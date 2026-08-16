@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+#
+# Boot / firmware tuning for an appliance-style node.
+#
+# Everything here is optional and reversible: originals are backed up to
+# *.pistreamer.bak the first time this runs.
+#
+set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+
+# Trixie/Bookworm put the firmware files here; older images used /boot.
+BOOT_DIR="/boot/firmware"
+[[ -d "${BOOT_DIR}" ]] || BOOT_DIR="/boot"
+CONFIG_TXT="${BOOT_DIR}/config.txt"
+CMDLINE_TXT="${BOOT_DIR}/cmdline.txt"
+
+[[ -f "${CONFIG_TXT}" ]] || { warn "No ${CONFIG_TXT}; skipping boot tuning"; exit 0; }
+
+backup_once() {
+  local f="$1"
+  [[ -f "${f}.pistreamer.bak" ]] || cp -a "${f}" "${f}.pistreamer.bak"
+}
+
+# --- config.txt ------------------------------------------------------------
+backup_once "${CONFIG_TXT}"
+
+MARKER="# --- pi-streamer ---"
+if grep -qF "${MARKER}" "${CONFIG_TXT}"; then
+  info "config.txt already tuned"
+else
+  info "Appending pi-streamer settings to config.txt"
+  cat >> "${CONFIG_TXT}" <<'EOF'
+
+# --- pi-streamer ---
+# Full KMS driver: required for kmssink and mpv's DRM output.
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+
+# Keep HDMI alive even if the display is powered off or hot-plugged later.
+# Without this a signage node that boots before the screen shows nothing.
+hdmi_force_hotplug=1
+
+# No rainbow splash, no boot delay — this is an appliance.
+disable_splash=1
+boot_delay=0
+
+# Disable the on-board activity/power LEDs (uncomment for dark installs).
+#dtparam=act_led_trigger=none
+#dtparam=act_led_activelow=off
+EOF
+  ok "config.txt updated"
+fi
+
+# --- cmdline.txt -----------------------------------------------------------
+if [[ -f "${CMDLINE_TXT}" ]]; then
+  backup_once "${CMDLINE_TXT}"
+  CMDLINE="$(tr -d '\n' < "${CMDLINE_TXT}")"
+  ADDED=""
+  # consoleblank=0 stops the console blanking after 10 minutes and taking the
+  # HDMI output with it. logo.nologo + cursor off keep the screen clean before
+  # the player takes over.
+  for opt in "consoleblank=0" "logo.nologo" "vt.global_cursor_default=0"; do
+    key="${opt%%=*}"
+    if ! grep -qE "(^| )${key}(=|\$| )" <<<"${CMDLINE}"; then
+      CMDLINE="${CMDLINE} ${opt}"
+      ADDED="${ADDED} ${opt}"
+    fi
+  done
+  if [[ -n "${ADDED}" ]]; then
+    printf '%s\n' "${CMDLINE}" > "${CMDLINE_TXT}"
+    ok "cmdline.txt updated:${ADDED}"
+  else
+    info "cmdline.txt already tuned"
+  fi
+fi
+
+# --- trim the image --------------------------------------------------------
+# Nothing here is fatal if the unit does not exist.
+for unit in triggerhappy.service man-db.timer apt-daily.timer apt-daily-upgrade.timer; do
+  if systemctl list-unit-files "${unit}" >/dev/null 2>&1 \
+     && systemctl is-enabled --quiet "${unit}" 2>/dev/null; then
+    systemctl disable --now "${unit}" >/dev/null 2>&1 || true
+    info "disabled ${unit}"
+  fi
+done
+
+# Reduce SD card wear: journald to RAM with a small cap. The node's real logs
+# are the pipeline log in the GUI; the journal only needs to survive a session.
+install -d /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/99-pistreamer.conf <<'EOF'
+# Keep the journal in RAM to reduce SD card write wear on an appliance node.
+[Journal]
+Storage=volatile
+RuntimeMaxUse=32M
+EOF
+systemctl restart systemd-journald || true
+ok "journald set to volatile storage"
+
+warn "Boot changes take effect after a reboot."

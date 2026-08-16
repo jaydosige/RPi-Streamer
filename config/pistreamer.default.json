@@ -1,0 +1,17 @@
+{
+  "audio_device": "",
+  "audio_enabled": true,
+  "autostart": true,
+  "connector": "",
+  "device_name": "pistreamer",
+  "local_file": "",
+  "loop": true,
+  "mode": "idle",
+  "ndi_bandwidth": "highest",
+  "ndi_latency_ms": 200,
+  "ndi_source": "",
+  "rotation": 0,
+  "video_mode": "",
+  "volume": 100,
+  "web_port": 80
+}

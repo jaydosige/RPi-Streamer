@@ -1,0 +1,46 @@
+[Unit]
+Description=pi-streamer NDI/media node
+Documentation=https://github.com/livewire/pi-streamer
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=pistreamer
+Group=pistreamer
+# video/render: DRM master and V4L2 hardware decode.
+# audio: ALSA. dialout is not needed.
+SupplementaryGroups=video render audio tty input
+
+WorkingDirectory=/opt/pistreamer
+Environment=PYTHONUNBUFFERED=1
+Environment=PISTREAMER_CONFIG=/etc/pistreamer/config.json
+Environment=PISTREAMER_MEDIA=/var/lib/pistreamer/media
+Environment=PISTREAMER_STATE=/var/lib/pistreamer
+# gst-plugin-ndi is installed outside the distro plugin path.
+Environment=GST_PLUGIN_PATH=/opt/pistreamer/gst-plugins
+Environment=LD_LIBRARY_PATH=/usr/local/lib
+
+ExecStart=/opt/pistreamer/venv/bin/python -m pistreamer
+
+# Let the non-root service bind port 80 and issue reboot/poweroff.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_BOOT
+
+Restart=always
+RestartSec=3
+# KillMode=control-group so a wedged gst-launch/mpv child dies with the unit
+# and releases the DRM master.
+KillMode=control-group
+TimeoutStopSec=20
+
+# Modest hardening. Not a sandbox — the service legitimately touches
+# /dev/dri, /dev/snd and the media directory.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+ProtectSystem=full
+ReadWritePaths=/etc/pistreamer /var/lib/pistreamer
+
+[Install]
+WantedBy=multi-user.target
