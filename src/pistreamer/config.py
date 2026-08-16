@@ -59,6 +59,9 @@ class Config:
     # ("receive-time-vs-timecode") trusts the sender's timecode, which stalls
     # playback if the sender emits odd or non-advancing timecodes.
     ndi_timestamp_mode: str = "receive-time"
+    # Fall back to shelling out to gst-launch-1.0 instead of the instrumented
+    # runner. Loses all stream telemetry; kept as an escape hatch.
+    use_gst_launch: bool = False
 
     # --- system ---
     device_name: str = "pistreamer"

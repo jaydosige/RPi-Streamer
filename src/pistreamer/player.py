@@ -15,19 +15,21 @@ Two backends:
 from __future__ import annotations
 
 import collections
+import json
 import logging
 import os
 import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, List, Optional
 
-from . import config, display, media
+from . import config, display, media, sources
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +43,8 @@ _BACKOFF = [1, 2, 5, 10, 15, 30]
 # A process that stayed up this long is considered healthy; backoff resets.
 _HEALTHY_AFTER = 30.0
 _LOG_LINES = 300
+# Prefix the runner uses to mark a machine-readable stats line on stdout.
+STATS_PREFIX = "@STATS "
 
 
 @dataclass
@@ -121,6 +125,8 @@ class Player:
         self._backoff_idx = 0
         self._supervisor: Optional[threading.Thread] = None
         self._reader: Optional[threading.Thread] = None
+        self._stats_reader: Optional[threading.Thread] = None
+        self._stream_stats: dict = {}
 
     # ------------------------------------------------------------------
     # Command construction
@@ -259,13 +265,40 @@ class Player:
         cmd += files
         return cmd
 
+    def _runner_command(self, cfg: config.Config, source: str) -> List[str]:
+        """Spawn the instrumented runner, which builds the pipeline itself."""
+        ok, reason = sources.ndi_available()
+        if not ok:
+            raise RuntimeError(reason)
+        conn = display.pick_connector(cfg.connector)
+        conn_name = conn.name if conn else ""
+        mode = display.target_mode(conn, cfg.video_mode)
+        spec = {
+            "source": source,
+            "bandwidth": _bandwidth_value(cfg.ndi_bandwidth),
+            "timestamp_mode": cfg.ndi_timestamp_mode,
+            "latency_ms": cfg.ndi_latency_ms,
+            "receiver_name": cfg.device_name or "pistreamer",
+            "rotation": cfg.rotation,
+            "width": mode.width if mode else None,
+            "height": mode.height if mode else None,
+            "connector_id": _connector_id(conn_name) if conn_name else None,
+            "driver_name": display.drm_driver_for(conn_name) if conn_name else None,
+            "audio": cfg.audio_enabled,
+            "audio_device": cfg.audio_device,
+            "stats_interval": 1.0,
+        }
+        return [sys.executable, "-m", "pistreamer.runner", json.dumps(spec)]
+
     def _build_command(self, cfg: config.Config, mode: str, target: str) -> List[str]:
         if mode == MODE_NDI:
             if not target:
                 raise RuntimeError("no NDI source selected")
-            if not shutil.which("gst-launch-1.0"):
-                raise RuntimeError("gst-launch-1.0 not installed")
-            return self._ndi_command(cfg, target)
+            if cfg.use_gst_launch:
+                if not shutil.which("gst-launch-1.0"):
+                    raise RuntimeError("gst-launch-1.0 not installed")
+                return self._ndi_command(cfg, target)
+            return self._runner_command(cfg, target)
         if mode == MODE_LOCAL:
             if not shutil.which("mpv"):
                 raise RuntimeError("mpv not installed")
@@ -289,6 +322,36 @@ class Player:
         except (OSError, ValueError):
             pass
 
+    def _drain_stats(self, proc: subprocess.Popen) -> None:
+        """Read the runner's stdout, splitting stats lines from plain output."""
+        stream = proc.stdout
+        if stream is None:
+            return
+        try:
+            for raw in stream:
+                line = raw.rstrip("\n")
+                if not line:
+                    continue
+                if line.startswith(STATS_PREFIX):
+                    try:
+                        with self._lock:
+                            self._stream_stats = json.loads(line[len(STATS_PREFIX):])
+                    except json.JSONDecodeError:
+                        pass
+                else:
+                    self._logs.append(f"{time.strftime('%H:%M:%S')} {line}")
+        except (OSError, ValueError):
+            pass
+
+    def stream_stats(self) -> dict:
+        """Latest per-second stats from the runner, or {} on the fallback path."""
+        with self._lock:
+            stats = dict(self._stream_stats)
+        # Stats go stale if the runner dies without us noticing.
+        if stats and (time.time() - stats.get("t", 0)) > 10:
+            return {}
+        return stats
+
     def _spawn(self, cfg: config.Config, mode: str, target: str) -> None:
         cmd = self._build_command(cfg, mode, target)
         log.info("starting: %s", " ".join(shlex.quote(c) for c in cmd))
@@ -300,7 +363,7 @@ class Player:
         proc = subprocess.Popen(  # noqa: S603 - argv list, never shell=True
             cmd,
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             env=env,
@@ -310,8 +373,13 @@ class Player:
         self._status.pid = proc.pid
         self._status.running = True
         self._status.since = time.time()
+        self._stream_stats = {}
         self._reader = threading.Thread(target=self._drain_output, args=(proc,), daemon=True)
         self._reader.start()
+        self._stats_reader = threading.Thread(
+            target=self._drain_stats, args=(proc,), daemon=True
+        )
+        self._stats_reader.start()
 
     def _terminate(self, timeout: float = 5.0) -> None:
         """Stop the current process and wait for it to release the display."""

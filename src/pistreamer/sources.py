@@ -283,3 +283,31 @@ def discover(timeout: float = 0.0, use_cache: bool = True) -> List[NdiSource]:
 
 def status() -> dict:
     return _discovery.status()
+
+
+def ndi_available() -> tuple[bool, str]:
+    """Pre-flight check: can we actually build an NDI pipeline?
+
+    Used so that starting a stream on a node with a broken plugin fails
+    immediately with a useful message, instead of spawning a runner that dies
+    and leaving the supervisor to retry it forever.
+    """
+    try:
+        import gi  # type: ignore
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst  # type: ignore
+
+        if not Gst.is_initialized():
+            Gst.init(None)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"python3-gi / GStreamer bindings unavailable: {exc}"
+
+    for element in ("ndisrc", "ndisrcdemux"):
+        if Gst.ElementFactory.find(element) is None:
+            return False, (
+                f"the '{element}' element is not registered — check that "
+                f"libgstndi.so is installed and GST_PLUGIN_PATH is set "
+                f"(try: gst-inspect-1.0 ndisrc)"
+            )
+    return True, ""

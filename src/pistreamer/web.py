@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 
 from . import config, display, media, sources, system
 from .player import MODE_IDLE, MODE_LOCAL, MODE_NDI, player
+from .telemetry import telemetry
 
 log = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
@@ -40,6 +41,8 @@ async def lifespan(app: FastAPI):
     # before anything else so it has been up for a while by the first poll.
     sources.start()
     player.start()
+    telemetry.bind_player(player.stream_stats)
+    telemetry.start()
     if cfg.autostart and cfg.mode != MODE_IDLE:
         target = cfg.ndi_source if cfg.mode == MODE_NDI else cfg.local_file
         log.info("autostarting mode=%s target=%s", cfg.mode, target)
@@ -47,6 +50,7 @@ async def lifespan(app: FastAPI):
     yield
     player.shutdown()
     sources.stop()
+    telemetry.stop()
 
 
 app = FastAPI(title="pi-streamer", version="0.1.0", lifespan=lifespan)
@@ -89,9 +93,26 @@ async def index() -> FileResponse:
 async def get_status() -> Dict[str, Any]:
     return {
         "player": player.status(),
+        "stream": player.stream_stats(),
         "system": system.summary(),
         "config": config.load().to_dict(),
+        "discovery": sources.status(),
     }
+
+
+@app.get("/api/telemetry")
+async def get_telemetry(points: int = 0) -> Dict[str, Any]:
+    """Rolling history as parallel arrays.
+
+    `points` trims to the most recent N samples — the status page polls a
+    dozen for its sparklines and does not need the whole window every two
+    seconds over an event network.
+    """
+    data = telemetry.history()
+    if points > 0:
+        data["t"] = data["t"][-points:]
+        data["series"] = {k: v[-points:] for k, v in data["series"].items()}
+    return data
 
 
 @app.get("/api/logs")

@@ -8,10 +8,11 @@
   "loop": true,
   "mode": "idle",
   "ndi_bandwidth": "highest",
-  "ndi_timestamp_mode": "receive-time",
   "ndi_latency_ms": 200,
   "ndi_source": "",
+  "ndi_timestamp_mode": "receive-time",
   "rotation": 0,
+  "use_gst_launch": false,
   "video_mode": "",
   "volume": 100,
   "web_port": 80

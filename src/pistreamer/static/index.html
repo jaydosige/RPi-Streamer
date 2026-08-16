@@ -13,10 +13,24 @@
     --text: #e6e9ef;
     --muted: #8b93a4;
     --accent: #4c8dff;
-    --good: #35c17f;
-    --warn: #e0a33e;
-    --bad: #e5544b;
     --radius: 10px;
+
+    /* Status palette — reserved for state, never reused as a series colour.
+       Always shipped with an icon and a label, never colour alone. */
+    --good: #0ca30c;
+    --warn: #fab219;
+    --serious: #ec835a;
+    --bad: #d03b3b;
+
+    /* Chart hues, stepped for a dark surface. Each chart is single-series,
+       so these identify measures across small multiples, not series within
+       one plot. Validated for the dark surface (all >= 3:1, adjacent CVD
+       delta-E 8.4, normal-vision 19.3). */
+    --series-cpu: #3987e5;
+    --series-net: #199e70;
+    --series-temp: #c98500;
+    --series-fps: #d55181;
+    --spark-muted: #5d6472;
   }
   * { box-sizing: border-box; }
   body {
@@ -118,6 +132,62 @@
   }
   #toast.show { transform: translateX(-50%) translateY(0); }
   #toast.bad { border-color: #45272a; color: #ffb4ae; }
+
+  /* --- stat tiles, meters, charts, tables --- */
+  .stat .row2 { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; }
+  .stat .sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+  svg.spark { display: block; flex: none; }
+
+  .chart-block { margin-bottom: 18px; }
+  .chart-head {
+    display: flex; align-items: baseline; gap: 9px; margin-bottom: 6px;
+  }
+  .chart-head .name { font-size: 13px; font-weight: 600; }
+  .chart-head .now { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .chart-head .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+  .chart-wrap { position: relative; }
+  svg.chart { width: 100%; height: 132px; display: block; overflow: visible; }
+  svg.chart .tick { fill: var(--muted); font-size: 10px; font-family: inherit; }
+  .chart-empty { color: var(--muted); font-size: 13px; padding: 40px 0; text-align: center; }
+  .chart-tip {
+    position: absolute; top: -6px; transform: translateX(-50%);
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
+    padding: 3px 8px; font-size: 12px; pointer-events: none; opacity: 0;
+    transition: opacity .1s; white-space: nowrap; display: flex; gap: 7px; align-items: baseline;
+  }
+  .chart-tip span { color: var(--muted); }
+
+  .meter { margin-bottom: 12px; }
+  .meter .cap { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 5px; }
+  .meter .cap .r { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .meter .track { height: 7px; border-radius: 4px; background: #22314a; overflow: hidden; }
+  .meter .fill { height: 100%; border-radius: 4px; background: var(--series-cpu); }
+
+  table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+  table.data th, table.data td {
+    text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line);
+  }
+  table.data th { color: var(--muted); font-weight: 500; font-size: 11px;
+                  text-transform: uppercase; letter-spacing: .5px; }
+  table.data td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.data tr:last-child td { border-bottom: none; }
+  .scroller { overflow-x: auto; }
+
+  .badge {
+    display: inline-flex; align-items: center; gap: 6px; font-size: 13px;
+    padding: 4px 10px; border-radius: 6px; background: var(--panel-2);
+    border: 1px solid var(--line);
+  }
+  .badge .ico { font-weight: 700; }
+  .badge.good .ico { color: var(--good); }
+  .badge.warn .ico { color: var(--warn); }
+  .badge.serious .ico { color: var(--serious); }
+  .badge.bad .ico { color: var(--bad); }
+  .kvs { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 0 22px; }
+  .kv { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0;
+        border-bottom: 1px solid var(--line); font-size: 13px; }
+  .kv .k { color: var(--muted); }
+  .kv .v { text-align: right; word-break: break-all; }
 </style>
 </head>
 <body>
@@ -133,6 +203,7 @@
   <button data-tab="ndi">NDI sources</button>
   <button data-tab="media">Local media</button>
   <button data-tab="display">Display &amp; audio</button>
+  <button data-tab="diag">Diagnostics</button>
   <button data-tab="system">System</button>
 </nav>
 
@@ -150,6 +221,11 @@
         <button class="btn" id="btnRestart">Restart pipeline</button>
         <button class="btn danger" id="btnStop">Stop output</button>
       </div>
+    </div>
+    <div class="card">
+      <h2>Stream</h2>
+      <div class="grid" id="streamGrid"></div>
+      <div class="host" id="streamNote" style="margin-top:10px"></div>
     </div>
     <div class="card">
       <h2>Health</h2>
@@ -263,6 +339,50 @@
     <button class="btn primary" id="btnSaveDisplay">Save &amp; apply</button>
   </section>
 
+  <!-- DIAGNOSTICS -->
+  <section id="tab-diag">
+    <div class="card">
+      <h2>Last 10 minutes</h2>
+      <div id="charts"></div>
+      <div class="row" style="margin-top:4px">
+        <button class="btn" id="btnTable">Show data table</button>
+        <span class="host" id="peaksNote"></span>
+      </div>
+      <div id="tableWrap" class="scroller" style="display:none;margin-top:12px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Capacity</h2>
+      <div id="meters"></div>
+    </div>
+
+    <div class="card">
+      <h2>Network interfaces</h2>
+      <div class="scroller"><table class="data" id="netTable"></table></div>
+      <div class="banner warn" id="netNote" style="margin:12px 0 0;display:none"></div>
+    </div>
+
+    <div class="card">
+      <h2>Power &amp; thermal</h2>
+      <div class="row" id="throttleRow"></div>
+      <div class="host" style="margin-top:10px">
+        Under-voltage is the most common cause of a Pi misbehaving under load, and it
+        looks exactly like a decode problem. If anything below is flagged, replace the
+        power supply before investigating anything else.
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Discovery</h2>
+      <div class="kvs" id="discoveryInfo"></div>
+    </div>
+
+    <div class="card">
+      <h2>Device &amp; versions</h2>
+      <div class="kvs" id="versionInfo"></div>
+    </div>
+  </section>
+
   <!-- SYSTEM -->
   <section id="tab-system">
     <div class="card">
@@ -297,11 +417,14 @@
 
 <div id="toast"></div>
 
+<script src="/static/viz.js"></script>
 <script>
 "use strict";
 
 const $ = (id) => document.getElementById(id);
 let STATE = null;
+let HIST = { t: [], series: {}, peaks: {} };
+let SPARKS = {};
 let CONNECTORS = [];
 let pollTimer = null;
 let settingsDirty = false;
@@ -362,8 +485,14 @@ document.querySelectorAll("nav button").forEach((btn) => {
     $("tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "media") loadMedia();
     if (btn.dataset.tab === "display") loadConnectors();
+    if (btn.dataset.tab === "diag") loadTelemetry();
   };
 });
+
+function activeTab() {
+  const b = document.querySelector("nav button.active");
+  return b ? b.dataset.tab : "now";
+}
 
 // ---------- status polling ----------
 
@@ -382,6 +511,36 @@ async function poll() {
     box.textContent = logs.lines.length ? logs.lines.join("\n") : "No output yet.";
     if (atBottom) box.scrollTop = box.scrollHeight;
   } catch (_) { /* logs are best-effort */ }
+  try {
+    // Just enough points for the tile sparklines; the full window is only
+    // fetched when the Diagnostics tab is actually open.
+    SPARKS = (await api("/api/telemetry?points=14")).series || {};
+  } catch (_) { /* sparklines are decoration */ }
+  if (activeTab() === "diag") loadTelemetry();
+}
+
+// ---------- stat tiles ----------
+
+function tile(label, value, opts) {
+  const o = opts || {};
+  const spark = o.spark && o.spark.length > 1;
+  return `<div class="stat">
+    <div class="k">${label}</div>
+    <div class="row2">
+      <div>
+        <div class="v">${value}</div>
+        ${o.sub ? `<div class="sub">${o.sub}</div>` : ""}
+      </div>
+      ${spark ? `<span data-spark="${o.sparkId}"></span>` : ""}
+    </div>
+  </div>`;
+}
+
+function paintSparks(root, specs) {
+  for (const [id, spec] of Object.entries(specs)) {
+    const host = root.querySelector(`[data-spark="${id}"]`);
+    if (host) { host.innerHTML = ""; host.appendChild(VIZ.sparkline(spec.values, spec.color)); }
+  }
 }
 
 function renderStatus() {
@@ -410,28 +569,91 @@ function renderStatus() {
     err.innerHTML = "";
   }
 
-  const memUsed = (s.memory.total && s.memory.available !== null)
-    ? s.memory.total - s.memory.available : null;
-  const stats = [
-    ["Stream uptime", p.uptime !== null ? fmtDuration(p.uptime) : "—"],
-    ["CPU", s.cpu_percent !== null ? s.cpu_percent + "<small> %</small>" : "—"],
-    ["Temperature", s.cpu_temp !== null ? s.cpu_temp.toFixed(1) + "<small> °C</small>" : "—"],
-    ["Memory used", memUsed !== null ? fmtBytes(memUsed) : "—"],
-    ["Disk free", fmtBytes(s.disk.free)],
-    ["System uptime", fmtDuration(s.uptime)],
-    ["Power / thermal", s.throttled || "—"],
-  ];
-  $("healthGrid").innerHTML = stats.map(
-    ([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`
-  ).join("");
+  renderStream(STATE.stream || {}, p);
 
-  $("netList").innerHTML = s.network.length
-    ? s.network.map((n) =>
-        `<li><div class="meta"><div class="name">${n.address}</div><div class="sub">${n.interface}</div></div></li>`
-      ).join("")
-    : `<div class="empty">No network interfaces with an IPv4 address.</div>`;
+  const mem = s.memory || {};
+  const memUsed = (mem.total && mem.available !== null && mem.available !== undefined)
+    ? mem.total - mem.available : null;
+  const th = s.throttled || {};
+  const primaryNet = (s.network || []).find((n) => (n.addresses || []).length) || {};
+  const H = SPARKS;
+
+  const health = [
+    ["CPU", s.cpu_percent !== null && s.cpu_percent !== undefined ? s.cpu_percent + "<small> %</small>" : "—",
+      { sub: s.cpu_freq && s.cpu_freq.current ? s.cpu_freq.current + " MHz" : null,
+        spark: H.cpu_percent, sparkId: "h-cpu", color: "var(--series-cpu)" }],
+    ["Temperature", s.cpu_temp !== null && s.cpu_temp !== undefined ? s.cpu_temp.toFixed(1) + "<small> °C</small>" : "—",
+      { spark: H.cpu_temp, sparkId: "h-temp", color: "var(--series-temp)" }],
+    ["Network in", primaryNet.rx_mbps !== null && primaryNet.rx_mbps !== undefined
+      ? primaryNet.rx_mbps + "<small> Mbps</small>" : "—",
+      { sub: primaryNet.speed_mbps ? `link ${primaryNet.speed_mbps} Mbps` : null,
+        spark: H.rx_mbps, sparkId: "h-rx", color: "var(--series-net)" }],
+    ["Memory used", memUsed !== null ? fmtBytes(memUsed) : "—",
+      { sub: mem.total ? "of " + fmtBytes(mem.total) : null }],
+    ["Disk free", fmtBytes(s.disk && s.disk.free), {}],
+    ["System uptime", fmtDuration(s.uptime), { sub: (s.load && s.load.length) ? "load " + s.load[0].toFixed(2) : null }],
+    ["Power / thermal", th.ok === true ? "OK" : th.ok === false ? "See diagnostics" : "—",
+      { sub: (th.now && th.now.length) ? th.now[0] : ((th.since_boot && th.since_boot.length) ? "history flagged" : null) }],
+  ];
+  $("healthGrid").innerHTML = health.map(([k, v, o]) => tile(k, v, o)).join("");
+  paintSparks($("healthGrid"), {
+    "h-cpu": { values: H.cpu_percent || [], color: "var(--series-cpu)" },
+    "h-temp": { values: H.cpu_temp || [], color: "var(--series-temp)" },
+    "h-rx": { values: H.rx_mbps || [], color: "var(--series-net)" },
+  });
+
+  const nets = s.network || [];
+  $("netList").innerHTML = nets.length
+    ? nets.map((n) => `<li><div class="meta">
+        <div class="name">${(n.addresses || []).join(", ") || "no IPv4 address"}</div>
+        <div class="sub">${n.interface} · ${n.operstate || "?"}${n.speed_mbps ? " · " + n.speed_mbps + " Mbps" : ""}</div>
+      </div></li>`).join("")
+    : `<div class="empty">No network interfaces found.</div>`;
 
   if (!settingsDirty) applyConfigToForm(c);
+}
+
+function renderStream(st, p) {
+  const grid = $("streamGrid"), note = $("streamNote");
+  if (p.mode === "idle") {
+    grid.innerHTML = `<div class="empty">Output is idle — nothing to measure.</div>`;
+    note.textContent = "";
+    return;
+  }
+  if (p.mode === "local") {
+    grid.innerHTML = `<div class="empty">Local playback runs through mpv, which does not report frame statistics here.</div>`;
+    note.textContent = "";
+    return;
+  }
+  if (!st || st.fps === undefined) {
+    grid.innerHTML = `<div class="empty">Waiting for the first frame…</div>`;
+    note.textContent = STATE.config.use_gst_launch
+      ? "Stream statistics are unavailable on the gst-launch fallback path."
+      : "";
+    return;
+  }
+
+  const H = SPARKS;
+  const stale = st.since_last_frame !== null && st.since_last_frame > 2;
+  const res = (st.width && st.height) ? `${st.width}×${st.height}` : "—";
+  const tiles = [
+    ["Frame rate", st.fps !== null ? st.fps.toFixed(1) + "<small> fps</small>" : "—",
+      { sub: st.declared_fps ? `sender declares ${st.declared_fps}` : null,
+        spark: H.fps, sparkId: "s-fps" }],
+    ["Resolution", res, { sub: st.format || null }],
+    ["To display", st.render_mbps !== null ? st.render_mbps + "<small> Mbps</small>" : "—",
+      { sub: "after conversion" }],
+    ["Frames shown", st.rendered !== null && st.rendered !== undefined ? st.rendered.toLocaleString() : st.frames_total.toLocaleString(), {}],
+    ["Frames dropped", st.dropped !== null && st.dropped !== undefined ? st.dropped.toLocaleString() : "—",
+      { sub: st.qos_events ? st.qos_events + " QoS events" : null }],
+    ["Last frame", st.since_last_frame !== null ? st.since_last_frame.toFixed(1) + "<small> s ago</small>" : "—",
+      { sub: st.time_to_first_frame !== null ? `first frame in ${st.time_to_first_frame}s` : null }],
+  ];
+  grid.innerHTML = tiles.map(([k, v, o]) => tile(k, v, o)).join("");
+  paintSparks(grid, { "s-fps": { values: H.fps || [], color: "var(--series-fps)" } });
+  note.textContent = stale
+    ? "No new frames for over two seconds — the sender may have stopped."
+    : "";
 }
 
 function applyConfigToForm(c) {
@@ -448,6 +670,192 @@ function applyConfigToForm(c) {
     $("cfgHostname").value = STATE.system.hostname || c.device_name;
   }
 }
+
+// ---------- diagnostics ----------
+
+const CHARTS = [
+  { id: "cpu_percent", label: "CPU", unit: " %", color: "var(--series-cpu)", max: 100 },
+  { id: "cpu_temp", label: "Temperature", unit: " °C", color: "var(--series-temp)", floor: 60 },
+  { id: "rx_mbps", label: "Network in", unit: " Mbps", color: "var(--series-net)", floor: 10 },
+  { id: "fps", label: "Frame rate", unit: " fps", color: "var(--series-fps)", floor: 30 },
+];
+
+async function loadTelemetry() {
+  try {
+    HIST = await api("/api/telemetry");
+  } catch (_) { return; }
+  renderCharts();
+  renderMeters();
+  renderNetTable();
+  renderThrottle();
+  renderDiscovery();
+  renderVersions();
+  if ($("tableWrap").style.display !== "none") renderDataTable();
+}
+
+function renderCharts() {
+  const host = $("charts");
+  const series = HIST.series || {};
+  if (!host.dataset.built) {
+    host.innerHTML = CHARTS.map((c) => `
+      <div class="chart-block">
+        <div class="chart-head">
+          <span class="swatch" style="background:${c.color}"></span>
+          <span class="name">${c.label}</span>
+          <span class="now" id="now-${c.id}"></span>
+        </div>
+        <div class="chart-wrap" id="chart-${c.id}"></div>
+      </div>`).join("");
+    host.dataset.built = "1";
+  }
+  CHARTS.forEach((c) => {
+    const values = series[c.id] || [];
+    VIZ.areaChart($("chart-" + c.id), {
+      id: c.id, label: c.label, values, times: HIST.t || [],
+      color: c.color, unit: c.unit, max: c.max, floor: c.floor,
+    });
+    const latest = [...values].reverse().find((v) => v !== null && v !== undefined);
+    $("now-" + c.id).textContent = latest !== undefined ? VIZ.fmtVal(latest) + c.unit : "—";
+  });
+  const pk = HIST.peaks || {};
+  const bits = [];
+  if (pk.cpu_temp != null) bits.push(`peak temp ${pk.cpu_temp.toFixed(1)} °C`);
+  if (pk.cpu_percent != null) bits.push(`peak CPU ${pk.cpu_percent.toFixed(0)} %`);
+  if (pk.rx_mbps != null) bits.push(`peak network in ${pk.rx_mbps.toFixed(1)} Mbps`);
+  $("peaksNote").textContent = bits.join(" · ");
+}
+
+function meter(label, used, total, color) {
+  if (!total) return "";
+  const pct = Math.min(100, (used / total) * 100);
+  return `<div class="meter">
+    <div class="cap"><span>${label}</span>
+      <span class="r">${fmtBytes(used)} of ${fmtBytes(total)} · ${pct.toFixed(0)}%</span></div>
+    <div class="track"><div class="fill" style="width:${pct}%;background:${color}"></div></div>
+  </div>`;
+}
+
+function renderMeters() {
+  if (!STATE) return;
+  const s = STATE.system, mem = s.memory || {}, dsk = s.disk || {};
+  const memUsed = (mem.total && mem.available != null) ? mem.total - mem.available : null;
+  // Fill colour carries severity; the track is a darker step of the same hue.
+  const sev = (frac) => frac > 0.9 ? "var(--bad)" : frac > 0.75 ? "var(--warn)" : "var(--series-cpu)";
+  let html = "";
+  if (memUsed !== null) html += meter("Memory", memUsed, mem.total, sev(memUsed / mem.total));
+  if (dsk.used != null && dsk.total) html += meter("Disk", dsk.used, dsk.total, sev(dsk.used / dsk.total));
+  const swapUsed = (mem.swap_total && mem.swap_free != null) ? mem.swap_total - mem.swap_free : null;
+  if (swapUsed !== null && mem.swap_total) html += meter("Swap", swapUsed, mem.swap_total, sev(swapUsed / mem.swap_total));
+  $("meters").innerHTML = html || `<div class="empty">No capacity data.</div>`;
+}
+
+function renderNetTable() {
+  if (!STATE) return;
+  const nets = STATE.system.network || [];
+  if (!nets.length) { $("netTable").innerHTML = ""; return; }
+  $("netTable").innerHTML = `
+    <thead><tr>
+      <th>Interface</th><th>Address</th><th>Link</th>
+      <th class="num">In (Mbps)</th><th class="num">Out (Mbps)</th><th class="num">Errors</th>
+    </tr></thead>
+    <tbody>${nets.map((n) => `<tr>
+      <td>${n.interface}</td>
+      <td>${(n.addresses || []).join(", ") || "—"}</td>
+      <td>${n.operstate || "?"}${n.speed_mbps ? ` · ${n.speed_mbps} Mbps ${n.duplex || ""}` : ""}</td>
+      <td class="num">${n.rx_mbps != null ? n.rx_mbps.toFixed(1) : "—"}</td>
+      <td class="num">${n.tx_mbps != null ? n.tx_mbps.toFixed(1) : "—"}</td>
+      <td class="num">${(n.rx_errs || 0) + (n.tx_errs || 0)}</td>
+    </tr>`).join("")}</tbody>`;
+
+  const primary = nets.find((n) => (n.addresses || []).length);
+  const note = $("netNote");
+  if (primary && primary.speed_mbps && primary.rx_mbps != null
+      && primary.rx_mbps > primary.speed_mbps * 0.7) {
+    note.textContent = `Inbound traffic is above 70% of the ${primary.speed_mbps} Mbps link.`
+      + " Full-bandwidth NDI at 1080p60 is roughly 130 Mbps — headroom is getting thin.";
+    note.style.display = "";
+  } else if (primary && primary.speed_mbps && primary.speed_mbps < 1000) {
+    note.textContent = `This interface has negotiated ${primary.speed_mbps} Mbps, not gigabit.`
+      + " Check the cable and switch port before running full-bandwidth NDI.";
+    note.style.display = "";
+  } else {
+    note.style.display = "none";
+  }
+}
+
+function renderThrottle() {
+  if (!STATE) return;
+  const th = STATE.system.throttled || {};
+  const v = STATE.system.core_voltage;
+  const badge = (cls, ico, text) => `<span class="badge ${cls}"><span class="ico">${ico}</span>${text}</span>`;
+  let html = "";
+  if (th.ok === true) html += badge("good", "✓", "No throttling or under-voltage");
+  (th.now || []).forEach((f) => { html += badge("bad", "✕", "Now: " + f); });
+  (th.since_boot || []).forEach((f) => { html += badge("warn", "!", "Since boot: " + f); });
+  if (th.ok === null || th.ok === undefined) html += badge("", "–", "vcgencmd unavailable");
+  if (v) html += badge("", "", `Core voltage ${v.toFixed(2)} V`);
+  if (STATE.system.cpu_temp != null) {
+    const t = STATE.system.cpu_temp;
+    const cls = t >= 80 ? "bad" : t >= 70 ? "warn" : "good";
+    const ico = t >= 80 ? "✕" : t >= 70 ? "!" : "✓";
+    html += badge(cls, ico, `CPU ${t.toFixed(1)} °C`);
+  }
+  $("throttleRow").innerHTML = html;
+}
+
+function kvs(pairs) {
+  return pairs.filter(([, v]) => v !== null && v !== undefined && v !== "")
+    .map(([k, v]) => `<div class="kv"><span class="k">${k}</span><span class="v">${v}</span></div>`)
+    .join("");
+}
+
+function renderDiscovery() {
+  const d = (STATE && STATE.discovery) || {};
+  $("discoveryInfo").innerHTML = kvs([
+    ["Finder running", d.running ? "yes" : "no"],
+    ["Backend", d.backend],
+    ["Senders visible", d.count],
+    ["Finder uptime", d.uptime != null ? fmtDuration(d.uptime) : null],
+    ["Error", d.error || null],
+    ["Receiver name", STATE ? STATE.config.device_name : null],
+  ]);
+}
+
+function renderVersions() {
+  const v = (STATE && STATE.system.versions) || {};
+  $("versionInfo").innerHTML = kvs([
+    ["Model", v.model], ["Revision", v.revision], ["Serial", v.serial],
+    ["OS", v.os], ["Kernel", v.kernel], ["Firmware", v.firmware],
+    ["pi-streamer", v.pistreamer], ["GStreamer", v.gstreamer],
+    ["NDI SDK", v.ndi_sdk], ["mpv", v.mpv],
+    ["Pipeline", STATE && STATE.config.use_gst_launch ? "gst-launch (fallback)" : "instrumented runner"],
+  ]);
+}
+
+function renderDataTable() {
+  const t = HIST.t || [], series = HIST.series || {};
+  const keys = CHARTS.map((c) => c.id).filter((k) => series[k]);
+  if (!t.length) { $("tableWrap").innerHTML = `<div class="empty">No samples yet.</div>`; return; }
+  const rows = [];
+  for (let i = t.length - 1; i >= 0; i--) {
+    rows.push(`<tr><td>${VIZ.relTime(t[i])}</td>` + keys.map((k) => {
+      const v = series[k][i];
+      return `<td class="num">${v == null ? "—" : VIZ.fmtVal(v)}</td>`;
+    }).join("") + "</tr>");
+  }
+  $("tableWrap").innerHTML = `<table class="data">
+    <thead><tr><th>When</th>${CHARTS.filter((c) => series[c.id])
+      .map((c) => `<th class="num">${c.label}${c.unit}</th>`).join("")}</tr></thead>
+    <tbody>${rows.join("")}</tbody></table>`;
+}
+
+$("btnTable").onclick = () => {
+  const wrap = $("tableWrap");
+  const showing = wrap.style.display !== "none";
+  wrap.style.display = showing ? "none" : "";
+  $("btnTable").textContent = showing ? "Show data table" : "Hide data table";
+  if (!showing) renderDataTable();
+};
 
 // ---------- NDI ----------
 

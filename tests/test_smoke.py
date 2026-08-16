@@ -48,7 +48,7 @@ def main() -> int:
 
         r = client.get("/api/config")
         check("GET /api/config -> 200", r.status_code == 200)
-        check("config exposes all 16 keys", len(r.json()) == 16, str(len(r.json())))
+        check("config exposes all 17 keys", len(r.json()) == 17, str(len(r.json())))
 
         print("\nconfig validation")
         r = client.post("/api/config", json={"rotation": 45})
@@ -118,13 +118,13 @@ def main() -> int:
 
         r = client.post("/api/play/ndi", json={"source": "FAKE (Test)"})
         check(
-            "play ndi without gstreamer -> clean 500",
+            "play ndi with no NDI stack -> clean 500",
             r.status_code == 500,
             r.text,
         )
         check(
-            "error explains the cause",
-            "gst-launch" in r.text or "not installed" in r.text,
+            "error names the missing piece",
+            any(s in r.text for s in ("ndisrc", "GStreamer", "gst-launch", "not installed")),
             r.text,
         )
 
