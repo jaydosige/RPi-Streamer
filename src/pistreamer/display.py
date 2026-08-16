@@ -132,20 +132,47 @@ def drm_card_for(connector_name: str) -> Optional[str]:
     return f"/dev/dri/{card.name}" if card else None
 
 
-def drm_driver_for(connector_name: str) -> Optional[str]:
-    """Return the kernel DRM driver that owns a connector, e.g. "vc4".
+# The driver names kmssink itself probes for, from gstkmssink.c. We use this
+# as a whitelist: if what we detect is not on it, drmOpen would reject the
+# name anyway, so we stay quiet and let kmssink run its own probe.
+KNOWN_DRM_DRIVERS = frozenset(
+    {
+        "i915", "nouveau", "radeon", "amdgpu", "omapdrm", "exynos", "tilcdc",
+        "msm", "sti", "imx-drm", "rockchip", "atmel-hlcdc", "mediatek",
+        "meson", "sun4i-drm", "vc4", "stm", "rcar-du", "vkms", "v3d",
+    }
+)
 
-    This is what kmssink's `driver-name` property wants. It is emphatically
-    NOT a device path: kmssink's other selector, `bus-id`, expects a DRM bus
-    id and is passed straight to drmOpen(NULL, bus_id). Handing a
-    /dev/dri/cardN path to `bus-id` makes drmOpen fail with the memorably
-    unhelpful "Could not open DRM module (NULL)".
+
+def drm_driver_for(connector_name: str) -> Optional[str]:
+    """Return the DRM driver name for a connector, e.g. "vc4", or None.
+
+    This is what kmssink's `driver-name` wants, and it is NOT the same string
+    as the platform driver in sysfs. On a Pi, /sys/.../device/driver resolves
+    to `vc4-drm` (the platform driver) while drmOpen only answers to `vc4`
+    (the DRM driver). Feeding it the platform name fails with "Could not open
+    DRM module vc4-drm".
+
+    Nor is it a device path — kmssink's other selector, `bus-id`, is passed to
+    drmOpen(NULL, bus_id) as a bus identifier, so a /dev/dri/cardN path there
+    fails too.
+
+    Returning None is a safe answer: the caller omits the property and
+    kmssink probes its own list, which includes vc4.
     """
     card = _card_dir_for(connector_name)
     if card is None:
         return None
-    driver_link = card / "device" / "driver"
     try:
-        return driver_link.resolve().name
+        raw = (card / "device" / "driver").resolve().name
     except OSError:
         return None
+
+    # Check the unmodified name first: `imx-drm` and `sun4i-drm` are genuine
+    # DRM driver names, so stripping the suffix unconditionally would break
+    # those platforms.
+    if raw in KNOWN_DRM_DRIVERS:
+        return raw
+    if raw.endswith("-drm") and raw[:-4] in KNOWN_DRM_DRIVERS:
+        return raw[:-4]  # vc4-drm -> vc4
+    return None
