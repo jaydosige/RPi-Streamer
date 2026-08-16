@@ -56,6 +56,13 @@ if [[ -f "${CMDLINE_TXT}" ]]; then
   backup_once "${CMDLINE_TXT}"
   CMDLINE="$(tr -d '\n' < "${CMDLINE_TXT}")"
   ADDED=""
+  # Move the kernel console off tty1. Otherwise boot messages and the login
+  # prompt sit on the HDMI output underneath the video, and the getty and the
+  # player both want the same screen.
+  if grep -q "console=tty1" <<<"${CMDLINE}"; then
+    CMDLINE="${CMDLINE//console=tty1/console=tty3}"
+    ADDED="${ADDED} console=tty3"
+  fi
   # consoleblank=0 stops the console blanking after 10 minutes and taking the
   # HDMI output with it. logo.nologo + cursor off keep the screen clean before
   # the player takes over.
@@ -72,6 +79,17 @@ if [[ -f "${CMDLINE_TXT}" ]]; then
   else
     info "cmdline.txt already tuned"
   fi
+fi
+
+# --- give the player sole ownership of the screen --------------------------
+# The login prompt on tty1 shares the HDMI output with the video and shows
+# through as a terminal behind the picture. This is an appliance; log in over
+# SSH instead. Reverse with:
+#   sudo systemctl unmask getty@tty1 && sudo systemctl enable --now getty@tty1
+if systemctl list-unit-files 'getty@.service' >/dev/null 2>&1; then
+  systemctl stop getty@tty1.service >/dev/null 2>&1 || true
+  systemctl mask getty@tty1.service >/dev/null 2>&1 || true
+  ok "getty on tty1 masked (SSH in instead; see this script to reverse)"
 fi
 
 # --- trim the image --------------------------------------------------------

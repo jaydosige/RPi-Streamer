@@ -111,13 +111,41 @@ def pick_connector(preferred: str = "") -> Optional[Connector]:
     return connectors[0] if connectors else None
 
 
-def drm_card_for(connector_name: str) -> Optional[str]:
-    """Return the /dev/dri/cardN path that owns a given connector."""
+def _card_dir_for(connector_name: str) -> Optional[Path]:
+    """Return the /sys/class/drm/cardN directory that owns a given connector."""
     if not DRM_SYSFS.exists():
         return None
     for entry in sorted(DRM_SYSFS.iterdir()):
         match = _CONNECTOR_RE.match(entry.name)
         if match and match.group("name") == connector_name:
-            card = entry.name.split("-", 1)[0]  # "card1"
-            return f"/dev/dri/{card}"
+            return DRM_SYSFS / entry.name.split("-", 1)[0]  # "card1"
     return None
+
+
+def drm_card_for(connector_name: str) -> Optional[str]:
+    """Return the /dev/dri/cardN device node that owns a given connector.
+
+    Useful for mpv (--drm-device) and for diagnostics. NOT for kmssink — see
+    drm_driver_for.
+    """
+    card = _card_dir_for(connector_name)
+    return f"/dev/dri/{card.name}" if card else None
+
+
+def drm_driver_for(connector_name: str) -> Optional[str]:
+    """Return the kernel DRM driver that owns a connector, e.g. "vc4".
+
+    This is what kmssink's `driver-name` property wants. It is emphatically
+    NOT a device path: kmssink's other selector, `bus-id`, expects a DRM bus
+    id and is passed straight to drmOpen(NULL, bus_id). Handing a
+    /dev/dri/cardN path to `bus-id` makes drmOpen fail with the memorably
+    unhelpful "Could not open DRM module (NULL)".
+    """
+    card = _card_dir_for(connector_name)
+    if card is None:
+        return None
+    driver_link = card / "device" / "driver"
+    try:
+        return driver_link.resolve().name
+    except OSError:
+        return None

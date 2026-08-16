@@ -136,9 +136,14 @@ class Player:
         sink = ["kmssink", "force-modesetting=true"]
         if conn_id is not None:
             sink.append(f"connector-id={conn_id}")
-        card = display.drm_card_for(conn_name) if conn_name else None
-        if card:
-            sink.append(f"bus-id={card}")
+        # driver-name, not bus-id, and not a device path. kmssink passes
+        # bus-id to drmOpen(NULL, bus_id) as a *bus* identifier; a
+        # /dev/dri/cardN path there fails with "Could not open DRM module".
+        # If we cannot identify the driver, say nothing and let kmssink probe
+        # its built-in list.
+        driver = display.drm_driver_for(conn_name) if conn_name else None
+        if driver:
+            sink.append(f"driver-name={driver}")
 
         video_chain = [
             "queue",
