@@ -180,6 +180,7 @@ class Player:
             # silently; the supervisor then retries with backoff.
             "connect-timeout=10000",
             "timeout=5000",
+            f"timestamp-mode={cfg.ndi_timestamp_mode}",
             f"receiver-ndi-name={_gst_quote(cfg.device_name or 'pistreamer')}",
             "!",
             "ndisrcdemux",
@@ -189,7 +190,19 @@ class Player:
         ] + video_chain
 
         if cfg.audio_enabled:
-            audio_sink = ["alsasink", "sync=false"]
+            # provide-clock=false is load-bearing. An audio sink is the
+            # pipeline's preferred clock provider by default, and that clock
+            # only advances while audio is actually being consumed by the
+            # card. If the sender has no audio, or HDMI audio is not really
+            # playing, the clock stalls — and the video sink, which syncs to
+            # it, renders exactly one frame and then waits forever.
+            # async=false keeps a sulking audio sink out of preroll too.
+            audio_sink = [
+                "alsasink",
+                "sync=false",
+                "provide-clock=false",
+                "async=false",
+            ]
             if cfg.audio_device:
                 audio_sink.append(f"device={cfg.audio_device}")
             cmd += [

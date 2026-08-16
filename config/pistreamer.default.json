@@ -8,6 +8,7 @@
   "loop": true,
   "mode": "idle",
   "ndi_bandwidth": "highest",
+  "ndi_timestamp_mode": "receive-time",
   "ndi_latency_ms": 200,
   "ndi_source": "",
   "rotation": 0,

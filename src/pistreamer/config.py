@@ -54,6 +54,11 @@ class Config:
     ndi_bandwidth: str = "highest"
     # Latency in ms for the NDI receive queue
     ndi_latency_ms: int = 200
+    # How ndisrc derives presentation timestamps. "receive-time" uses our own
+    # clock and is monotonic by construction; the upstream default
+    # ("receive-time-vs-timecode") trusts the sender's timecode, which stalls
+    # playback if the sender emits odd or non-advancing timecodes.
+    ndi_timestamp_mode: str = "receive-time"
 
     # --- system ---
     device_name: str = "pistreamer"

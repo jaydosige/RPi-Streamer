@@ -22,6 +22,15 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 UPLOAD_CHUNK = 1024 * 1024
 
+# ndisrc's timestamp-mode enum nicks, from gst-plugin-ndi.
+TIMESTAMP_MODES = (
+    "receive-time",
+    "receive-time-vs-timecode",
+    "receive-time-vs-timestamp",
+    "timecode",
+    "timestamp",
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -111,6 +120,10 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         raise HTTPException(400, "rotation must be 0, 90, 180 or 270")
     if "ndi_bandwidth" in patch and patch["ndi_bandwidth"] not in ("highest", "lowest"):
         raise HTTPException(400, "ndi_bandwidth must be 'highest' or 'lowest'")
+    if "ndi_timestamp_mode" in patch and patch["ndi_timestamp_mode"] not in TIMESTAMP_MODES:
+        raise HTTPException(
+            400, f"ndi_timestamp_mode must be one of: {', '.join(TIMESTAMP_MODES)}"
+        )
 
     cfg = config.update(**patch)
     # Display/audio/NDI settings only take effect on a fresh pipeline.
@@ -123,6 +136,7 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         "volume",
         "ndi_bandwidth",
         "ndi_latency_ms",
+        "ndi_timestamp_mode",
         "loop",
     }
     if restart_keys & set(patch) and cfg.mode != MODE_IDLE:

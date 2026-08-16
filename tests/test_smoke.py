@@ -48,7 +48,7 @@ def main() -> int:
 
         r = client.get("/api/config")
         check("GET /api/config -> 200", r.status_code == 200)
-        check("config exposes all 15 keys", len(r.json()) == 15, str(len(r.json())))
+        check("config exposes all 16 keys", len(r.json()) == 16, str(len(r.json())))
 
         print("\nconfig validation")
         r = client.post("/api/config", json={"rotation": 45})

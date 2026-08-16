@@ -244,6 +244,16 @@
         <span class="lbl">Receive buffer (ms) &mdash; raise if the picture stutters</span>
         <input type="number" id="cfgLatency" min="0" max="2000" step="20">
       </label>
+      <label class="field">
+        <span class="lbl">Timestamps &mdash; change only if the picture freezes on one frame</span>
+        <select id="cfgTimestampMode">
+          <option value="receive-time">Our own clock (safest)</option>
+          <option value="receive-time-vs-timecode">Sender timecode vs receive time</option>
+          <option value="receive-time-vs-timestamp">Sender timestamp vs receive time</option>
+          <option value="timecode">Sender timecode</option>
+          <option value="timestamp">Sender timestamp</option>
+        </select>
+      </label>
       <div class="banner warn" style="margin-bottom:0">
         A Pi 4 can comfortably decode NDI HX (H.264/HEVC). Full-bandwidth SpeedHQ at
         1080p60 is likely beyond it &mdash; if playback stutters, switch the sender to HX
@@ -432,6 +442,7 @@ function applyConfigToForm(c) {
   $("volLabel").textContent = c.volume;
   $("cfgBandwidth").value = c.ndi_bandwidth;
   $("cfgLatency").value = c.ndi_latency_ms;
+  $("cfgTimestampMode").value = c.ndi_timestamp_mode;
   $("cfgAutostart").checked = c.autostart;
   if (document.activeElement !== $("cfgHostname")) {
     $("cfgHostname").value = STATE.system.hostname || c.device_name;
@@ -616,6 +627,7 @@ $("btnSaveDisplay").onclick = async () => {
       volume: parseInt($("cfgVolume").value, 10),
       ndi_bandwidth: $("cfgBandwidth").value,
       ndi_latency_ms: parseInt($("cfgLatency").value, 10) || 0,
+      ndi_timestamp_mode: $("cfgTimestampMode").value,
     });
     settingsDirty = false;
     toast("Saved — pipeline restarting");
