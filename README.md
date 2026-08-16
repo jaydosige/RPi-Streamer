@@ -69,8 +69,8 @@ options, then:
 
 ```bash
 sudo apt update && sudo apt install -y git
-git clone <this-repo> pi-streamer
-cd pi-streamer
+git clone https://github.com/jaydosige/RPi-Streamer.git
+cd RPi-Streamer
 sudo ./install.sh
 sudo reboot
 ```

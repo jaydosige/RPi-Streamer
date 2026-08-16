@@ -70,6 +70,29 @@ def _flip_method(rotation: int) -> Optional[str]:
     return {90: "clockwise", 180: "rotate-180", 270: "counterclockwise"}.get(rotation)
 
 
+def _gst_quote(value: str) -> str:
+    """Quote a property value for the gst-launch parser.
+
+    gst-launch-1.0 joins its argv with spaces and re-parses the result, so
+    passing the value as a single argv element is not enough: a real NDI name
+    like `STUDIO-PC (OBS)` contains a space and parentheses, and parentheses
+    open a bin in gst-launch syntax. The value has to carry literal quotes.
+    """
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _bandwidth_value(setting: str) -> int:
+    """Map the config's friendly name onto ndisrc's integer `bandwidth`.
+
+    ndisrc exposes bandwidth as an int in the range -10..100 mirroring the NDI
+    SDK enum (-10 metadata-only, 0 lowest/proxy, 10 audio-only, 100 highest).
+    It is NOT a string enum — passing "highest" fails to parse and the pipeline
+    never starts.
+    """
+    return {"highest": 100, "lowest": 0}.get(setting, 100)
+
+
 def _connector_id(connector_name: str) -> Optional[int]:
     """Read the numeric DRM connector id kmssink wants, from sysfs."""
     if not connector_name or not display.DRM_SYSFS.exists():
@@ -135,8 +158,13 @@ class Player:
             "gst-launch-1.0",
             "-q",
             "ndisrc",
-            f"ndi-name={source}",
-            f"bandwidth={cfg.ndi_bandwidth}",
+            f"ndi-name={_gst_quote(source)}",
+            f"bandwidth={_bandwidth_value(cfg.ndi_bandwidth)}",
+            # Surface a dead sender as a pipeline error instead of hanging
+            # silently; the supervisor then retries with backoff.
+            "connect-timeout=10000",
+            "timeout=5000",
+            f"receiver-ndi-name={_gst_quote(cfg.device_name or 'pistreamer')}",
             "!",
             "ndisrcdemux",
             "name=demux",

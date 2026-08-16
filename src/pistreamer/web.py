@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
-import shutil
+import os
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 from fastapi import Body, FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -26,6 +27,9 @@ UPLOAD_CHUNK = 1024 * 1024
 async def lifespan(app: FastAPI):
     config.ensure_dirs()
     cfg = config.load()
+    # The NDI finder needs to run continuously to see the network; start it
+    # before anything else so it has been up for a while by the first poll.
+    sources.start()
     player.start()
     if cfg.autostart and cfg.mode != MODE_IDLE:
         target = cfg.ndi_source if cfg.mode == MODE_NDI else cfg.local_file
@@ -33,6 +37,7 @@ async def lifespan(app: FastAPI):
         player.apply(cfg.mode, target)
     yield
     player.shutdown()
+    sources.stop()
 
 
 app = FastAPI(title="pi-streamer", version="0.1.0", lifespan=lifespan)
@@ -132,8 +137,46 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 
 @app.get("/api/ndi/sources")
 async def ndi_sources(refresh: bool = False) -> Dict[str, Any]:
-    found = sources.discover(timeout=2.0, use_cache=not refresh)
-    return {"sources": [s.__dict__ for s in found]}
+    # The finder runs continuously; this is a snapshot read. On a cold start
+    # give it a moment so the first page load is not misleadingly empty.
+    found = sources.discover(timeout=4.0 if refresh else 0.0)
+    return {
+        "sources": [s.to_dict() for s in found],
+        "discovery": sources.status(),
+    }
+
+
+@app.get("/api/ndi/diagnostics")
+async def ndi_diagnostics() -> Dict[str, Any]:
+    """Everything needed to tell 'the plugin is broken' from 'the network is'."""
+    env = dict(os.environ)
+    checks: Dict[str, Any] = {
+        "discovery": sources.status(),
+        "gst_plugin_path": env.get("GST_PLUGIN_PATH", ""),
+        "ld_library_path": env.get("LD_LIBRARY_PATH", ""),
+    }
+
+    plugin_so = Path("/opt/pistreamer/gst-plugins/libgstndi.so")
+    checks["plugin_file"] = str(plugin_so) if plugin_so.exists() else "MISSING"
+
+    libndi = sorted(Path("/usr/local/lib").glob("libndi.so*"))
+    checks["libndi"] = [str(p) for p in libndi] or "MISSING"
+
+    def _run(cmd: list[str]) -> str:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            return (proc.stdout + proc.stderr).strip()[:4000]
+        except (subprocess.SubprocessError, OSError) as exc:
+            return f"failed: {exc}"
+
+    inspect = _run(["gst-inspect-1.0", "ndisrc"])
+    checks["ndisrc_registered"] = "Factory Details" in inspect
+    checks["gst_inspect_ndisrc"] = inspect
+
+    checks["device_monitor"] = _run(
+        ["timeout", "8", "gst-device-monitor-1.0", "-f", "Source/Network"]
+    )
+    return checks
 
 
 # ----------------------------------------------------------------------

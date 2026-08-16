@@ -446,9 +446,15 @@ async function scanNdi(refresh) {
   try {
     const data = await api("/api/ndi/sources" + (refresh ? "?refresh=true" : ""));
     renderNdi(data.sources);
-    $("scanNote").textContent = data.sources.length
-      ? `${data.sources.length} found`
-      : "none found";
+    const d = data.discovery || {};
+    if (d.error) {
+      $("scanNote").textContent = "discovery error";
+      $("ndiList").innerHTML = `<div class="banner">Discovery is not running: ${d.error}</div>`
+        + $("ndiList").innerHTML;
+    } else {
+      const age = d.uptime ? ` · finder up ${Math.round(d.uptime)}s` : "";
+      $("scanNote").textContent = (data.sources.length ? `${data.sources.length} found` : "none found") + age;
+    }
   } catch (err) {
     $("ndiList").innerHTML = `<div class="banner">Discovery failed: ${err.message}</div>`;
     $("scanNote").textContent = "";
