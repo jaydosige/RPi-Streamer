@@ -98,6 +98,46 @@ def list_connectors() -> List[Connector]:
     return out
 
 
+def parse_mode(text: str) -> Optional[Mode]:
+    """Parse "1920x1080@60" / "1920x1080" into a Mode."""
+    m = re.match(r"^\s*(\d+)\s*x\s*(\d+)\s*(?:@\s*(\d+))?\s*$", text or "")
+    if not m:
+        return None
+    return Mode(int(m.group(1)), int(m.group(2)), int(m.group(3) or 60))
+
+
+def target_mode(connector: Optional[Connector], requested: str = "") -> Optional[Mode]:
+    """Resolve which mode to actually drive, as one the connector reports.
+
+    kmssink will only set a mode that matches the incoming frame size
+    *exactly*: configure_mode_setting() walks the connector's mode list
+    looking for hdisplay/vdisplay equal to the video width/height, and fails
+    outright if nothing matches. So rather than hoping an NDI sender happens
+    to produce a resolution the monitor advertises, we scale the video to a
+    mode we know is on the list.
+
+    Falls back to the kernel's preferred mode, which is the first entry in
+    the connector's modes file.
+    """
+    if connector is None or not connector.modes:
+        return None
+    if requested:
+        want = parse_mode(requested)
+        if want:
+            # Prefer an exact width/height/refresh hit, then ignore refresh.
+            for mode in connector.modes:
+                if (mode.width, mode.height, mode.refresh) == (
+                    want.width,
+                    want.height,
+                    want.refresh,
+                ):
+                    return mode
+            for mode in connector.modes:
+                if (mode.width, mode.height) == (want.width, want.height):
+                    return mode
+    return connector.modes[0]
+
+
 def pick_connector(preferred: str = "") -> Optional[Connector]:
     """Resolve the configured connector, falling back to the first connected one."""
     connectors = list_connectors()

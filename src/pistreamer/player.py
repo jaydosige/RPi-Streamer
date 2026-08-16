@@ -157,7 +157,18 @@ class Player:
         flip = _flip_method(cfg.rotation)
         if flip:
             video_chain += ["!", "videoflip", f"method={flip}"]
-        video_chain += ["!", "videoscale", "!"] + sink
+
+        # Scale to a mode the connector actually advertises and pin the pixel
+        # format. kmssink only sets a mode that matches the frame size
+        # exactly, and allocates its mode-setting buffer at that size, so an
+        # arbitrary sender resolution fails with "failed to allocate buffer
+        # object for mode setting". add-borders keeps the aspect ratio and
+        # pillar/letterboxes the rest.
+        mode = display.target_mode(conn, cfg.video_mode)
+        caps = "video/x-raw,format=BGRx"
+        if mode:
+            caps += f",width={mode.width},height={mode.height}"
+        video_chain += ["!", "videoscale", "add-borders=true", "!", caps, "!"] + sink
 
         cmd: List[str] = [
             "gst-launch-1.0",

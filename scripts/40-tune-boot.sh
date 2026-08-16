@@ -25,6 +25,16 @@ backup_once() {
 backup_once "${CONFIG_TXT}"
 
 MARKER="# --- pi-streamer ---"
+
+# Migration: earlier versions of this script set hdmi_force_hotplug=1, which
+# costs you EDID and pins the output at 640x480 when no EDID is readable.
+if grep -qE '^[[:space:]]*hdmi_force_hotplug=1' "${CONFIG_TXT}"; then
+  sed -i 's/^[[:space:]]*hdmi_force_hotplug=1/#hdmi_force_hotplug=1  # disabled by pi-streamer: costs EDID, forces 640x480/' \
+    "${CONFIG_TXT}"
+  warn "commented out hdmi_force_hotplug=1 (it can force the output to 640x480)"
+  warn "reboot required before the full mode list comes back"
+fi
+
 if grep -qF "${MARKER}" "${CONFIG_TXT}"; then
   info "config.txt already tuned"
 else
@@ -36,9 +46,14 @@ else
 dtoverlay=vc4-kms-v3d
 max_framebuffers=2
 
-# Keep HDMI alive even if the display is powered off or hot-plugged later.
-# Without this a signage node that boots before the screen shows nothing.
-hdmi_force_hotplug=1
+# NOTE: hdmi_force_hotplug=1 is deliberately NOT set here. It forces the
+# connector to report "connected" even with no EDID, and the fallback mode
+# in that case is 640x480 — which silently caps the whole node at VGA and
+# makes kmssink fail to match any sensible mode. Under the KMS driver the
+# correct way to pin an output that may boot with the display off is a
+# kernel cmdline entry in cmdline.txt instead, e.g.
+#   video=HDMI-A-1:1920x1080@60D
+# (the trailing D forces the connector enabled). Add that only if you need it.
 
 # No rainbow splash, no boot delay — this is an appliance.
 disable_splash=1
