@@ -179,12 +179,19 @@ try:
     digest = cl.sha256_file(clip)
     api(8111, "/api/playlists", method="POST",
         body={"name": "Wall", "items": [{"type": "file", "target": "sync-clip.mp4"}]})
-    result = api(8111, "/api/cluster/push", method="POST",
+    result = api(8111, "/api/cluster/push?wait=1", method="POST",
                  body={"playlist": "Wall"}, timeout=120)
-    pushed = result["results"][0] if result["results"] else {}
-    check("the push reported success", pushed.get("ok"), json.dumps(result))
+    pushed = result["nodes"][0] if result["nodes"] else {}
+    check("the push finished", result.get("done") and not result.get("running"),
+          json.dumps(result)[:300])
+    check("the node completed", pushed.get("state") == "done", json.dumps(pushed))
     check("the file was listed as sent", "sync-clip.mp4" in pushed.get("sent", []),
           json.dumps(pushed))
+    check("byte totals were tracked",
+          result.get("total_bytes", 0) >= clip.stat().st_size
+          and result.get("moved_bytes", 0) >= clip.stat().st_size,
+          json.dumps({k: result.get(k) for k in ("total_bytes", "moved_bytes")}))
+    check("progress reached 100%", result.get("percent") == 100.0, str(result.get("percent")))
     remote = api(8112, "/api/media?hashes=1", timeout=60)["files"]
     match = [f for f in remote if f["name"] == "sync-clip.mp4"]
     check("B now has the file", bool(match), json.dumps(remote))
@@ -196,12 +203,51 @@ try:
 
     # A second push must send nothing: the point of hashing is not re-sending
     # gigabytes before every show.
-    again = api(8111, "/api/cluster/push", method="POST",
+    again = api(8111, "/api/cluster/push?wait=1", method="POST",
                 body={"playlist": "Wall"}, timeout=120)
-    second = again["results"][0]
+    second = again["nodes"][0]
     check("a repeat push skips what is already there",
           second.get("skipped") == ["sync-clip.mp4"] and not second.get("sent"),
           json.dumps(second))
+    check("nothing was transferred the second time",
+          again.get("total_bytes") == 0, str(again.get("total_bytes")))
+
+    # Progress must be observable *while* it runs, not just at the end — that is
+    # the entire point. Push a file big enough to still be moving when we look.
+    big = TMP / "NODE-A" / "media" / "big-clip.mp4"
+    big.write_bytes(os.urandom(24 * 1024 * 1024))
+    api(8111, "/api/playlists", method="POST",
+        body={"name": "Big", "items": [{"type": "file", "target": "big-clip.mp4"}]})
+    api(8111, "/api/cluster/push", method="POST", body={"playlist": "Big"}, timeout=30)
+    seen_running, seen_partial, seen_file = False, False, False
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        snap = api(8111, "/api/cluster/push", timeout=10)
+        if snap.get("running"):
+            seen_running = True
+            if snap.get("file"):
+                seen_file = True
+            moved = snap.get("moved_bytes") or 0
+            if 0 < moved < big.stat().st_size:
+                seen_partial = True
+        if snap.get("done"):
+            break
+        time.sleep(0.05)
+    check("progress was visible while the push was running", seen_running)
+    # Whether an *intermediate* byte count is caught depends on the transfer
+    # outlasting one poll, and over loopback it often does not. The states
+    # themselves are asserted deterministically in test_cluster.py against a
+    # fake transfer, so racing them here would only buy a flaky test.
+    if seen_partial or seen_file:
+        check("a mid-transfer byte count or filename was observed", True)
+    else:
+        print("  · transfer completed inside one poll; see test_cluster.py "
+              "for the deterministic progress assertions")
+    final = api(8111, "/api/cluster/push", timeout=10)
+    check("the big file arrived intact",
+          any(f["name"] == "big-clip.mp4" and f["sha256"] == cl.sha256_file(big)
+              for f in api(8112, "/api/media?hashes=1", timeout=60)["files"]),
+          json.dumps(final)[:200])
 
     print("\ncommanding the group")
     out = api(8111, "/api/cluster/command", method="POST",

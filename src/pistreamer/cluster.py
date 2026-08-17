@@ -595,8 +595,50 @@ def _call_one(peer: Peer, address: str, path: str, method: str,
         return {"raw": raw.decode(errors="replace")[:300]}
 
 
+class _CountingReader:
+    """A file wrapper that reports how much has been handed to the socket.
+
+    http.client reads from the object we give it in chunks, so counting reads is
+    the only place a byte count is available — and without one, a multi-gigabyte
+    push to four nodes is a spinner with no information in it for ten minutes.
+
+    Reads are what has been *handed to the kernel*, not what the far end has
+    acknowledged, so the count can run slightly ahead of reality. Over a LAN the
+    difference is a socket buffer; it is not worth a second channel to correct.
+    """
+
+    def __init__(self, fh, on_progress=None, interval: float = 0.25) -> None:
+        self._fh = fh
+        self._on_progress = on_progress
+        self._sent = 0
+        self._interval = interval
+        self._last = 0.0
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._fh.read(size)
+        if chunk:
+            self._sent += len(chunk)
+            now = time.monotonic()
+            # Rate-limited: a 4 GB file is tens of thousands of reads and the
+            # callback takes a lock.
+            if self._on_progress and (now - self._last) >= self._interval:
+                self._last = now
+                try:
+                    self._on_progress(self._sent)
+                except Exception:  # noqa: BLE001 - reporting must never break a transfer
+                    pass
+        return chunk
+
+    def close(self) -> None:
+        self._fh.close()
+
+    @property
+    def sent(self) -> int:
+        return self._sent
+
+
 def upload(peer: Peer, name: str, path: Path, key: str = "",
-           timeout: float = 3600.0) -> Dict[str, Any]:
+           timeout: float = 3600.0, on_progress=None) -> Dict[str, Any]:
     """Stream one media file to a peer.
 
     Uses the raw-body endpoint rather than multipart: a multipart body has to be
@@ -610,7 +652,8 @@ def upload(peer: Peer, name: str, path: Path, key: str = "",
     # preceded by a call to ask what the peer already has, so by the time we
     # get here peer.ip is the address that worked.
     url = f"{peer.base_url()}/api/media/raw/{urllib.request.quote(name)}"
-    with path.open("rb") as fh:
+    with path.open("rb") as raw_fh:
+        fh = _CountingReader(raw_fh, on_progress)
         req = urllib.request.Request(
             url, data=fh, method="PUT",
             headers={
@@ -633,6 +676,14 @@ def upload(peer: Peer, name: str, path: Path, key: str = "",
             raise PeerError(f"{peer.name or peer.ip}: HTTP {exc.code} {detail}") from exc
         except (urllib.error.URLError, OSError, TimeoutError) as exc:
             raise PeerError(f"{peer.name or peer.ip}: upload failed ({exc})") from exc
+        finally:
+            # One last report so a finished file lands on its true size rather
+            # than wherever the rate limiter last happened to fire.
+            if on_progress:
+                try:
+                    on_progress(fh.sent)
+                except Exception:  # noqa: BLE001
+                    pass
     try:
         return json.loads(raw)
     except ValueError:

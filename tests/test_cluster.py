@@ -29,7 +29,7 @@ os.environ["PISTREAMER_MEDIA"] = str(TMP / "media")
 os.environ["PISTREAMER_STATE"] = str(TMP)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pistreamer import cluster, syncplay  # noqa: E402
+from pistreamer import cluster, pushjob, syncplay  # noqa: E402
 
 PASS, FAIL = [], []
 
@@ -300,6 +300,138 @@ check("a node that never became ready got no pulses", not nodes[2].pulses)
 check("the failure is reported, not swallowed",
       any(f["name"] == "C" for f in state["last"]["failed"]), str(state["last"]))
 check("both items were played", state["index"] == 1, str(state["index"]))
+
+print("\npush progress")
+# Progress reporting is tested here rather than against a real transfer: over
+# loopback a push finishes inside a single poll, so a live test can only catch
+# the intermediate states by luck. Fake deps make every state deterministic.
+
+
+class FakePeer:
+    def __init__(self, name):
+        self.id = name
+        self.name = name
+        self.ip = "10.0.0.1"
+
+
+def fake_job(upload=None, hashes=None, playlist_fn=None):
+    return pushjob.PushJob("Wall", {
+        "remote_hashes": hashes or (lambda peer: {}),
+        "send_playlist": playlist_fn or (lambda peer: None),
+        "resolve": lambda name: "/tmp/" + name,
+        "upload": upload or (lambda peer, name, path, progress: progress(10)),
+    })
+
+
+SIZES = {"a.mp4": 1000, "b.mp4": 500}
+WANTED = {"a.mp4": "hash-a", "b.mp4": "hash-b"}
+
+seen = []
+
+
+def slow_upload(peer, name, path, progress):
+    for sent in (250, 500, 750, SIZES[name]):
+        progress(min(sent, SIZES[name]))
+        time.sleep(0.05)
+
+
+job = fake_job(upload=slow_upload)
+job.start([FakePeer("NODE-A")], WANTED, SIZES)
+while job.is_running():
+    seen.append(job.snapshot())
+    time.sleep(0.02)
+final = job.snapshot()
+
+check("the total is what will actually be sent",
+      final["total_bytes"] == 1500, str(final["total_bytes"]))
+check("every byte is accounted for at the end",
+      final["moved_bytes"] == 1500, str(final["moved_bytes"]))
+check("it finishes at 100%", final["percent"] == 100.0, str(final["percent"]))
+check("it reports success", final["ok"] and not final["failed"], str(final))
+check("both files are listed as sent",
+      final["nodes"][0]["sent"] == ["a.mp4", "b.mp4"], str(final["nodes"][0]))
+check("partial progress was visible while running",
+      any(0 < s["moved_bytes"] < 1500 for s in seen),
+      str([s["moved_bytes"] for s in seen]))
+check("the file being sent was named",
+      any(s["file"] in ("a.mp4", "b.mp4") for s in seen),
+      str({s["file"] for s in seen}))
+check("progress never went backwards",
+      all(b <= a for a, b in zip([s["moved_bytes"] for s in seen],
+                                 [s["moved_bytes"] for s in seen][1:])) is False
+      or all(a <= b for a, b in zip([s["moved_bytes"] for s in seen],
+                                    [s["moved_bytes"] for s in seen][1:])),
+      str([s["moved_bytes"] for s in seen]))
+check("a rate was measured", any(s["rate"] > 0 for s in seen))
+
+# A node that already has everything must transfer nothing at all.
+job = fake_job(hashes=lambda peer: dict(WANTED))
+job.start([FakePeer("NODE-A")], WANTED, SIZES)
+while job.is_running():
+    time.sleep(0.02)
+final = job.snapshot()
+check("a node that has everything gets nothing sent",
+      final["total_bytes"] == 0 and not final["nodes"][0]["sent"], str(final["nodes"][0]))
+check("...and its files are reported as skipped",
+      sorted(final["nodes"][0]["skipped"]) == ["a.mp4", "b.mp4"],
+      str(final["nodes"][0]["skipped"]))
+check("percent is absent rather than a false 0%", final["percent"] is None,
+      str(final["percent"]))
+
+# One node failing must not stop the next, and must be reported.
+def flaky_upload(peer, name, path, progress):
+    if peer.name == "NODE-A":
+        raise RuntimeError("HTTP 401 wrong or missing cluster key")
+    progress(SIZES[name])
+
+
+job = fake_job(upload=flaky_upload)
+job.start([FakePeer("NODE-A"), FakePeer("NODE-B")], WANTED, SIZES)
+while job.is_running():
+    time.sleep(0.02)
+final = job.snapshot()
+check("a failing node is marked failed",
+      final["nodes"][0]["state"] == "failed", str(final["nodes"][0]))
+check("the reason is kept, not swallowed",
+      "401" in final["nodes"][0]["error"], final["nodes"][0]["error"])
+check("the next node is still pushed to",
+      final["nodes"][1]["state"] == "done", str(final["nodes"][1]))
+check("the outcome is not reported as ok", not final["ok"], str(final["ok"]))
+check("the failure is summarised for the GUI",
+      final["failed"] and final["failed"][0]["name"] == "NODE-A", str(final["failed"]))
+check("the bar still reaches 100% despite the failure",
+      final["percent"] == 100.0, str(final["percent"]))
+
+# Cancelling mid-transfer must stop promptly and say so.
+def slower_upload(peer, name, path, progress):
+    for _ in range(20):
+        progress(100)
+        time.sleep(0.05)
+
+
+job = fake_job(upload=slower_upload)
+job.start([FakePeer("NODE-A")], WANTED, SIZES)
+time.sleep(0.15)
+job.cancel()
+stopped_by = time.monotonic() + 5
+while job.is_running() and time.monotonic() < stopped_by:
+    time.sleep(0.02)
+final = job.snapshot()
+check("cancelling stops the push", not job.is_running())
+check("...and it is reported as cancelled", final["cancelled"] and not final["ok"],
+      str({k: final[k] for k in ("cancelled", "ok")}))
+
+print("\ncounting bytes as they go")
+import io  # noqa: E402
+
+marks = []
+reader = cluster._CountingReader(io.BytesIO(b"x" * 5000), marks.append, interval=0)
+while reader.read(1000):
+    pass
+check("every read is counted", reader.sent == 5000, str(reader.sent))
+check("progress was reported as it went", len(marks) >= 4, str(marks))
+check("the counts only ever increase",
+      all(a < b for a, b in zip(marks, marks[1:])), str(marks))
 
 print()
 print(f"{len(PASS)} passed, {len(FAIL)} failed")

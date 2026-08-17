@@ -366,9 +366,11 @@ python3 tests/test_smoke.py        # API contract, config, uploads, degradation
 python3 tests/test_features.py     # playlist segments, validation, schedule cues
 python3 tests/test_teardown.py     # nothing outlives its segment (real processes)
 python3 tests/test_diagnose.py     # network-vs-Pi verdicts
-python3 tests/test_cluster.py      # beacons, group auth, sync maths, conductor
+python3 tests/test_cluster.py      # beacons, group auth, sync maths, push progress
 python3 tests/test_cluster_live.py # two real nodes: discovery, auth, file push
 python3 tests/test_overlay.py      # the identify caption actually renders
+python3 tests/test_gui.py          # real browser: the poll must not overwrite
+                                   # what you are typing, and progress bars move
 
 python -m pistreamer.runner --self-test             # the real video chain
 python -m pistreamer.runner --self-test-compressed  # decoder selection

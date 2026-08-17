@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import (cluster, config, diagnose, display, media, ndiconfig, playlists,
-               schedule as schedule_mod, sources, syncplay, system)
+               pushjob, schedule as schedule_mod, sources, syncplay, system)
 from .player import MODE_IDLE, MODE_LOCAL, MODE_NDI, identify_text, player
 from .telemetry import telemetry
 
@@ -35,6 +35,12 @@ conductor = syncplay.Conductor({
     "offsets": lambda ids: _conductor_offsets(ids),
     "position": lambda: player.sync_position(),
 })
+
+
+# The most recent push, kept so its progress can be polled after the request
+# that started it has returned. One at a time: two pushes of the same file to
+# the same node would race over the same temp file at the far end.
+push_job = None
 
 
 def _is_self(peer: cluster.Peer) -> bool:
@@ -1063,55 +1069,82 @@ class SyncPushBody(BaseModel):
 
 
 @app.post("/api/cluster/push")
-async def post_cluster_push(body: SyncPushBody) -> Dict[str, Any]:
+async def post_cluster_push(body: SyncPushBody, wait: bool = False) -> Dict[str, Any]:
     """Copy a playlist and every file it needs to the other nodes.
 
     Only what is missing is sent, decided by hash rather than by name and size:
     two different cuts of a video exported the same afternoon are the same size
     surprisingly often, and sending nothing because of that would put the wrong
     content on a screen.
+
+    Returns immediately with a job to poll, because a playlist is gigabytes and
+    a request that returns nothing for ten minutes cannot be told apart from one
+    that has hung. `?wait=1` blocks until it finishes, for scripting.
     """
+    global push_job
     cfg = config.load()
     playlist = playlists.get(body.playlist)
     if playlist is None:
         raise HTTPException(404, f"playlist not found: {body.playlist}")
+    if push_job is not None and push_job.is_running():
+        raise HTTPException(409, "a push is already running")
+
     wanted: Dict[str, str] = {}
+    sizes: Dict[str, int] = {}
     for segment in playlists.resolved_segments(body.playlist):
         if segment["type"] != "file":
             continue
         path = Path(segment["path"])
         wanted[segment["target"]] = cluster.sha256_file(path)
+        sizes[segment["target"]] = path.stat().st_size
 
-    targets = _peers_by_id(body.nodes) if body.nodes else cluster.registry.all()
-    results = []
-    for peer in targets:
-        if peer.id == cluster.node_id():
-            continue
-        entry: Dict[str, Any] = {"name": peer.name or peer.ip, "sent": [],
-                                 "skipped": [], "ok": True}
-        try:
-            remote = cluster.call(peer, "/api/media?hashes=1", key=cfg.cluster_key,
-                                  timeout=600)
-            have = {f["name"]: f.get("sha256") for f in remote.get("files", [])}
-            for name, digest in wanted.items():
-                if have.get(name) == digest:
-                    entry["skipped"].append(name)
-                    continue
-                path = media.resolve(name)
-                if path is None:
-                    continue
-                cluster.upload(peer, name, path, key=cfg.cluster_key)
-                entry["sent"].append(name)
-            cluster.call(peer, "/api/playlists", method="POST",
-                         body={"name": playlist.name, "items": playlist.items,
-                               "loop": playlist.loop, "shuffle": playlist.shuffle,
-                               "image_duration": playlist.image_duration},
-                         key=cfg.cluster_key)
-        except Exception as exc:  # noqa: BLE001
-            entry["ok"] = False
-            entry["error"] = str(exc)
-        results.append(entry)
-    return {"playlist": body.playlist, "files": list(wanted), "results": results}
+    targets = [p for p in (_peers_by_id(body.nodes) if body.nodes
+                           else cluster.registry.all())
+               if p.id != cluster.node_id()]
+    if not targets:
+        raise HTTPException(400, "no other nodes to send to")
+
+    def remote_hashes(peer: cluster.Peer) -> Dict[str, Any]:
+        remote = cluster.call(peer, "/api/media?hashes=1", key=cfg.cluster_key,
+                              timeout=600)
+        return {f["name"]: f.get("sha256") for f in remote.get("files", [])}
+
+    def send_playlist(peer: cluster.Peer) -> None:
+        cluster.call(peer, "/api/playlists", method="POST",
+                     body={"name": playlist.name, "items": playlist.items,
+                           "loop": playlist.loop, "shuffle": playlist.shuffle,
+                           "image_duration": playlist.image_duration},
+                     key=cfg.cluster_key)
+
+    push_job = pushjob.PushJob(body.playlist, {
+        "remote_hashes": remote_hashes,
+        "send_playlist": send_playlist,
+        "resolve": media.resolve,
+        "upload": lambda peer, name, path, progress: cluster.upload(
+            peer, name, path, key=cfg.cluster_key, on_progress=progress),
+    })
+    push_job.start(targets, wanted, sizes)
+
+    if wait:
+        while push_job.is_running():
+            await asyncio.sleep(0.2)
+    return push_job.snapshot()
+
+
+@app.get("/api/cluster/push")
+async def get_cluster_push() -> Dict[str, Any]:
+    """Where the running (or last) push got to. Polled by the GUI."""
+    if push_job is None:
+        return {"running": False, "done": False, "nodes": []}
+    return push_job.snapshot()
+
+
+@app.post("/api/cluster/push/cancel")
+async def post_cluster_push_cancel() -> Dict[str, Any]:
+    if push_job is None:
+        raise HTTPException(404, "no push has been started")
+    push_job.cancel()
+    return {"cancelling": True}
 
 
 class SyncPlayBody(BaseModel):

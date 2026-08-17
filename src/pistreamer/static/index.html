@@ -102,6 +102,41 @@
   ul.list li .name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   ul.list li .sub { font-size: 12px; color: var(--muted); }
   ul.list li.playing { outline: 1px solid var(--accent); }
+  /* Transfer progress. Used for browser->node uploads and node->node pushes;
+     one set of styles so both read the same way. */
+  .prog { margin: 8px 0 2px; }
+  .prog .row3 {
+    display: flex; align-items: baseline; gap: 8px; font-size: 13px;
+    margin-bottom: 4px;
+  }
+  .prog .who { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  .prog .pct { font-variant-numeric: tabular-nums; font-weight: 500; }
+  .prog .rate { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bar {
+    height: 6px; border-radius: 3px; background: var(--panel-2);
+    overflow: hidden;
+  }
+  .bar > i {
+    display: block; height: 100%; width: 0; background: var(--accent);
+    border-radius: 3px; transition: width .18s linear;
+  }
+  .bar.done > i { background: var(--good); }
+  .bar.failed > i { background: var(--bad); width: 100% !important; }
+  /* No total known: show motion rather than a bar stuck at zero. */
+  .bar.unknown > i {
+    width: 35% !important; animation: slide 1.1s ease-in-out infinite;
+  }
+  @keyframes slide {
+    0% { margin-left: -35%; } 100% { margin-left: 100%; }
+  }
+
+  /* A field with unsaved edits. It has stopped tracking the node on purpose,
+     and saying so is better than leaving someone wondering. */
+  input.edited, select.edited, textarea.edited {
+    border-color: var(--accent);
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
   .empty { color: var(--muted); font-size: 14px; padding: 14px 2px; }
 
   label.field { display: block; margin-bottom: 13px; }
@@ -337,10 +372,12 @@
       <h2>Library</h2>
       <div class="row" style="margin-bottom:12px">
         <button class="btn primary" id="btnPlayAll">Play whole folder (loop)</button>
-        <input type="file" id="fileInput" hidden>
-        <button class="btn" id="btnUpload">Upload file</button>
+        <input type="file" id="fileInput" hidden multiple>
+        <button class="btn" id="btnUpload">Upload files</button>
+        <button class="btn danger" id="btnUploadCancel" style="display:none">Cancel</button>
         <span class="host" id="uploadNote"></span>
       </div>
+      <div id="uploadProgress"></div>
       <ul class="list" id="mediaList"></ul>
     </div>
     <div class="card">
@@ -716,7 +753,7 @@
       <h2>This node</h2>
       <ul class="list" id="clusterSelf"></ul>
       <div class="checkline" style="margin-top:10px">
-        <input type="checkbox" id="cfgIdentify">
+        <input type="checkbox" id="cfgIdentify" data-transient>
         <label for="cfgIdentify">Identify &mdash; show every node's name and address on screen</label>
       </div>
       <div class="host">
@@ -753,14 +790,15 @@
       </div>
       <label class="field">
         <span class="lbl">Playlist</span>
-        <select id="syncPlaylist"></select>
+        <select id="syncPlaylist" data-transient></select>
       </label>
       <div class="row">
         <button class="btn" id="btnPushPlaylist">Send files to the group</button>
+        <button class="btn danger" id="btnPushCancel" style="display:none">Cancel send</button>
         <button class="btn primary" id="btnSyncPlay">Play together</button>
         <button class="btn" id="btnSyncStop">Stop</button>
       </div>
-      <div class="host" id="pushResult" style="margin-top:10px"></div>
+      <div id="pushProgress" style="margin-top:10px"></div>
       <ul class="list" id="syncState" style="margin-top:10px"></ul>
     </div>
 
@@ -903,6 +941,71 @@ let CONNECTORS = [];
 let pollTimer = null;
 let settingsDirty = false;
 
+// ---------- form fields the poll must not fight ----------
+//
+// The status poll runs every two seconds and repopulates the settings forms
+// from the server. Left unguarded that overwrites whatever someone is halfway
+// through typing, which reads as the page fighting you.
+//
+// This was originally patched per-field with `document.activeElement !== el`
+// checks on four inputs. That was not enough twice over: it only covered the
+// fields somebody had complained about, so every field added later brought the
+// bug back; and focus is the wrong test, because clicking from the group name
+// into the key field means the poll wipes the name you just typed.
+//
+// So: one helper, used for every write into a form control, and a field stays
+// protected from the moment it is edited until its value is saved.
+
+const DIRTY = new Set();
+
+function setField(id, value) {
+  const el = $(id);
+  if (!el) return;
+  if (DIRTY.has(id)) return;
+  if (el.type === "checkbox" || el.type === "radio") {
+    // No focus guard for a tick box: there is no half-typed value to protect,
+    // and a clicked checkbox keeps focus indefinitely — which froze the
+    // identify toggle so it stopped showing what the group was actually doing.
+    el.checked = !!value;
+    return;
+  }
+  if (document.activeElement === el) return;
+  const next = value === null || value === undefined ? "" : String(value);
+  // Assigning an identical value still moves the caret in some browsers.
+  if (el.value !== next) el.value = next;
+}
+
+// Rebuilding a <select>'s options resets its selection, so callers that
+// regenerate option lists need to know whether they may.
+function fieldHeld(id) {
+  return DIRTY.has(id) || document.activeElement === $(id);
+}
+
+function markDirty(el) {
+  if (!el || !el.id) return;
+  if (!/^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) return;
+  // data-transient marks a control that is acted on immediately or merely
+  // picks a target. There is no save to clear its flag, so tracking it would
+  // freeze it after first use; focus alone is the right guard for those.
+  if (el.dataset.transient !== undefined) return;
+  DIRTY.add(el.id);
+  el.classList.add("edited");
+}
+
+function clearDirty(...ids) {
+  const list = ids.length ? ids : Array.from(DIRTY);
+  list.forEach((id) => {
+    DIRTY.delete(id);
+    const el = $(id);
+    if (el) el.classList.remove("edited");
+  });
+}
+
+// Capture phase, on the document: this has to cover controls that do not exist
+// yet, because the playlist editor and the node list are rebuilt as we go.
+document.addEventListener("input", (e) => markDirty(e.target), true);
+document.addEventListener("change", (e) => markDirty(e.target), true);
+
 // ---------- helpers ----------
 
 function toast(msg, bad) {
@@ -924,11 +1027,47 @@ async function api(path, opts) {
   return body;
 }
 
-const post = (path, data) => api(path, {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify(data || {}),
-});
+// Which form control holds which config key. Its only job is to know exactly
+// which fields a save covered, so those — and only those — go back to tracking
+// the server. Clearing every field instead would mean saving the display
+// settings silently discarded a group key typed but not yet saved.
+const CONFIG_FIELDS = {
+  audio_device: "cfgAudioDevice",
+  audio_device_mpv: "cfgAudioDeviceMpv",
+  audio_enabled: "cfgAudioEnabled",
+  audio_sync: "cfgAudioSync",
+  autostart: "cfgAutostart",
+  cluster_drift_correct: "cfgClusterDrift",
+  cluster_enabled: "cfgClusterEnabled",
+  cluster_extra_ips: "cfgClusterExtraIps",
+  cluster_group: "cfgClusterGroup",
+  cluster_key: "cfgClusterKey",
+  connector: "cfgConnector",
+  device_name: "cfgHostname",
+  ndi_adapter_ips: "cfgAdapterIps",
+  ndi_bandwidth: "cfgBandwidth",
+  ndi_discovery_server: "cfgDiscoveryServer",
+  ndi_extra_ips: "cfgExtraIps",
+  ndi_latency_ms: "cfgLatency",
+  ndi_timestamp_mode: "cfgTimestampMode",
+  ndi_url_address: "cfgUrlAddress",
+  rotation: "cfgRotation",
+  schedule_enabled: "cfgScheduleEnabled",
+  video_mode: "cfgMode",
+  volume: "cfgVolume",
+};
+
+const post = async (path, data) => {
+  const reply = await api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data || {}),
+  });
+  if (path === "/api/config" && data) {
+    clearDirty(...Object.keys(data).map((k) => CONFIG_FIELDS[k]).filter(Boolean));
+  }
+  return reply;
+};
 
 function fmtBytes(n) {
   if (n === null || n === undefined) return "—";
@@ -1175,18 +1314,16 @@ function renderStream(st, p) {
 }
 
 function applyConfigToForm(c) {
-  $("cfgRotation").value = String(c.rotation);
-  $("cfgAudioEnabled").checked = c.audio_enabled;
-  $("cfgAudioSync").checked = c.audio_sync;
-  $("cfgVolume").value = c.volume;
-  $("volLabel").textContent = c.volume;
-  $("cfgBandwidth").value = c.ndi_bandwidth;
-  $("cfgLatency").value = c.ndi_latency_ms;
-  $("cfgTimestampMode").value = c.ndi_timestamp_mode;
-  $("cfgAutostart").checked = c.autostart;
-  if (document.activeElement !== $("cfgHostname")) {
-    $("cfgHostname").value = STATE.system.hostname || c.device_name;
-  }
+  setField("cfgRotation", String(c.rotation));
+  setField("cfgAudioEnabled", c.audio_enabled);
+  setField("cfgAudioSync", c.audio_sync);
+  setField("cfgVolume", c.volume);
+  if (!fieldHeld("cfgVolume")) $("volLabel").textContent = c.volume;
+  setField("cfgBandwidth", c.ndi_bandwidth);
+  setField("cfgLatency", c.ndi_latency_ms);
+  setField("cfgTimestampMode", c.ndi_timestamp_mode);
+  setField("cfgAutostart", c.autostart);
+  setField("cfgHostname", STATE.system.hostname || c.device_name);
 }
 
 // ---------- playlists ----------
@@ -1344,7 +1481,7 @@ let SCHEDULE = { cues: [], day_names: ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"
 
 async function loadSchedule() {
   try { SCHEDULE = await api("/api/schedule"); } catch (_) { return; }
-  $("cfgScheduleEnabled").checked = SCHEDULE.enabled;
+  setField("cfgScheduleEnabled", SCHEDULE.enabled);
   const n = SCHEDULE.next;
   $("nextCue").textContent = !SCHEDULE.enabled ? "Schedule is off — no cues will fire."
     : n ? `Next: ${n.cue.label || n.cue.action} at ${n.cue.time}, in ${fmtDuration(n.in_minutes * 60)}.`
@@ -1470,7 +1607,7 @@ async function loadNodes() {
       && STATE.stream.overlay_available === false
       ? "unavailable — install gstreamer1.0-x (re-run install.sh)" : null],
   ]);
-  $("cfgIdentify").checked = !!c.self.identify;
+  setField("cfgIdentify", !!c.self.identify);
 
   // Two nodes with one identity see nothing of each other and there is no other
   // symptom, so this warning is worth more than it looks.
@@ -1526,14 +1663,15 @@ async function loadNodes() {
 
   const cfg = STATE ? STATE.config : null;
   if (cfg) {
-    $("cfgClusterEnabled").checked = cfg.cluster_enabled;
-    $("cfgClusterGroup").value = cfg.cluster_group;
-    $("cfgClusterKey").value = cfg.cluster_key;
-    $("cfgClusterExtraIps").value = cfg.cluster_extra_ips;
-    $("cfgClusterDrift").checked = cfg.cluster_drift_correct;
+    setField("cfgClusterEnabled", cfg.cluster_enabled);
+    setField("cfgClusterGroup", cfg.cluster_group);
+    setField("cfgClusterKey", cfg.cluster_key);
+    setField("cfgClusterExtraIps", cfg.cluster_extra_ips);
+    setField("cfgClusterDrift", cfg.cluster_drift_correct);
   }
   const sel = $("syncPlaylist");
   const keep = sel.value;
+  if (fieldHeld("syncPlaylist")) return;  // do not rebuild under the operator
   try {
     const pls = (await api("/api/playlists")).playlists;
     sel.innerHTML = pls.length
@@ -1551,10 +1689,17 @@ $("cfgIdentify").onchange = async () => {
       ? `Identify set here; ${bad.length} node(s) did not answer`
       : `Identify ${r.identify ? "on" : "off"} across the group`, bad.length > 0);
   } catch (e) { toast(e.message, true); }
+  clearDirty("cfgIdentify");
   loadNodes();
 };
 
-$("btnNodesRefresh").onclick = loadNodes;
+// An explicit refresh is also a request to discard unsaved edits and show what
+// the node actually has.
+$("btnNodesRefresh").onclick = () => {
+  clearDirty("cfgClusterEnabled", "cfgClusterGroup", "cfgClusterKey",
+             "cfgClusterExtraIps", "cfgClusterDrift");
+  loadNodes();
+};
 
 $("btnStandbyAll").onclick = async () => {
   try {
@@ -1574,22 +1719,97 @@ $("btnRebootAll").onclick = async () => {
   } catch (e) { toast(e.message, true); }
 };
 
+// The push runs on the node, not in the browser, so its progress has to be
+// asked for. Poll four times a second: fast enough that the bar moves smoothly,
+// slow enough to be nothing next to the transfer itself.
+let PUSH_TIMER = null;
+
+function renderPush(job) {
+  if (!job || (!job.running && !job.done)) {
+    $("pushProgress").innerHTML = "";
+    return;
+  }
+  const overall = job.percent === null || job.percent === undefined
+    ? "" : `${job.percent}%`;
+  const bits = [];
+  if (job.running) {
+    bits.push(job.file ? `sending ${job.file}` : "checking what each node needs");
+    if (job.rate > 0) bits.push(`${fmtBytes(job.rate)}/s`);
+    if (job.eta_s !== null && job.eta_s !== undefined) {
+      bits.push(job.eta_s > 90 ? `${Math.round(job.eta_s / 60)} min left`
+                               : `${job.eta_s}s left`);
+    }
+  } else if (job.cancelled) {
+    bits.push("cancelled");
+  } else {
+    // "finished" on its own reads as success, so a push where every node
+    // rejected the key would look fine. Say what actually happened.
+    const bad = (job.nodes || []).filter((n) => n.error).length;
+    bits.push(bad ? `finished with ${bad} failure${bad === 1 ? "" : "s"}` : "finished");
+  }
+
+  const nodeRows = (job.nodes || []).map((n) => {
+    const detail = n.error
+      ? `<span style="color:var(--bad)">${n.error}</span>`
+      : `${n.state}${n.sent.length ? ` · ${n.sent.length} sent` : ""}${
+          n.skipped.length ? ` · ${n.skipped.length} already there` : ""}`;
+    return `<div class="row3"><span class="who">${n.name}</span>
+      <span class="rate">${detail}</span></div>`;
+  }).join("");
+
+  $("pushProgress").innerHTML = `
+    <div class="prog">
+      <div class="row3">
+        <span class="who">${job.playlist || "playlist"} → ${(job.nodes || []).length} node(s)</span>
+        <span class="pct">${overall}</span>
+        <span class="rate">${bits.join(" · ")}</span>
+      </div>
+      <div class="bar${job.done
+        ? ((job.cancelled || (job.nodes || []).some((n) => n.error)) ? " failed" : " done")
+        : ""}">
+        <i style="width:${job.percent || 0}%"></i>
+      </div>
+      ${job.total_bytes ? `<div class="row3"><span class="rate">${
+        fmtBytes(job.moved_bytes)} of ${fmtBytes(job.total_bytes)}</span></div>` : ""}
+    </div>
+    ${nodeRows}`;
+}
+
+async function pollPush() {
+  let job;
+  try { job = await api("/api/cluster/push"); } catch (_) { return; }
+  renderPush(job);
+  if (!job.running) {
+    clearInterval(PUSH_TIMER);
+    PUSH_TIMER = null;
+    $("btnPushPlaylist").disabled = false;
+    $("btnPushCancel").style.display = "none";
+    const failed = (job.nodes || []).filter((n) => n.error);
+    if (job.cancelled) toast("Push cancelled", true);
+    else if (failed.length) toast(`${failed.length} node(s) failed`, true);
+    else if (job.done) toast("Playlist sent to the group");
+  }
+}
+
 $("btnPushPlaylist").onclick = async () => {
   const name = $("syncPlaylist").value;
   if (!name) { toast("No playlist selected", true); return; }
   $("btnPushPlaylist").disabled = true;
-  $("pushResult").textContent = "Sending — large files take a while, this waits for them.";
+  $("btnPushCancel").style.display = "";
+  $("pushProgress").innerHTML = `<div class="host">Hashing the playlist's files…</div>`;
   try {
-    const r = await post("/api/cluster/push", { playlist: name });
-    $("pushResult").innerHTML = r.results.length
-      ? r.results.map((x) => `<div>${x.name}: ${x.ok
-          ? `${x.sent.length} sent, ${x.skipped.length} already there`
-          : `<span style="color:var(--bad)">${x.error}</span>`}</div>`).join("")
-      : "<div>No other nodes to send to.</div>";
+    renderPush(await post("/api/cluster/push", { playlist: name }));
+    if (PUSH_TIMER) clearInterval(PUSH_TIMER);
+    PUSH_TIMER = setInterval(pollPush, 250);
   } catch (e) {
-    $("pushResult").innerHTML = `<span style="color:var(--bad)">${e.message}</span>`;
+    $("pushProgress").innerHTML = `<span style="color:var(--bad)">${e.message}</span>`;
+    $("btnPushPlaylist").disabled = false;
+    $("btnPushCancel").style.display = "none";
   }
-  $("btnPushPlaylist").disabled = false;
+};
+
+$("btnPushCancel").onclick = async () => {
+  try { await post("/api/cluster/push/cancel", {}); } catch (e) { toast(e.message, true); }
 };
 
 $("btnSyncPlay").onclick = async () => {
@@ -2085,10 +2305,11 @@ $("btnTable").onclick = () => {
 async function loadNdiNetwork() {
   if (!STATE) return;
   const c = STATE.config;
-  if (document.activeElement !== $("cfgAdapterIps")) $("cfgAdapterIps").value = c.ndi_adapter_ips;
-  if (document.activeElement !== $("cfgExtraIps")) $("cfgExtraIps").value = c.ndi_extra_ips;
-  if (document.activeElement !== $("cfgDiscoveryServer")) $("cfgDiscoveryServer").value = c.ndi_discovery_server;
-  if (document.activeElement !== $("cfgUrlAddress")) $("cfgUrlAddress").value = c.ndi_url_address;
+  // Per-field guarding lives in setField now, so these need no special case.
+  setField("cfgAdapterIps", c.ndi_adapter_ips);
+  setField("cfgExtraIps", c.ndi_extra_ips);
+  setField("cfgDiscoveryServer", c.ndi_discovery_server);
+  setField("cfgUrlAddress", c.ndi_url_address);
   try {
     const caps = await api("/api/capabilities");
     const nc = caps.ndi_config || {};
@@ -2236,26 +2457,149 @@ async function loadMedia() {
   }
 }
 
-$("btnUpload").onclick = () => $("fileInput").click();
-$("fileInput").onchange = async () => {
-  const file = $("fileInput").files[0];
-  if (!file) return;
-  const form = new FormData();
-  form.append("file", file);
-  $("btnUpload").disabled = true;
-  $("uploadNote").textContent = `uploading ${file.name}…`;
-  try {
-    await api("/api/media", { method: "POST", body: form });
-    $("uploadNote").textContent = "";
-    toast("Uploaded " + file.name);
-    loadMedia();
-  } catch (err) {
-    $("uploadNote").textContent = "";
-    toast(err.message, true);
-  } finally {
-    $("btnUpload").disabled = false;
-    $("fileInput").value = "";
+// ---------- uploads ----------
+//
+// XMLHttpRequest rather than fetch, for one reason: fetch cannot report upload
+// progress. A show file is often several gigabytes over Wi-Fi, and "uploading…"
+// with no numbers for six minutes is indistinguishable from a hung box.
+
+let UPLOAD = null;   // the in-flight XHR, so it can be cancelled
+let UPLOAD_QUEUE = [];
+
+function progressRow(id, label) {
+  return `<div class="prog" id="prog-${id}">
+    <div class="row3">
+      <span class="who">${label}</span>
+      <span class="pct" id="pct-${id}">0%</span>
+      <span class="rate" id="rate-${id}"></span>
+    </div>
+    <div class="bar" id="bar-${id}"><i></i></div>
+  </div>`;
+}
+
+function setProgress(id, sent, total, rate, note) {
+  const bar = $("bar-" + id), pct = $("pct-" + id), rateEl = $("rate-" + id);
+  if (!bar) return;
+  if (total > 0) {
+    const share = Math.max(0, Math.min(1, sent / total));
+    bar.classList.remove("unknown");
+    bar.firstElementChild.style.width = (share * 100).toFixed(1) + "%";
+    if (pct) pct.textContent = Math.floor(share * 100) + "%";
+  } else {
+    // Length unknown — an indeterminate bar is honest, a 0% one is not.
+    bar.classList.add("unknown");
+    if (pct) pct.textContent = fmtBytes(sent);
   }
+  if (rateEl) {
+    const parts = [];
+    if (total > 0) parts.push(`${fmtBytes(sent)} of ${fmtBytes(total)}`);
+    if (rate > 0) {
+      parts.push(`${fmtBytes(rate)}/s`);
+      if (total > sent) {
+        const left = Math.round((total - sent) / rate);
+        parts.push(left > 90 ? `${Math.round(left / 60)} min left` : `${left}s left`);
+      }
+    }
+    if (note) parts.push(note);
+    rateEl.textContent = parts.join(" · ");
+  }
+}
+
+function finishProgress(id, ok, note) {
+  const bar = $("bar-" + id);
+  if (bar) {
+    bar.classList.remove("unknown");
+    bar.classList.add(ok ? "done" : "failed");
+    if (ok) bar.firstElementChild.style.width = "100%";
+  }
+  const rateEl = $("rate-" + id);
+  if (rateEl && note) rateEl.textContent = note;
+  const pct = $("pct-" + id);
+  if (pct) pct.textContent = ok ? "done" : "failed";
+}
+
+function uploadOne(file, id) {
+  return new Promise((resolve, reject) => {
+    const form = new FormData();
+    form.append("file", file);
+    const xhr = new XMLHttpRequest();
+    UPLOAD = xhr;
+    // Rate over a short trailing window, not since the start: an average over
+    // the whole transfer hides the Wi-Fi dropping to a crawl halfway through,
+    // which is exactly what you want to see.
+    const started = Date.now();
+    let marks = [[started, 0]];
+    xhr.upload.onprogress = (e) => {
+      const now = Date.now();
+      marks.push([now, e.loaded]);
+      while (marks.length > 2 && now - marks[0][0] > 4000) marks.shift();
+      // A trailing window shows a stall the moment it happens, but on a fast
+      // link the window can be shorter than its own minimum span — which left
+      // a whole transfer reporting no rate. Fall back to the average so far.
+      const span = (now - marks[0][0]) / 1000;
+      const total = (now - marks[0][0] === 0 ? 0 : (now - started) / 1000);
+      const rate = span > 0.3 ? (e.loaded - marks[0][1]) / span
+                 : total > 0.1 ? e.loaded / total : 0;
+      setProgress(id, e.loaded, e.lengthComputable ? e.total : 0, rate);
+    };
+    xhr.onload = () => {
+      UPLOAD = null;
+      if (xhr.status >= 200 && xhr.status < 300) { resolve(); return; }
+      let detail = xhr.statusText;
+      try { detail = JSON.parse(xhr.responseText).detail || detail; } catch (_) {}
+      reject(new Error(detail));
+    };
+    xhr.onerror = () => { UPLOAD = null; reject(new Error("connection lost")); };
+    xhr.onabort = () => { UPLOAD = null; reject(new Error("cancelled")); };
+    xhr.open("POST", "/api/media");
+    xhr.send(form);
+  });
+}
+
+async function runUploads(files) {
+  UPLOAD_QUEUE = Array.from(files);
+  $("btnUpload").disabled = true;
+  $("btnUploadCancel").style.display = "";
+  $("uploadProgress").innerHTML = UPLOAD_QUEUE
+    .map((f, i) => progressRow("up" + i, `${f.name} · ${fmtBytes(f.size)}`)).join("");
+
+  let done = 0, failed = 0, cancelled = false;
+  for (let i = 0; i < UPLOAD_QUEUE.length; i++) {
+    const file = UPLOAD_QUEUE[i];
+    $("uploadNote").textContent =
+      `uploading ${i + 1} of ${UPLOAD_QUEUE.length} — ${file.name}`;
+    try {
+      await uploadOne(file, "up" + i);
+      finishProgress("up" + i, true, fmtBytes(file.size));
+      done++;
+      // Refresh as each one lands, so the library fills in as it goes rather
+      // than staying empty until the last file finishes.
+      loadMedia();
+    } catch (err) {
+      finishProgress("up" + i, false, err.message);
+      if (err.message === "cancelled") { cancelled = true; break; }
+      failed++;
+    }
+  }
+
+  $("btnUpload").disabled = false;
+  $("btnUploadCancel").style.display = "none";
+  $("fileInput").value = "";
+  $("uploadNote").textContent = "";
+  if (cancelled) toast(`Cancelled after ${done} file(s)`, true);
+  else if (failed) toast(`${done} uploaded, ${failed} failed`, true);
+  else if (done) toast(`Uploaded ${done} file${done === 1 ? "" : "s"}`);
+  loadMedia();
+  loadPlaylists();
+}
+
+$("btnUpload").onclick = () => $("fileInput").click();
+$("fileInput").onchange = () => {
+  const files = $("fileInput").files;
+  if (files && files.length) runUploads(files);
+};
+$("btnUploadCancel").onclick = () => {
+  if (UPLOAD) UPLOAD.abort();
 };
 
 $("btnPlayAll").onclick = async () => {
@@ -2276,6 +2620,7 @@ async function loadAudioDevices() {
   const opt = (v, label, sel) =>
     `<option value="${v}"${v === sel ? " selected" : ""}>${label}</option>`;
 
+  if (fieldHeld("cfgAudioDevice") || fieldHeld("cfgAudioDeviceMpv")) return;
   $("cfgAudioDevice").innerHTML = opt("", "System default", cur) +
     a.alsa.map((d) => opt(d.device,
       d.device + (d.description ? ` — ${d.description.slice(0, 60)}` : ""), cur)).join("");
@@ -2328,6 +2673,7 @@ function renderModes() {
     || CONNECTORS.find((c) => c.connected);
   const modes = conn ? conn.modes : [];
   const chosen = STATE ? STATE.config.video_mode : "";
+  if (fieldHeld("cfgMode")) return;  // an unsaved choice is not ours to replace
   $("cfgMode").innerHTML = `<option value="">Auto (monitor's preferred mode)</option>` +
     modes.map((m) => `<option value="${m}">${m}</option>`).join("");
   $("cfgMode").value = chosen;
@@ -2365,6 +2711,8 @@ $("btnSaveDisplay").onclick = async () => {
 $("btnSaveHostname").onclick = async () => {
   try {
     const res = await post("/api/system/hostname", { hostname: $("cfgHostname").value.trim() });
+    // Its own endpoint, so it is not covered by the /api/config key map.
+    clearDirty("cfgHostname");
     toast(`Hostname set to ${res.hostname} — reboot to apply everywhere`);
   } catch (err) { toast(err.message, true); }
 };
