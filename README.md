@@ -69,8 +69,8 @@ options, then:
 
 ```bash
 sudo apt update && sudo apt install -y git
-git clone https://github.com/jaydosige/RPi-Streamer.git
-cd RPi-Streamer
+git clone <this-repo> pi-streamer
+cd pi-streamer
 sudo ./install.sh
 sudo reboot
 ```
@@ -91,33 +91,99 @@ sudo NDI_SDK_TARBALL=/home/pi/Install_NDI_SDK_v6_Linux.tar.gz ./install.sh
 
 ## Performance — read this before specifying a job
 
-The Pi 4's video block and its CPU pull in different directions, and NDI has two
-very different wire formats:
+### The one lever that matters most
+
+The Pi 4 has **no hardware SpeedHQ decoder**, so full-bandwidth NDI is decoded
+on four Cortex-A72 cores and nothing you configure will change that. NDI HX is
+H.264/HEVC, which the Pi *can* decode in hardware — but only if the receiver
+hands the compressed frames over instead of decoding them itself.
+
+That requires the **NDI Advanced SDK**. With it, `ndisrc` emits
+`video/x-h264` / `video/x-h265` untouched, and the pipeline routes that to
+whatever hardware decoder the box has. Without it, every frame is decoded in
+software no matter what the sender does.
+
+```bash
+# Get the Advanced SDK from https://ndi.video/for-developers/ then:
+sudo NDI_ADVANCED_SDK_TARBALL=/path/to/advanced-sdk.tar.gz ./install.sh
+```
+
+The installer detects the Advanced SDK headers and builds the plugin with
+`--features advanced-sdk` automatically. Then pick a `compressed-*` colour
+format (the **Hardware decode** preset does this) and check the Performance
+tab: it reports which decoder actually got used and whether it is hardware.
+No element name is hardcoded — the decoder is chosen by rank at runtime and
+reported honestly.
+
+**This only helps if the sender emits NDI HX.** Full-bandwidth NDI has no
+compressed form; the setting will be ignored.
 
 | Stream | Decode path | Realistic on a Pi 4B |
 | --- | --- | --- |
-| NDI HX (H.264) | Hardware, V4L2 M2M | 1080p60 comfortably |
-| NDI HX3 / HEVC | Hardware HEVC block | 1080p60 comfortably |
-| Full-bandwidth NDI (SpeedHQ) | **CPU only** | 1080p30 marginal; 1080p60 unlikely |
+| NDI HX, Advanced SDK build | **Hardware** | 1080p60 comfortably |
+| NDI HX, standard SDK build | Software (libndi) | 1080p30–60, CPU-heavy |
+| Full-bandwidth NDI (SpeedHQ) | Software, no hardware path exists | 1080p30 marginal, 1080p60 unlikely |
 
-There is no hardware SpeedHQ decoder, so full-bandwidth NDI is decoded on four
-Cortex-A72 cores and that is the wall you will hit first. Two ways round it:
-have the sender emit NDI HX, or select the **proxy stream** in the GUI's NDI
-settings (`bandwidth=lowest`), which receives the sender's low-resolution
-preview instead.
+### Everything else, roughly in order of payoff
 
-**These numbers are estimates and need confirming on your hardware.** The GUI's
-health panel shows CPU, temperature and the Pi's own under-voltage/throttle
-flags — watch all three during a soak test.
+1. **Have the sender emit NDI HX.** Less data on the wire and the only route to
+   hardware decode. Bigger than every software tweak combined.
+2. **Turn off sink QoS.** The sink drops late frames to stay in time; if the Pi
+   is only slightly too slow that mechanism *is* the visible problem. Turning
+   off clock sync goes further — every frame is shown as it arrives.
+3. **Eliminate the colour conversion.** Set the output format to `auto`, which
+   negotiates from an ordered list of cheap formats. UYVY and NV12 are native
+   vc4 plane formats, so if the SDK hands back UYVY the conversion disappears.
+   (`auto` is a *preference list*, not "anything" — left unconstrained,
+   negotiation will cheerfully pick `A444_16LE`, which is the most expensive
+   format on offer.)
+4. **Eliminate the scale.** Either pin the display mode to the source
+   resolution, or tick "send the source's own resolution to the display".
+   videoscale is a passthrough when sizes already match.
+5. **Nearest-neighbour scaling** if you must scale. Free quality loss you
+   cannot see from ten metres.
+6. **Drop to the proxy stream** (`bandwidth=lowest`). Cuts network and CPU at
+   once. Sometimes the right answer for a confidence monitor.
+7. **Lower the output mode.** 720p instead of 1080p is a big saving in
+   conversion and scaling.
+8. **CPU governor pinned to `performance`.** Applied at boot by
+   `pistreamer-tuning.service`. The default `ondemand` ramps up *after* load
+   appears, which shows as periodic timing wobble.
+9. **Overclock.** Worth roughly 20–30% more headroom on a Pi 4 and documented
+   in `/etc/pistreamer/tuning.conf`. Deliberately not applied automatically:
+   check for under-voltage first and fit at least a heatsink.
+10. **Turn off audio** if you are not using it — one less branch and no ALSA.
+11. **Turn off the snapshot** if you do not need the standby hold; it costs a
+    JPEG encode every few seconds.
+12. **A Pi 5** if full-bandwidth 1080p60 is a hard requirement. Two to three
+    times the CPU. Sometimes the honest answer is a bigger board.
+
+The Performance tab has presets — Maximum compatibility, Balanced, Lowest CPU,
+Hardware decode — which fill the fields in without saving so you can see what
+changes before applying.
+
+### Diagnosing rather than guessing
+
+Frames are measured at two points: as they arrive from the receiver and as they
+reach the display. That distinguishes the two causes that look identical from
+outside.
+
+- Short **on arrival** → the network or the sender.
+- Arrive fine, short **on screen** → this Pi.
+
+The Diagnosis card on Now Playing states which, with its evidence. Wi-Fi
+signal, link rate, retries and power-save state are on the Diagnostics tab,
+along with ten minutes of history for CPU, temperature, throughput and frame
+rate.
 
 Also worth knowing:
 
 - Use a genuine 3A USB-C supply. Under-voltage throttling looks exactly like a
-  decode problem and the GUI will tell you which one it is.
-- Use wired Ethernet. NDI discovery is mDNS and full-bandwidth NDI is ~130 Mbps
-  at 1080p60; Wi-Fi is not a serious option for either.
-- NDI discovery does not cross subnets or VLANs without an NDI Discovery Server.
-  If the sender is on another VLAN, use the GUI's manual connect field.
+  decode problem; the Diagnostics tab separates them.
+- Use wired Ethernet. Full-bandwidth 1080p60 NDI is ~130 Mbps and discovery is
+  mDNS; Wi-Fi is not a serious option for either.
+- NDI discovery does not cross subnets or VLANs without an NDI Discovery
+  Server. Use the GUI's manual connect field for that case.
 
 ## Configuration
 

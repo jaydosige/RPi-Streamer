@@ -7,7 +7,7 @@ import os
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import Body, FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -38,9 +38,21 @@ COLOR_FORMATS = (
     "uyvy-rgba",
     "fastest",
     "best",
+    # These require the plugin to have been built against the NDI Advanced
+    # SDK. In them ndisrc passes H.264/H.265 through undecoded so hardware can
+    # decode it — the single biggest performance lever on a Pi.
+    "compressed-v1",
+    "compressed-v2",
+    "compressed-v3",
+    "compressed-v3-with-audio",
+    "compressed-v4",
+    "compressed-v4-with-audio",
+    "compressed-v5",
+    "compressed-v5-with-audio",
 )
-# Formats worth offering for the sink. BGRx is the safe default on vc4.
-VIDEO_FORMATS = ("BGRx", "RGBx", "BGRA", "RGB16", "NV12", "I420")
+# Formats worth offering for the sink. BGRx is the safe default on vc4;
+# "auto" negotiates from an ordered list of cheap formats.
+VIDEO_FORMATS = ("auto", "BGRx", "RGBx", "BGRA", "RGB16", "NV12", "UYVY", "I420")
 
 
 @asynccontextmanager
@@ -107,6 +119,58 @@ async def get_status() -> Dict[str, Any]:
         "system": system.summary(),
         "config": config.load().to_dict(),
         "discovery": sources.status(),
+    }
+
+
+@app.get("/api/capabilities")
+async def get_capabilities() -> Dict[str, Any]:
+    """What this particular box can actually do.
+
+    Chiefly: are there hardware video decoders, and was the NDI plugin built
+    against the Advanced SDK (which is what makes hardware decode reachable)?
+    """
+    decoders: List[Dict[str, Any]] = []
+    compressed_supported = False
+    try:
+        import gi  # type: ignore
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst  # type: ignore
+
+        if not Gst.is_initialized():
+            Gst.init(None)
+        from .runner import list_decoders
+
+        decoders = list_decoders()
+
+        # The compressed colour formats only exist in the enum when the plugin
+        # was built with --features advanced-sdk, so ask the element itself
+        # rather than guessing from a version string.
+        factory = Gst.ElementFactory.find("ndisrc")
+        if factory is not None:
+            element = factory.create(None)
+            if element is not None:
+                prop = element.find_property("color-format")
+                if prop is not None:
+                    try:
+                        values = prop.enum_class.__enum_values__  # type: ignore[attr-defined]
+                        compressed_supported = any(
+                            "compressed" in v.value_nick for v in values.values()
+                        )
+                    except Exception:  # noqa: BLE001
+                        compressed_supported = False
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc), "decoders": [], "hardware_decoders": [],
+                "advanced_sdk": False}
+
+    hardware = [d for d in decoders if d["hardware"]]
+    return {
+        "decoders": decoders,
+        "hardware_decoders": hardware,
+        "hardware_decode_available": bool(hardware),
+        "advanced_sdk": compressed_supported,
+        "color_formats": list(COLOR_FORMATS),
+        "video_formats": list(VIDEO_FORMATS),
     }
 
 
@@ -197,7 +261,7 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         "ndi_connect_timeout_ms", "ndi_timeout_ms",
         "sink_sync", "sink_qos", "sink_max_lateness_ms",
         "scale_method", "video_format",
-        "queue_leaky", "queue_max_buffers", "convert_threads",
+        "queue_leaky", "queue_max_buffers", "convert_threads", "match_source",
         "snapshot_enabled", "snapshot_interval_s",
         "idle_mode", "standby_file",
         "loop",

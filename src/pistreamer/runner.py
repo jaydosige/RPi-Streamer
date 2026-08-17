@@ -52,7 +52,12 @@ FLIP_METHODS = {90: 1, 180: 2, 270: 3}
 LEAKY = {"none": 0, "upstream": 1, "downstream": 2}
 LEAKY_DOWNSTREAM = 2
 
-# ndisrc color-format enum nicks.
+# ndisrc color-format enum nicks. The compressed-* values only exist when the
+# plugin was built against the NDI *Advanced* SDK (cargo --features
+# advanced-sdk). In those modes ndisrc does NOT decode: it hands out
+# video/x-h264 or video/x-h265 byte-stream, which a hardware decoder can take.
+# That is the difference between the Pi 4's CPU doing all the work and the
+# video block doing it.
 COLOR_FORMATS = {
     "bgrx-bgra": 0,
     "uyvy-bgra": 1,
@@ -60,7 +65,59 @@ COLOR_FORMATS = {
     "uyvy-rgba": 3,
     "fastest": 4,
     "best": 5,
+    "compressed-v1": 6,
+    "compressed-v2": 7,
+    "compressed-v3": 8,
+    "compressed-v3-with-audio": 9,
+    "compressed-v4": 10,
+    "compressed-v4-with-audio": 11,
+    "compressed-v5": 12,
+    "compressed-v5-with-audio": 13,
 }
+
+
+def is_compressed(color_format: str) -> bool:
+    return color_format.startswith("compressed-")
+
+
+# Name fragments that mark a decoder as running on dedicated silicon rather
+# than the CPU. Matching on the name is crude, but the alternative is
+# hardcoding element names per platform, which is exactly the mistake that
+# cost us two rounds of debugging on kmssink.
+_HW_DECODER_HINTS = ("v4l2", "rpivid", "vaapi", "nvv4l2", "vulkan", "omx")
+
+
+def _is_hardware_decoder(name: str) -> bool:
+    lowered = name.lower()
+    return any(hint in lowered for hint in _HW_DECODER_HINTS)
+
+
+def list_decoders() -> list:
+    """Every video decoder registered on this box, best-ranked first.
+
+    Used by the capabilities endpoint so it is possible to see whether
+    hardware decode is even an option before chasing it.
+    """
+    out = []
+    registry = Gst.Registry.get()
+    for factory in registry.get_feature_list(Gst.ElementFactory):
+        try:
+            klass = factory.get_metadata("klass") or ""
+            if "Decoder" not in klass or "Video" not in klass:
+                continue
+            name = factory.get_name()
+            out.append(
+                {
+                    "name": name,
+                    "rank": int(factory.get_rank()),
+                    "hardware": _is_hardware_decoder(name),
+                    "description": factory.get_metadata("description") or "",
+                }
+            )
+        except Exception:  # noqa: BLE001
+            continue
+    out.sort(key=lambda d: (-d["rank"], d["name"]))
+    return out
 
 STATS_PREFIX = "@STATS "
 
@@ -121,6 +178,11 @@ class Runner:
         self._arrival_bytes = 0
         self._last_arrival_bytes = 0
         self._queue_overruns = 0
+        # Which decoder actually got used, and whether it is hardware. Worth
+        # reporting rather than assuming: the element name is chosen by rank
+        # at runtime, so this is the only honest answer.
+        self._decoder: Optional[str] = None
+        self._match_source = bool(spec.get("match_source"))
 
     # -- construction ------------------------------------------------------
 
@@ -158,14 +220,30 @@ class Runner:
         set_prop(scale, "method", int(spec.get("scale_method", 1)))
         elements.append(scale)
 
-        # kmssink only sets a mode whose size matches the frame exactly, so
-        # pin the output to a mode the connector actually advertises.
+        # kmssink only sets a mode whose size matches the frame exactly, so by
+        # default pin the output to a mode the connector advertises. "auto"
+        # format and match-source sizing exist to make videoconvert and
+        # videoscale into passthroughs, which is the cheapest they can be.
         capsfilter = make("capsfilter", "vcaps")
-        caps_str = f"video/x-raw,format={spec.get('video_format', 'BGRx')}"
+        fields = []
+        fmt = spec.get("video_format", "BGRx")
+        if fmt == "auto":
+            # NOT unconstrained. Left to itself, negotiation happily picks
+            # something like A444_16LE — 16 bits per channel with alpha, the
+            # most expensive thing on the list. "auto" means an ordered
+            # preference list of formats that are cheap on this hardware:
+            # UYVY and NV12 are native vc4 plane formats, so if the NDI SDK
+            # hands us UYVY the conversion and the scale both fall away.
+            fields.append("format=(string){ UYVY, NV12, BGRx, RGBx, BGRA }")
+        elif fmt:
+            fields.append(f"format={fmt}")
         width, height = spec.get("width"), spec.get("height")
-        if width and height:
-            caps_str += f",width={int(width)},height={int(height)}"
+        if width and height and not self._match_source:
+            fields.append(f"width={int(width)}")
+            fields.append(f"height={int(height)}")
+        caps_str = "video/x-raw" + ("," + ",".join(fields) if fields else "")
         set_prop(capsfilter, "caps", Gst.Caps.from_string(caps_str))
+        log(f"output caps: {caps_str}")
         elements.append(capsfilter)
 
         if spec.get("sink") == "fake":
@@ -366,6 +444,44 @@ class Runner:
                     raise PipelineError("could not link videotestsrc -> idle caps")
             return pipeline
 
+        if spec.get("source_type") == "compressed-test":
+            src = make("videotestsrc", "src")
+            set_prop(src, "is-live", True)
+            enc = make(spec["encoder"], "enc")
+            if enc.find_property("tune") is not None:
+                try:
+                    enc.set_property("tune", "zerolatency")
+                except (TypeError, ValueError):
+                    pass
+            parse = make("h264parse", "parse")
+            decode = make("decodebin", "vdecode")
+
+            def on_decoded(_bin, pad):
+                caps = pad.get_current_caps()
+                if caps and not caps.to_string().startswith("video/x-raw"):
+                    return
+                sink_pad = video_head.get_static_pad("sink")
+                if not sink_pad.is_linked():
+                    pad.link(sink_pad)
+
+            def note_decoder(_bin, _sub, element):
+                factory = element.get_factory()
+                if factory is None:
+                    return
+                klass = factory.get_metadata("klass") or ""
+                if "Decoder" in klass and "Video" in klass:
+                    self._decoder = factory.get_name()
+                    kind = "hardware" if _is_hardware_decoder(self._decoder) else "software"
+                    log(f"decoding with {self._decoder} ({kind})")
+
+            decode.connect("pad-added", on_decoded)
+            decode.connect("deep-element-added", note_decoder)
+            for element in (src, enc, parse, decode):
+                pipeline.add(element)
+            if not src.link(enc) or not enc.link(parse) or not parse.link(decode):
+                raise PipelineError("could not build the compressed test chain")
+            return pipeline
+
         if spec.get("source_type") == "test":
             src = make("videotestsrc", "src")
             set_prop(src, "is-live", True)
@@ -404,12 +520,46 @@ class Runner:
         if not src.link(demux):
             raise PipelineError("could not link ndisrc -> ndisrcdemux")
 
+        # In a compressed colour format the demuxer hands out video/x-h264 or
+        # video/x-h265 rather than raw frames, so something has to decode it.
+        # decodebin picks the highest-ranked decoder registered on this box,
+        # which is the hardware one when the platform has it — no element name
+        # hardcoded here, and we report what it actually chose.
+        video_target = video_head
+        if is_compressed(color):
+            decode = make("decodebin", "vdecode")
+            pipeline.add(decode)
+
+            def on_decoded(_bin, pad):
+                caps = pad.get_current_caps()
+                if caps and not caps.to_string().startswith("video/x-raw"):
+                    return
+                sink_pad = video_head.get_static_pad("sink")
+                if sink_pad.is_linked():
+                    return
+                if pad.link(sink_pad) != Gst.PadLinkReturn.OK:
+                    log("failed to link decoder output into the video chain")
+
+            def note_decoder(_bin, _sub, element):
+                factory = element.get_factory()
+                if factory is None:
+                    return
+                klass = factory.get_metadata("klass") or ""
+                if "Decoder" in klass and "Video" in klass:
+                    self._decoder = factory.get_name()
+                    kind = "hardware" if _is_hardware_decoder(self._decoder) else "software"
+                    log(f"decoding with {self._decoder} ({kind})")
+
+            decode.connect("pad-added", on_decoded)
+            decode.connect("deep-element-added", note_decoder)
+            video_target = decode
+
         # ndisrcdemux exposes video and audio as sometimes-pads: they appear
         # only once the stream is up, and the audio pad never appears at all
         # if the sender has no audio.
         def on_pad_added(_demux, pad):
             name = pad.get_name()
-            target = video_head if name.startswith("video") else audio_head
+            target = video_target if name.startswith("video") else audio_head
             if target is None:
                 log(f"no {name} branch configured; ignoring pad")
                 return
@@ -527,6 +677,8 @@ class Runner:
                 else None
             ),
             "qos_events": self._qos_events,
+            "decoder": self._decoder,
+            "hardware_decode": bool(self._decoder and _is_hardware_decoder(self._decoder)),
             "rendered": stats["rendered"],
             "dropped": stats["dropped"],
             **self._caps,
@@ -600,6 +752,36 @@ class Runner:
 def main(argv: Optional[list] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     Gst.init(None)
+
+    if argv and argv[0] == "--list-decoders":
+        for d in list_decoders():
+            mark = "HW" if d["hardware"] else "sw"
+            print(f"{mark}  {d['name']:<24} rank={d['rank']:<5} {d['description']}")
+        return 0
+
+    if argv and argv[0] == "--self-test-compressed":
+        # Exercises the compressed path — encoder, decodebin, decoder
+        # selection and relinking — without an NDI sender. This is how the
+        # hardware-decode path gets tested before it reaches a venue.
+        encoder = next(
+            (e for e in ("x264enc", "openh264enc", "avenc_h264_omx", "v4l2h264enc")
+             if Gst.ElementFactory.find(e)),
+            None,
+        )
+        if encoder is None:
+            log("no H.264 encoder available on this host; cannot self-test compressed")
+            return 2
+        spec = {
+            "source_type": "compressed-test",
+            "encoder": encoder,
+            "sink": "fake",
+            "audio": False,
+            "video_format": "auto",
+            "match_source": True,
+            "run_for": float(argv[1]) if len(argv) > 1 else 4.0,
+            "stats_interval": 2.0,
+        }
+        return Runner(spec).run()
 
     if argv and argv[0] == "--self-test":
         # Exercises the whole video chain with no NDI sender and no display,

@@ -8,6 +8,7 @@
   "idle_mode": "black",
   "local_file": "",
   "loop": true,
+  "match_source": false,
   "mode": "idle",
   "ndi_bandwidth": "highest",
   "ndi_color_format": "uyvy-bgra",

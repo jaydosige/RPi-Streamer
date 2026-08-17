@@ -62,7 +62,18 @@ if [[ "$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)" -lt 3000 ]]; then
   info "Low memory detected — limiting to ${JOBS} build jobs"
 fi
 
-( cd "${BUILD_DIR}" && cargo build --release --jobs "${JOBS}" )
+# The compressed (hardware-decode) colour formats are gated behind the
+# advanced-sdk cargo feature, which needs the Advanced SDK headers present.
+CARGO_FEATURE_ARGS=()
+if [[ -f /usr/local/include/Processing.NDI.compressed.v5.h ]]; then
+  CARGO_FEATURE_ARGS=(--features advanced-sdk)
+  ok "Advanced SDK headers found — building with hardware decode support"
+else
+  info "Standard SDK only; building without compressed receive support."
+  info "For hardware decode see the note in scripts/10-ndi-sdk.sh."
+fi
+
+( cd "${BUILD_DIR}" && cargo build --release --jobs "${JOBS}" "${CARGO_FEATURE_ARGS[@]}" )
 
 BUILT="$(find "${BUILD_DIR}/target/release" -maxdepth 1 -name 'libgstndi.so' | head -n1)"
 [[ -n "${BUILT}" ]] || die "build finished but libgstndi.so was not produced"

@@ -372,6 +372,27 @@
     </div>
 
     <div class="card">
+      <h2>Presets</h2>
+      <div class="host" style="margin-bottom:12px">
+        Each fills in the settings below without saving, so you can see what
+        changed before applying it.
+      </div>
+      <div class="row">
+        <button class="btn" data-preset="safe">Maximum compatibility</button>
+        <button class="btn" data-preset="balanced">Balanced</button>
+        <button class="btn primary" data-preset="fast">Lowest CPU</button>
+        <button class="btn" data-preset="hw">Hardware decode</button>
+      </div>
+      <div class="host" id="presetNote" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
+      <h2>What this box can do</h2>
+      <div class="kvs" id="capsInfo"></div>
+      <div class="banner warn" id="capsNote" style="margin:12px 0 0;display:none"></div>
+    </div>
+
+    <div class="card">
       <h2>Dropped frames</h2>
       <div class="checkline">
         <input type="checkbox" id="cfgSinkQos">
@@ -428,6 +449,15 @@
         <span class="lbl">Colour conversion threads &mdash; 0 lets GStreamer decide</span>
         <input type="number" id="cfgConvertThreads" min="0" max="8" step="1">
       </label>
+      <div class="checkline">
+        <input type="checkbox" id="cfgMatchSource">
+        <label for="cfgMatchSource">Send the source's own resolution to the display (skips scaling)</label>
+      </div>
+      <div class="host" style="margin:-6px 0 0">
+        Cheapest possible, because videoscale becomes a passthrough. It only
+        works if your display advertises a mode matching the source exactly;
+        if it does not, the pipeline falls back to the pinned mode.
+      </div>
     </div>
 
     <div class="card">
@@ -889,6 +919,7 @@ const PERF_FIELDS = {
   cfgColorFormat: ["ndi_color_format", "str"],
   cfgVideoFormat: ["video_format", "str"],
   cfgConvertThreads: ["convert_threads", "int"],
+  cfgMatchSource: ["match_source", "check"],
   cfgQueueLeaky: ["queue_leaky", "str"],
   cfgQueueBuffers: ["queue_max_buffers", "int"],
   cfgNdiQueue: ["ndi_max_queue", "int"],
@@ -900,14 +931,28 @@ const PERF_FIELDS = {
   cfgSnapshotInterval: ["snapshot_interval_s", "int"],
   cfgUseGstLaunch: ["use_gst_launch", "check"],
 };
-const VIDEO_FORMATS = ["BGRx", "RGBx", "BGRA", "RGB16", "NV12", "I420"];
+let VIDEO_FORMATS = ["auto", "BGRx", "RGBx", "BGRA", "RGB16", "NV12", "UYVY", "I420"];
+let CAPS = null;
 
 async function loadPerf() {
   if (!STATE) return;
   const c = STATE.config;
+  await loadCapabilities();
   if (!$("cfgVideoFormat").options.length) {
-    $("cfgVideoFormat").innerHTML = VIDEO_FORMATS.map(
-      (f) => `<option value="${f}">${f}${f === "BGRx" ? " (default)" : ""}</option>`).join("");
+    $("cfgVideoFormat").innerHTML = VIDEO_FORMATS.map((f) => {
+      const label = f === "auto" ? "Auto — cheapest the display accepts"
+        : f + (f === "BGRx" ? " (default)" : "");
+      return `<option value="${f}">${label}</option>`;
+    }).join("");
+  }
+  if (CAPS && CAPS.advanced_sdk) {
+    const sel = $("cfgColorFormat");
+    if (!sel.querySelector('option[value="compressed-v5"]')) {
+      for (const cf of (CAPS.color_formats || []).filter((c) => c.startsWith("compressed-"))) {
+        sel.insertAdjacentHTML("beforeend",
+          `<option value="${cf}">${cf} — hardware decode</option>`);
+      }
+    }
   }
   try {
     const media = await api("/api/media");
@@ -964,6 +1009,74 @@ $("btnResetPerf").onclick = async () => {
     await poll(); loadPerf();
   } catch (err) { toast(err.message, true); }
 };
+
+async function loadCapabilities() {
+  try { CAPS = await api("/api/capabilities"); } catch (_) { return; }
+  if (CAPS.video_formats) VIDEO_FORMATS = CAPS.video_formats;
+  const hw = CAPS.hardware_decoders || [];
+  $("capsInfo").innerHTML = kvs([
+    ["Hardware video decoders", hw.length ? hw.map((d) => d.name).join(", ") : "none found"],
+    ["NDI Advanced SDK", CAPS.advanced_sdk ? "yes — compressed receive available" : "no"],
+    ["Decoders registered", (CAPS.decoders || []).length],
+    ["Decoding with", STATE && STATE.stream && STATE.stream.decoder
+      ? STATE.stream.decoder + (STATE.stream.hardware_decode ? " (hardware)" : " (software)")
+      : "not decoding — raw NDI needs no decoder"],
+  ]);
+  const note = $("capsNote");
+  if (!CAPS.advanced_sdk) {
+    note.innerHTML = "This build uses the <strong>standard</strong> NDI SDK, so every frame is "
+      + "decoded in software. The Advanced SDK lets NDI HX pass through undecoded so the Pi's "
+      + "video hardware can do it instead — by far the biggest performance gain available. "
+      + "See scripts/10-ndi-sdk.sh for how to add it.";
+    note.style.display = "";
+  } else if (!hw.length) {
+    note.textContent = "The Advanced SDK is present but no hardware decoder is registered, "
+      + "so compressed frames would still be decoded in software.";
+    note.style.display = "";
+  } else {
+    note.style.display = "none";
+  }
+}
+
+const PRESETS = {
+  safe: { note: "Stock settings. Highest compatibility, highest CPU cost.",
+    values: { sink_qos: true, sink_sync: true, sink_max_lateness_ms: -1, scale_method: 1,
+      ndi_color_format: "uyvy-bgra", video_format: "BGRx", convert_threads: 0,
+      match_source: false, queue_leaky: "downstream" } },
+  balanced: { note: "Keeps timing but stops paying for quality you cannot see at a distance.",
+    values: { sink_qos: true, sink_sync: true, sink_max_lateness_ms: -1, scale_method: 0,
+      ndi_color_format: "fastest", video_format: "auto", convert_threads: 0,
+      match_source: false, queue_leaky: "downstream" } },
+  fast: { note: "Every frame shown as it arrives, no scaling quality, cheapest formats. "
+      + "Motion may judder very slightly; nothing is discarded.",
+    values: { sink_qos: false, sink_sync: false, sink_max_lateness_ms: -1, scale_method: 0,
+      ndi_color_format: "fastest", video_format: "auto", convert_threads: 0,
+      match_source: true, queue_leaky: "downstream" } },
+  hw: { note: "Asks the NDI receiver for compressed frames so the Pi's video hardware decodes "
+      + "them. Requires the Advanced SDK build AND an NDI HX sender — full-bandwidth NDI has "
+      + "no compressed form and will ignore this.",
+    values: { sink_qos: false, sink_sync: true, scale_method: 0,
+      ndi_color_format: "compressed-v5", video_format: "auto", convert_threads: 0,
+      match_source: false, queue_leaky: "downstream" } },
+};
+
+document.querySelectorAll("button[data-preset]").forEach((btn) => {
+  btn.onclick = () => {
+    const preset = PRESETS[btn.dataset.preset];
+    if (!preset) return;
+    if (btn.dataset.preset === "hw" && CAPS && !CAPS.advanced_sdk) {
+      toast("This build has no Advanced SDK — hardware decode is unavailable", true);
+      return;
+    }
+    for (const [key, value] of Object.entries(preset.values)) {
+      const entry = Object.entries(PERF_FIELDS).find(([, [k]]) => k === key);
+      if (!entry) continue;
+      const elm = $(entry[0]);
+      if (entry[1][1] === "check") elm.checked = value; else elm.value = value;
+    }
+    $("presetNote").textContent = preset.note + " Review below, then Save & apply.";
+  };
+});
 
 // ---------- diagnostics ----------
 

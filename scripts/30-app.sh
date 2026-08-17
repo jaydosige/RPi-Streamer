@@ -88,6 +88,21 @@ SOCKET_BUFFER_MB=16
 # Wi-Fi radio sleeping between beacons costs you a burst of frames every few
 # seconds. 1 disables power saving, 0 leaves it as the driver set it.
 DISABLE_WIFI_POWERSAVE=1
+
+# --- overclocking -----------------------------------------------------------
+# NOT applied from here: overclocking is set in /boot/firmware/config.txt and
+# needs a reboot, and doing it without adequate cooling shortens the life of
+# the board. It is worth roughly 20-30% more decode headroom on a Pi 4, which
+# can be the difference for full-bandwidth NDI.
+#
+# If you want it, add to /boot/firmware/config.txt and reboot:
+#     arm_freq=2000
+#     over_voltage=6
+#     gpu_freq=750
+# Then watch the Diagnostics tab: if "throttling has occurred" appears, or the
+# temperature passes 80 C, back it off. A heatsink is the minimum; a fan is
+# better. Check for under-voltage first — an inadequate supply plus an
+# overclock is how boards become unreliable.
 EOF
   ok "Wrote default tuning.conf"
 fi

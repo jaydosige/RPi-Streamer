@@ -323,6 +323,7 @@ class Player:
             "queue_leaky": cfg.queue_leaky,
             "queue_max_buffers": cfg.queue_max_buffers,
             "convert_threads": cfg.convert_threads,
+            "match_source": cfg.match_source,
             "snapshot_path": str(snapshot_path()) if cfg.snapshot_enabled else None,
             "snapshot_interval_s": cfg.snapshot_interval_s,
         }

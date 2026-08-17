@@ -93,6 +93,11 @@ class Config:
     queue_max_buffers: int = 0
     # videoconvert worker threads; 0 lets GStreamer choose.
     convert_threads: int = 0
+    # Let the source's own resolution through instead of scaling to a display
+    # mode. Makes videoscale a passthrough — the cheapest it can be — but
+    # kmssink then needs a mode matching the source exactly, so the runner
+    # falls back to the pinned mode if negotiation fails.
+    match_source: bool = False
 
     # --- standby screen ---
     # What to show when nothing is playing. An appliance should never show a

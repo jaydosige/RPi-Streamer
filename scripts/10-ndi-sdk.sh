@@ -15,8 +15,51 @@ source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 NDI_VERSION="${NDI_VERSION:-6}"
 NDI_URL="${NDI_URL:-https://downloads.ndi.tv/SDK/NDI_SDK_Linux/Install_NDI_SDK_v${NDI_VERSION}_Linux.tar.gz}"
 
+ADVANCED_MARKER="/usr/local/include/Processing.NDI.compressed.v5.h"
+
+# --- optional: the NDI Advanced SDK ----------------------------------------
+# This is the single biggest performance lever on a Pi. With the Advanced SDK,
+# ndisrc can hand out H.264/H.265 *undecoded*, so the Pi's hardware video
+# decoder does the work instead of the CPU. Without it, every NDI frame is
+# decoded in software.
+#
+# It is a separate download from Vizrt with its own licence, so it cannot be
+# fetched automatically:
+#   1. get the NDI Advanced SDK for Linux from https://ndi.video/for-developers/
+#   2. sudo NDI_ADVANCED_SDK_TARBALL=/path/to/it.tar.gz ./install.sh
+if [[ -n "${NDI_ADVANCED_SDK_TARBALL:-}" ]]; then
+  [[ -f "${NDI_ADVANCED_SDK_TARBALL}" ]] || die "NDI_ADVANCED_SDK_TARBALL not found"
+  banner "NDI Advanced SDK"
+  ADV_WORK="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '${ADV_WORK}'" EXIT
+  tar -xzf "${NDI_ADVANCED_SDK_TARBALL}" -C "${ADV_WORK}"
+  ADV_INSTALLER="$(find "${ADV_WORK}" -maxdepth 2 -name 'Install*NDI*SDK*.sh' | head -n1)"
+  if [[ -n "${ADV_INSTALLER}" ]]; then
+    chmod +x "${ADV_INSTALLER}"
+    ( cd "$(dirname "${ADV_INSTALLER}")" \
+      && yes | env PAGER=cat "./$(basename "${ADV_INSTALLER}")" >/dev/null ) || true
+  fi
+  ADV_ROOT="$(find "${ADV_WORK}" -maxdepth 3 -type d -name '*NDI*SDK*' | head -n1)"
+  [[ -n "${ADV_ROOT}" ]] || die "could not find the unpacked Advanced SDK"
+  ADV_LIB="$(find "${ADV_ROOT}/lib" -maxdepth 1 -type d -name 'aarch64*' | head -n1)"
+  [[ -n "${ADV_LIB}" ]] || die "no aarch64 libraries in the Advanced SDK"
+  install -d "${NDI_LIB_DIR}" /usr/local/include
+  cp -a "${ADV_LIB}"/libndi.so* "${NDI_LIB_DIR}/"
+  cp -a "${ADV_ROOT}/include/"* /usr/local/include/
+  echo "${NDI_LIB_DIR}" > /etc/ld.so.conf.d/ndi.conf
+  ldconfig
+  ok "Advanced SDK installed — the plugin will be built with hardware decode support"
+  exit 0
+fi
+
 if ls "${NDI_LIB_DIR}"/libndi.so.* >/dev/null 2>&1; then
   ok "NDI runtime already present: $(ls "${NDI_LIB_DIR}"/libndi.so.* | head -n1)"
+  if [[ -f "${ADVANCED_MARKER}" ]]; then
+    info "Advanced SDK headers detected — compressed (hardware) receive available"
+  else
+    info "Standard SDK. For hardware decode, re-run with NDI_ADVANCED_SDK_TARBALL=..."
+  fi
   exit 0
 fi
 
