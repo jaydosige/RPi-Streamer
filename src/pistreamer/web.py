@@ -29,7 +29,7 @@ from .telemetry import telemetry
 # and no display, which is the only way this feature could be developed at all
 # without a rack of Pis on the desk.
 conductor = syncplay.Conductor({
-    "prepare": lambda peer, item: _conductor_prepare(peer, item),
+    "prepare": lambda peer, item, session: _conductor_prepare(peer, item, session),
     "start": lambda peer, at: _conductor_start(peer, at),
     "pulse": lambda peer, body: _conductor_pulse(peer, body),
     "offsets": lambda ids: _conductor_offsets(ids),
@@ -47,13 +47,14 @@ def _is_self(peer: cluster.Peer) -> bool:
     return peer.id == cluster.node_id()
 
 
-def _conductor_prepare(peer: cluster.Peer, item: str) -> bool:
+def _conductor_prepare(peer: cluster.Peer, item: dict, session: str) -> dict:
+    payload = {"file": item["target"], "duration": item.get("duration"),
+               "image": bool(item.get("image")), "session": session}
     if _is_self(peer):
-        return bool(player.prepare(item).get("ready"))
-    reply = cluster.call(peer, "/api/cluster/prepare", method="POST",
-                         body={"file": item}, key=config.load().cluster_key,
-                         timeout=20)
-    return bool(reply.get("ready"))
+        return player.prepare(payload["file"], duration=payload["duration"],
+                              image=payload["image"], session=session)
+    return cluster.call(peer, "/api/cluster/prepare", method="POST", body=payload,
+                        key=config.load().cluster_key, timeout=20)
 
 
 def _conductor_start(peer: cluster.Peer, at: float) -> None:
@@ -170,6 +171,7 @@ def apply_cue_action(action: str, target: str) -> None:
     switch and a manual one are indistinguishable afterwards — which matters
     when someone overrides a cue by hand mid-show.
     """
+    take_local_control(f"cue action: {action}")
     if action == "ndi":
         config.update(mode=MODE_NDI, ndi_source=target)
         player.apply(MODE_NDI, target)
@@ -466,8 +468,26 @@ async def ndi_diagnostics() -> Dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
+def take_local_control(reason: str) -> None:
+    """End any synchronised session this node is conducting.
+
+    Without this, stopping playback stops the *player* but leaves the conductor
+    thread running, so at the next item boundary it prepares and starts the
+    whole group again — including this node. From the operator's side, stop
+    simply does not work: the screen goes black and then comes back a few
+    seconds later, which is worse than not stopping at all.
+
+    Anything that changes what this node plays counts as taking control: the
+    GUI, a schedule cue, or a group command.
+    """
+    if conductor.state().get("running"):
+        log.info("ending the synchronised session (%s)", reason)
+        conductor.stop()
+
+
 @app.post("/api/play/ndi")
 async def play_ndi(body: PlayNdi) -> Dict[str, Any]:
+    take_local_control("NDI source selected")
     config.update(mode=MODE_NDI, ndi_source=body.source)
     player.apply(MODE_NDI, body.source)
     status = player.status()
@@ -478,6 +498,7 @@ async def play_ndi(body: PlayNdi) -> Dict[str, Any]:
 
 @app.post("/api/play/local")
 async def play_local(body: PlayLocal) -> Dict[str, Any]:
+    take_local_control("local playback started")
     if body.file and media.resolve(body.file) is None:
         raise HTTPException(404, f"no such media file: {body.file}")
     config.update(mode=MODE_LOCAL, local_file=body.file, loop=body.loop)
@@ -490,6 +511,7 @@ async def play_local(body: PlayLocal) -> Dict[str, Any]:
 
 @app.post("/api/stop")
 async def stop() -> Dict[str, Any]:
+    take_local_control("stopped from the GUI")
     config.update(mode=MODE_IDLE)
     player.apply(MODE_IDLE)
     return player.status()
@@ -1024,13 +1046,21 @@ async def post_cluster_local(body: LocalActionBody, request: Request) -> Dict[st
 
 class PrepareBody(BaseModel):
     file: str
+    # A still image has no natural end, so the conductor tells each node how
+    # long it is for and holds it until the boundary.
+    duration: Optional[int] = None
+    image: bool = False
+    # Which synchronised session this belongs to, so a node stopped by hand can
+    # refuse the rest of that one and still join the next.
+    session: str = ""
 
 
 @app.post("/api/cluster/prepare")
 async def post_prepare(body: PrepareBody, request: Request) -> Dict[str, Any]:
     require_cluster_key(request)
     try:
-        return player.prepare(body.file)
+        return player.prepare(body.file, duration=body.duration,
+                              image=body.image, session=body.session)
     except RuntimeError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -1155,14 +1185,18 @@ class SyncPlayBody(BaseModel):
 
 @app.post("/api/cluster/sync/play")
 async def post_sync_play(body: SyncPlayBody) -> Dict[str, Any]:
-    files = [s["target"] for s in playlists.resolved_segments(body.playlist)
-             if s["type"] == "file"]
-    if not files:
+    # Whole segments, not just filenames: a still image needs its dwell time
+    # carried through, because it has no playhead to end it.
+    items = [{"target": seg["target"], "duration": seg["duration"],
+              "image": bool(seg["image"])}
+             for seg in playlists.resolved_segments(body.playlist)
+             if seg["type"] == "file"]
+    if not items:
         raise HTTPException(400, "synchronised playback needs a playlist of files")
     targets = ([_own_peer()] + cluster.registry.all() if not body.nodes
                else _peers_by_id(body.nodes))
     try:
-        return conductor.start(files, targets, loop=body.loop)
+        return conductor.start(items, targets, loop=body.loop)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 

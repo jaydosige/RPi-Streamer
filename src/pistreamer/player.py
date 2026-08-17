@@ -321,6 +321,10 @@ class Player:
         # While a speed nudge is settling, leave it alone rather than stacking
         # corrections on top of each other.
         self._nudging_until = 0.0
+        # The synchronised session this node is taking part in, and the one it
+        # has been pulled out of by hand.
+        self._sync_session = ""
+        self._sync_declined = ""
         # How many unsupervised player processes we have had to clean up. If
         # this is not zero, something is escaping teardown and the user is
         # hearing two soundtracks — worth surfacing rather than hiding.
@@ -888,7 +892,10 @@ class Player:
             self._segments = []
             self._segment_deadline = None
             # Any explicit mode change ends a synchronised session: the operator
-            # has taken local control of this node.
+            # has taken local control of this node. Remember *which* session, so
+            # this node refuses the rest of it but still joins the next one.
+            if self._sync_active and self._sync_session:
+                self._sync_declined = self._sync_session
             self._sync_active = False
             self._nudging_until = 0.0
             try:
@@ -959,7 +966,8 @@ class Player:
     # Synchronised playback
     # ------------------------------------------------------------------
 
-    def prepare(self, filename: str) -> Dict[str, Any]:
+    def prepare(self, filename: str, duration: Optional[int] = None,
+                image: bool = False, session: str = "") -> Dict[str, Any]:
         """Load a file and hold on its first frame, paused, ready to be released.
 
         This is half of an aligned start. Spawning a player costs tens to
@@ -968,6 +976,14 @@ class Player:
         expensive, variable part happens before the beat and only the cheap part
         happens on it.
         """
+        with self._lock:
+            # Somebody stopped this node by hand during this session. Stay
+            # stopped: being pulled back into playing at every item boundary is
+            # indistinguishable from stop not working. A *new* session is a
+            # fresh instruction and is honoured.
+            if session and session == self._sync_declined:
+                return {"ready": False, "file": filename,
+                        "reason": "stopped locally; will rejoin the next session"}
         path = media.resolve(filename)
         if path is None:
             raise RuntimeError(f"not in the media library: {filename}")
@@ -979,8 +995,18 @@ class Player:
             self._segment_deadline = None
             self._fallback = False
             self._sync_active = True
-            self._terminate()
-            cmd = self._mpv_base(cfg, 10) + [
+            self._sync_session = session
+            # A still image has no playhead and no natural end, so the conductor
+            # decides when it comes down — every node at the same instant.
+            # Letting each node time out on its own dwell counter instead means
+            # they blink off at slightly different moments.
+            hold = "inf" if image else str(duration or 10)
+            cmd = [c for c in self._mpv_base(cfg, 10)
+                   if not c.startswith("--image-display-duration=")]
+            cmd += [f"--image-display-duration={hold}"]
+            if duration and not image:
+                cmd.append(f"--length={duration}")
+            cmd += [
                 # Hold the first frame rather than the last: mpv paused at
                 # position 0 with the frame decoded is exactly the state we
                 # want to release on the beat.

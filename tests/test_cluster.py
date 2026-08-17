@@ -248,14 +248,16 @@ class Node:
         self.prepared = []
         self.started = []
         self.pulses = []
+        self.sessions = []
 
 
 nodes = [Node("A"), Node("B"), Node("C", ready=False)]
 clock = {"pos": 0.0}
 
 
-def prepare(node, item):
-    node.prepared.append(item)
+def prepare(node, item, session=""):
+    node.prepared.append(item["target"])
+    node.sessions.append(session)
     return node.ready
 
 
@@ -278,7 +280,9 @@ cond = syncplay.Conductor({
     "offsets": lambda ids: {i: 0.001 for i in ids},
     "position": position,
 })
-cond.start(["one.mp4", "two.mp4"], nodes, loop=False)
+cond.start([{"target": "one.mp4", "duration": None, "image": False},
+            {"target": "two.mp4", "duration": None, "image": False}],
+           nodes, loop=False)
 deadline = time.time() + 30
 while cond.state().get("running") and time.time() < deadline:
     time.sleep(0.2)
@@ -432,6 +436,118 @@ check("every read is counted", reader.sent == 5000, str(reader.sent))
 check("progress was reported as it went", len(marks) >= 4, str(marks))
 check("the counts only ever increase",
       all(a < b for a, b in zip(marks, marks[1:])), str(marks))
+
+print("\nstill images in a synchronised playlist")
+# An image reports time-pos 0.0 for ever. The playhead check read that as
+# "stopped advancing" and moved on after two seconds, so every image was on
+# screen for a fraction of its dwell time. Images end on the clock instead.
+
+
+class ImgNode:
+    def __init__(self, name):
+        self.id = name
+        self.name = name
+        self.prepared = []
+        self.started = []
+        self.pulses = []
+        self.sessions = []
+
+
+img_nodes = [ImgNode("A")]
+held = {}
+
+
+def img_prepare(node, item, session=""):
+    node.prepared.append(item)
+    return True
+
+
+def img_position():
+    return 0.0  # exactly what mpv reports for a still, for ever
+
+
+start_seen = []
+cond = syncplay.Conductor({
+    "prepare": img_prepare,
+    "start": lambda node, at: start_seen.append(at),
+    "pulse": lambda node, body_: node.pulses.append(body_),
+    "offsets": lambda ids: {i: 0.0 for i in ids},
+    "position": img_position,
+})
+began = time.time()
+cond.start([{"target": "slide.png", "duration": 8, "image": True}], img_nodes, loop=False)
+deadline = time.time() + 30
+while cond.state().get("running") and time.time() < deadline:
+    time.sleep(0.05)
+held_for = time.time() - began
+cond.stop()
+
+check("the image was prepared with its dwell time",
+      img_nodes[0].prepared and img_nodes[0].prepared[0]["duration"] == 8,
+      str(img_nodes[0].prepared))
+check("it is flagged as an image so the node holds it",
+      img_nodes[0].prepared[0]["image"] is True)
+# Start slack plus eight seconds. The playhead-based version gave up after
+# about 3.2s regardless of the dwell time, so the two cannot be confused.
+check("it stayed up for its full duration rather than being skipped",
+      8.0 < held_for < 12.0, f"{held_for:.1f}s")
+check("no drift pulses were sent for a still frame",
+      not img_nodes[0].pulses, str(img_nodes[0].pulses))
+
+print("\nstopping a node during a session")
+# A node stopped by hand must stay stopped for the rest of that session, or it
+# gets dragged back in at every item boundary and stop looks broken.
+
+
+class StoppyNode:
+    def __init__(self, name):
+        self.id = name
+        self.name = name
+        self.asked = 0
+        self.started = []
+
+
+stoppy = StoppyNode("A")
+sessions_seen = []
+
+
+def stoppy_prepare(node, item, session=""):
+    node.asked += 1
+    sessions_seen.append(session)
+    # Behaves like a node that was stopped locally after the first item.
+    if node.asked > 1:
+        return {"ready": False, "reason": "stopped locally; will rejoin the next session"}
+    return {"ready": True}
+
+
+results_seen = []
+cond = syncplay.Conductor({
+    "prepare": stoppy_prepare,
+    "start": lambda node, at: node.started.append(at),
+    "pulse": lambda node, body_: None,
+    "offsets": lambda ids: {i: 0.0 for i in ids},
+    "position": lambda: None,
+})
+cond.start([{"target": "a.mp4", "duration": 1, "image": False},
+            {"target": "b.mp4", "duration": 1, "image": False}], [stoppy], loop=False)
+deadline = time.time() + 30
+while cond.state().get("running") and time.time() < deadline:
+    time.sleep(0.05)
+cond.stop()
+final = cond.state()
+check("the node was started for the first item", len(stoppy.started) == 1,
+      str(stoppy.started))
+check("a node that says it was stopped is not started again",
+      len(stoppy.started) == 1, str(stoppy.started))
+check("the reason it gave is reported, not invented",
+      final["last"]["failed"] and "stopped locally" in final["last"]["failed"][0]["error"],
+      str(final["last"].get("failed")))
+check("every item carried the same session id",
+      len(set(sessions_seen)) == 1 and sessions_seen[0], str(sessions_seen))
+check("a second session gets a different id",
+      cond.start([{"target": "a.mp4", "duration": 1, "image": False}],
+                 [StoppyNode("B")], loop=False)["session"] != sessions_seen[0])
+cond.stop()
 
 print()
 print(f"{len(PASS)} passed, {len(FAIL)} failed")

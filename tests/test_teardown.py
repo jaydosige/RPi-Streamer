@@ -35,7 +35,7 @@ os.environ["PISTREAMER_STATE"] = str(TMP)
 (TMP / "media").mkdir(parents=True, exist_ok=True)
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from pistreamer import player as P  # noqa: E402
+from pistreamer import config, player as P  # noqa: E402
 
 PASS, FAIL = [], []
 
@@ -139,7 +139,7 @@ z.wait()
 # This is the check that told us where the audio overlap was NOT: the state
 # machine advances cleanly, so the problem had to be in teardown.
 print("\nplaylist sequencer")
-from pistreamer import config, playlists  # noqa: E402
+from pistreamer import playlists  # noqa: E402
 
 config.ensure_dirs()
 for name in ("clip.mp4", "still.jpg"):
@@ -194,6 +194,53 @@ for line in log_path.read_text().splitlines():
 check("the playlist advanced through several segments", starts >= 3, f"{starts} segments")
 check("never two segments running at once", overlaps == 0, f"{overlaps} overlaps")
 check("nothing still playing after shutdown", live == 0, f"{live} left")
+
+# --- what prepare() actually asks mpv for -------------------------------
+# The conductor decides when an item ends, so the command has to let it: a
+# still image must be held open rather than timing out on its own dwell
+# counter, or every node blinks off at a slightly different moment.
+print("\nsynchronised prepare")
+(config.MEDIA_DIR / "slide.png").write_bytes(b"\0" * 2048)
+(config.MEDIA_DIR / "clip.mp4").write_bytes(b"\0" * 2048)
+
+captured = []
+prep = P.Player()
+prep._spawn_command = lambda cmd, what: captured.append(cmd)
+prep._await_ready = lambda timeout=8.0: True
+
+prep.prepare("slide.png", duration=20, image=True)
+cmd = captured[-1]
+check("an image is held open, not timed out locally",
+      "--image-display-duration=inf" in cmd, " ".join(cmd))
+check("an image is not given a --length", not any(c.startswith("--length") for c in cmd))
+check("it starts paused, ready for the beat", "--pause=yes" in cmd)
+check("only one image-display-duration is passed",
+      sum(1 for c in cmd if c.startswith("--image-display-duration=")) == 1,
+      " ".join(c for c in cmd if c.startswith("--image-display-duration")))
+
+prep.prepare("clip.mp4", duration=12, image=False)
+cmd = captured[-1]
+check("a video with an explicit duration is cut to it", "--length=12" in cmd,
+      " ".join(cmd))
+
+prep.prepare("clip.mp4")
+cmd = captured[-1]
+check("a plain video is left to play to its end",
+      not any(c.startswith("--length") for c in cmd), " ".join(cmd))
+
+# --- a node stopped by hand stays stopped -------------------------------
+prep.prepare("clip.mp4", session="session-one")
+check("it takes part in a session normally",
+      prep.prepare("clip.mp4", session="session-one")["ready"])
+prep.apply("idle")            # the operator presses stop
+declined = prep.prepare("clip.mp4", session="session-one")
+check("after a local stop it refuses the rest of that session",
+      not declined["ready"], str(declined))
+check("...and says why, so the leader can report it",
+      "stopped locally" in declined.get("reason", ""), str(declined))
+check("...but joins the next session",
+      prep.prepare("clip.mp4", session="session-two")["ready"])
+prep._terminate()
 
 print()
 print(f"{len(PASS)} passed, {len(FAIL)} failed")

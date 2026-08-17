@@ -350,6 +350,17 @@ correction off and you still get a synchronised start for every item.
 Only files are synchronised. An NDI source is already live with its own timing,
 so putting one in a synchronised playlist is not meaningful.
 
+**Still images** end on the clock rather than on a playhead, because they do not
+have one — mpv reports a position of zero for an image for as long as it is up.
+Each node holds the image open and the conductor takes it down at the agreed
+instant, so a wall of screens changes slide together.
+
+**Stopping** a node — from its GUI, a cue, or a group command — ends the
+synchronised session it was conducting, and a node stopped by hand sits out the
+rest of that session rather than being pulled back in at the next item. It
+rejoins when the group is started again. Without that, stop looks broken: the
+screen goes black and comes back a few seconds later.
+
 **Node identity and cloned SD cards.** A node's identity is derived from the Pi's
 board serial first, then machine-id, then MAC. This matters because cloning a
 working card — the obvious way to deploy the second and third node — copies

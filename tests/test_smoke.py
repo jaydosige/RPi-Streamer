@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 import tempfile
 from pathlib import Path
 
@@ -229,6 +230,48 @@ def main() -> int:
         check("unknown segment type -> 422", r.status_code == 422, str(r.status_code))
         for name in ("Pre-show", "Legacy"):
             client.delete(f"/api/playlists/{name}")
+
+        # Stopping must end a synchronised session, not just the player. The
+        # conductor used to keep running, so at the next item boundary it
+        # prepared and started the whole group again — from the operator's side
+        # the screen went black and came back a few seconds later, which is
+        # worse than stop not working at all.
+        print("\nstop ends a synchronised session")
+        from pistreamer import web as web_mod  # noqa: E402
+
+        started = {"prepares": 0}
+
+        def fake_prepare(peer, item, session=""):
+            started["prepares"] += 1
+            return {"ready": True}
+
+        web_mod.conductor._d = dict(web_mod.conductor._d)
+        web_mod.conductor._d.update({
+            "prepare": fake_prepare,
+            "start": lambda peer, at: None,
+            "pulse": lambda peer, body: None,
+            "offsets": lambda ids: {i: 0.0 for i in ids},
+            "position": lambda: None,
+        })
+
+        class _Node:
+            id, name = "n1", "NODE-1"
+
+        web_mod.conductor.start(
+            [{"target": "clip.mp4", "duration": 1, "image": False},
+             {"target": "clip.mp4", "duration": 1, "image": False}],
+            [_Node()], loop=True)
+        time.sleep(0.5)
+        check("a session is running", web_mod.conductor.state()["running"])
+        before = started["prepares"]
+
+        r = client.post("/api/stop")
+        check("POST stop -> 200", r.status_code == 200, r.text)
+        check("stopping ends the session", not web_mod.conductor.state()["running"])
+        time.sleep(2.0)
+        check("nothing starts playing again afterwards",
+              started["prepares"] == before, 
+              f"{started['prepares'] - before} more items were prepared after stop")
 
         print("\nmedia deletion")
         r = client.delete("/api/media/clip.mp4")

@@ -1656,8 +1656,19 @@ async function loadNodes() {
           ? `${sync.last.started} of ${sync.last.nodes}` : null],
         ["Clock spread", sync.last && sync.last.clock_spread_ms !== undefined
           ? `${sync.last.clock_spread_ms} ms` : null],
-        ["Failed", sync.last && (sync.last.failed || []).length
-          ? sync.last.failed.map((f) => `${f.name}: ${f.error}`).join("; ") : null],
+        // "Failed" is the wrong word for a node somebody deliberately stopped,
+        // and calling it a failure sends you looking for a fault that is not
+        // there. Separate the two.
+        ["Sitting out", sync.last && (sync.last.failed || [])
+          .filter((f) => (f.error || "").includes("stopped locally")).length
+          ? sync.last.failed.filter((f) => (f.error || "").includes("stopped locally"))
+              .map((f) => f.name).join(", ") + " — stopped by hand, will rejoin the next start"
+          : null],
+        ["Failed", sync.last && (sync.last.failed || [])
+          .filter((f) => !(f.error || "").includes("stopped locally")).length
+          ? sync.last.failed.filter((f) => !(f.error || "").includes("stopped locally"))
+              .map((f) => `${f.name}: ${f.error}`).join("; ")
+          : null],
       ])
     : `<div class="empty">Not running a synchronised playlist.</div>`;
 

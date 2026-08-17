@@ -179,22 +179,31 @@ class Conductor:
         with self._lock:
             return dict(self._state)
 
-    def start(self, files: List[str], targets: List[Any], loop: bool = True) -> Dict[str, Any]:
+    def start(self, items: List[Dict[str, Any]], targets: List[Any],
+              loop: bool = True) -> Dict[str, Any]:
         import threading
         self._ensure()
-        if not files:
+        if not items:
             raise ValueError("nothing to play")
         if self._thread is not None and self._thread.is_alive():
             self.stop()
         self._stop.clear()
+        # A session id, so a node that has been stopped by hand can refuse the
+        # rest of *this* session and still join the next one. Without it, the
+        # only choices are a node that never rejoins and a node that cannot be
+        # stopped.
+        session = f"{int(time.time() * 1000):x}"
         with self._lock:
             self._state = {
-                "running": True, "files": files, "index": 0, "loop": loop,
+                "running": True, "session": session,
+                "files": [i.get("target", "") for i in items],
+                "index": 0, "loop": loop,
                 "nodes": [getattr(t, "name", "?") for t in targets],
                 "started_at": None, "last": {},
             }
         self._thread = threading.Thread(
-            target=self._run, args=(files, targets, loop), name="conductor", daemon=True
+            target=self._run, args=(items, targets, loop, session),
+            name="conductor", daemon=True,
         )
         self._thread.start()
         return self.state()
@@ -208,12 +217,13 @@ class Conductor:
         with self._lock:
             self._state["running"] = False
 
-    def _run(self, files: List[str], targets: List[Any], loop: bool) -> None:
+    def _run(self, items: List[Dict[str, Any]], targets: List[Any], loop: bool,
+             session: str) -> None:
         index = 0
         while not self._stop.is_set():
-            item = files[index]
+            item = items[index]
             try:
-                outcome = self._play_item(item, targets)
+                outcome = self._play_item(item, targets, session)
             except Exception as exc:  # noqa: BLE001 - a show must not stop on one item
                 log.exception("synchronised item %r failed", item)
                 outcome = {"error": str(exc)}
@@ -223,26 +233,32 @@ class Conductor:
             if self._stop.is_set():
                 break
             index += 1
-            if index >= len(files):
+            if index >= len(items):
                 if not loop:
                     break
                 index = 0
         with self._lock:
             self._state["running"] = False
 
-    def _play_item(self, item: str, targets: List[Any]) -> Dict[str, Any]:
+    def _play_item(self, item: Dict[str, Any], targets: List[Any],
+                   session: str) -> Dict[str, Any]:
         prepare = self._d["prepare"]
         results: List[Dict[str, Any]] = []
         ready: List[Any] = []
         for target in targets:
             name = getattr(target, "name", "?")
             try:
-                if prepare(target, item):
+                outcome = prepare(target, item, session)
+                if outcome is True or (isinstance(outcome, dict) and outcome.get("ready")):
                     ready.append(target)
                     results.append({"name": name, "ok": True})
                 else:
+                    # A node that has been stopped by hand says so, and is left
+                    # alone for the rest of this session rather than being
+                    # dragged back into playing every time the item changes.
+                    reason = (outcome.get("reason") if isinstance(outcome, dict) else "")
                     results.append({"name": name, "ok": False,
-                                    "error": "did not become ready"})
+                                    "error": reason or "did not become ready"})
             except Exception as exc:  # noqa: BLE001
                 results.append({"name": name, "ok": False, "error": str(exc)})
 
@@ -254,8 +270,11 @@ class Conductor:
                     result["offset_ms"] = (round(offset * 1000, 1)
                                            if offset is not None else None)
 
+        # One base instant, kept, because a fixed-length item (a still image
+        # above all) ends on the clock rather than on a playhead.
+        base = time.time()
         instants = start_instant({getattr(t, "id", ""): offsets.get(getattr(t, "id", ""))
-                                  for t in ready})
+                                  for t in ready}, now=base)
         for target in ready:
             try:
                 self._d["start"](target, instants[getattr(target, "id", "")])
@@ -267,45 +286,72 @@ class Conductor:
 
         with self._lock:
             self._state["started_at"] = time.time()
-            self._state["item"] = item
-        self._pulse_until_end(item, ready, offsets)
+            self._state["item"] = item.get("target", "")
+        self._pulse_until_end(item, ready, offsets, base + START_SLACK_S)
         return summarise(results)
 
-    def _pulse_until_end(self, item: str, targets: List[Any],
-                         offsets: Dict[str, Optional[float]]) -> None:
-        """Publish our playhead until our own copy of the item finishes.
+    def _pulse_until_end(self, item: Dict[str, Any], targets: List[Any],
+                         offsets: Dict[str, Optional[float]],
+                         started_at: float) -> None:
+        """Hold the item until it is over, publishing our playhead as we go.
 
-        The conductor's own end-of-file is the item boundary for the whole
-        group. Using a duration read from the file instead would drift from what
-        is actually on screen, and using each node's own end would let them
-        wander apart item by item.
+        How an item ends depends on what it is:
+
+        * A **still image has no playhead**. mpv reports time-pos 0.0 for it
+          forever, which the playhead check below read as "stopped advancing"
+          and so skipped every image after about two seconds — the item was on
+          screen for a fraction of its dwell time. Images therefore end on the
+          clock, at the agreed start instant plus their duration.
+        * A **video with an explicit duration** ends on the clock too, for the
+          same reason its cut is explicit.
+        * Anything else ends when the conductor's own copy runs out. Using its
+          end for the whole group, rather than each node's own, is what stops
+          them wandering apart item by item.
         """
         position_fn = self._d["position"]
         pulse_fn = self._d["pulse"]
+        duration = item.get("duration")
+        is_image = bool(item.get("image"))
+        if is_image and not duration:
+            # A playlist should not contain an image with no dwell time, but a
+            # hand-edited file might; ten seconds beats holding it forever.
+            duration = 10
+        deadline = started_at + duration if duration else None
+
         last_position = -1.0
         stalled_since: Optional[float] = None
         # Give the item a moment to actually start before deciding it has ended.
         if self._stop.wait(START_SLACK_S + 0.5):
             return
         while not self._stop.is_set():
-            position = position_fn()
             now = time.time()
-            if position is None:
-                # No playhead: either the file ended or the player went away.
-                # Either way this item is over.
+            if deadline is not None and now >= deadline:
                 return
-            if position <= last_position + 0.001:
-                stalled_since = stalled_since or now
-                if now - stalled_since > 2.0:
-                    return  # paused at the end, or wedged; move on
-            else:
-                stalled_since = None
-            last_position = position
+            position = position_fn()
+            if not is_image:
+                # Only meaningful where there is a playhead to read.
+                if position is None:
+                    # No playhead: either the file ended or the player went
+                    # away. Either way this item is over.
+                    return
+                if position <= last_position + 0.001:
+                    stalled_since = stalled_since or now
+                    if now - stalled_since > 2.0 and deadline is None:
+                        return  # paused at the end, or wedged; move on
+                else:
+                    stalled_since = None
+                last_position = position
+            if is_image:
+                # Nothing to correct on a still frame: it was put up on the
+                # agreed instant and comes down on the agreed instant.
+                if self._stop.wait(min(0.25, max(0.0, deadline - time.time()))):
+                    return
+                continue
             for target in targets:
                 offset = offsets.get(getattr(target, "id", "")) or 0.0
                 try:
                     pulse_fn(target, {
-                        "item": item,
+                        "item": item.get("target", ""),
                         "pos": position,
                         # Converted into the follower's clock here, for the same
                         # reason start times are: one place does the arithmetic.
