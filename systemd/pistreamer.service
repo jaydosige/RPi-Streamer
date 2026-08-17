@@ -27,6 +27,12 @@ ExecStart=/opt/pistreamer/venv/bin/python -m pistreamer
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_SYS_BOOT
 
+# Frame timing beats politeness on an appliance whose only job is playback.
+# Children (the pipeline runner, mpv) inherit this.
+Nice=-10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+
 Restart=always
 RestartSec=3
 # KillMode=control-group so a wedged gst-launch/mpv child dies with the unit

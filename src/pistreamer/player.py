@@ -97,6 +97,30 @@ def _bandwidth_value(setting: str) -> int:
     return {"highest": 100, "lowest": 0}.get(setting, 100)
 
 
+def snapshot_path() -> Path:
+    """Where the running pipeline keeps the most recent frame."""
+    return config.STATE_DIR / "lastframe.jpg"
+
+
+def _usable_jpeg(path: Path) -> bool:
+    """Is this a complete JPEG?
+
+    multifilesink rewrites the snapshot in place, so a read can land
+    mid-write. Checking for the end-of-image marker is cheap and rules that
+    out; a torn file just means we fall back to black for a few seconds.
+    """
+    try:
+        if not path.is_file() or path.stat().st_size < 1024:
+            return False
+        with path.open("rb") as fh:
+            if fh.read(2) != b"\xff\xd8":
+                return False
+            fh.seek(-2, os.SEEK_END)
+            return fh.read(2) == b"\xff\xd9"
+    except OSError:
+        return False
+
+
 def _connector_id(connector_name: str) -> Optional[int]:
     """Read the numeric DRM connector id kmssink wants, from sysfs."""
     if not connector_name or not display.DRM_SYSFS.exists():
@@ -287,10 +311,71 @@ class Player:
             "audio": cfg.audio_enabled,
             "audio_device": cfg.audio_device,
             "stats_interval": 1.0,
+            "color_format": cfg.ndi_color_format,
+            "max_queue": cfg.ndi_max_queue,
+            "connect_timeout_ms": cfg.ndi_connect_timeout_ms,
+            "timeout_ms": cfg.ndi_timeout_ms,
+            "sink_sync": cfg.sink_sync,
+            "sink_qos": cfg.sink_qos,
+            "sink_max_lateness_ms": cfg.sink_max_lateness_ms,
+            "scale_method": cfg.scale_method,
+            "video_format": cfg.video_format,
+            "queue_leaky": cfg.queue_leaky,
+            "queue_max_buffers": cfg.queue_max_buffers,
+            "convert_threads": cfg.convert_threads,
+            "snapshot_path": str(snapshot_path()) if cfg.snapshot_enabled else None,
+            "snapshot_interval_s": cfg.snapshot_interval_s,
+        }
+        return [sys.executable, "-m", "pistreamer.runner", json.dumps(spec)]
+
+    def _idle_command(self, cfg: config.Config) -> List[str]:
+        """The standby screen. An appliance should never show a console.
+
+        Note this means idle is an *active* pipeline holding the display, not
+        the absence of one — that is the whole point.
+        """
+        image: Optional[str] = None
+        if cfg.idle_mode == "image" and cfg.standby_file:
+            path = media.resolve(cfg.standby_file)
+            if path is not None:
+                if path.suffix.lower() in media.VIDEO_EXTS:
+                    # A standby video is just local playback that happens to
+                    # be the fallback, so reuse the mpv path and loop it.
+                    return self._local_command(cfg, cfg.standby_file)
+                image = str(path)
+        elif cfg.idle_mode == "lastframe":
+            snap = snapshot_path()
+            if _usable_jpeg(snap):
+                image = str(snap)
+
+        conn = display.pick_connector(cfg.connector)
+        conn_name = conn.name if conn else ""
+        mode_ = display.target_mode(conn, cfg.video_mode)
+        spec = {
+            "source_type": "idle",
+            "idle_image": image,
+            "width": mode_.width if mode_ else None,
+            "height": mode_.height if mode_ else None,
+            "connector_id": _connector_id(conn_name) if conn_name else None,
+            "driver_name": display.drm_driver_for(conn_name) if conn_name else None,
+            "rotation": cfg.rotation,
+            "audio": False,
+            "video_format": cfg.video_format,
+            "scale_method": cfg.scale_method,
+            "sink_sync": True,
+            "sink_qos": False,
+            "stats_interval": 5.0,
         }
         return [sys.executable, "-m", "pistreamer.runner", json.dumps(spec)]
 
     def _build_command(self, cfg: config.Config, mode: str, target: str) -> List[str]:
+        if mode == MODE_IDLE:
+            if cfg.use_gst_launch:
+                raise RuntimeError("standby screen requires the instrumented runner")
+            ok, reason = sources.gstreamer_available()
+            if not ok:
+                raise RuntimeError(reason)
+            return self._idle_command(cfg)
         if mode == MODE_NDI:
             if not target:
                 raise RuntimeError("no NDI source selected")
@@ -445,8 +530,6 @@ class Player:
             self._terminate()
             self._status.mode = mode
             self._status.target = target
-            if mode == MODE_IDLE:
-                return
             try:
                 self._spawn(config.load(), mode, target)
             except Exception as exc:  # noqa: BLE001 - surfaced to the GUI
@@ -478,8 +561,6 @@ class Player:
             if self._stop_event.is_set():
                 break
             with self._lock:
-                if self._wanted_mode == MODE_IDLE:
-                    continue
                 proc = self._proc
                 if proc is not None and proc.poll() is None:
                     # Healthy for long enough? Reset backoff.

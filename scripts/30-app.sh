@@ -70,12 +70,38 @@ polkit.addRule(function(action, subject) {
 EOF
 ok "polkit rules installed"
 
+# --- host tuning helper ----------------------------------------------------
+install -d "${PISTREAMER_HOME}/bin"
+install -m 0755 "${REPO_DIR}/scripts/pistreamer-tuning" "${PISTREAMER_HOME}/bin/pistreamer-tuning"
+if [[ ! -f "${PISTREAMER_CONFIG_DIR}/tuning.conf" ]]; then
+  cat > "${PISTREAMER_CONFIG_DIR}/tuning.conf" <<'EOF'
+# Host tuning applied at boot by pistreamer-tuning.service.
+# Change a value and reboot, or: sudo systemctl restart pistreamer-tuning
+
+# CPU frequency policy. "performance" pins the clock, which removes the
+# ramp-up lag that shows as frame timing wobble. "none" leaves it alone.
+CPU_GOVERNOR=performance
+
+# Kernel socket receive buffer, in MB. Full-bandwidth NDI is a fat stream.
+SOCKET_BUFFER_MB=16
+
+# Wi-Fi radio sleeping between beacons costs you a burst of frames every few
+# seconds. 1 disables power saving, 0 leaves it as the driver set it.
+DISABLE_WIFI_POWERSAVE=1
+EOF
+  ok "Wrote default tuning.conf"
+fi
+
 # --- systemd ---------------------------------------------------------------
 install -m 0644 "${REPO_DIR}/systemd/pistreamer.service" /etc/systemd/system/pistreamer.service
+install -m 0644 "${REPO_DIR}/systemd/pistreamer-tuning.service" \
+  /etc/systemd/system/pistreamer-tuning.service
 systemctl daemon-reload
+systemctl enable pistreamer-tuning >/dev/null
+systemctl restart pistreamer-tuning || warn "host tuning reported a problem (not fatal)"
 systemctl enable pistreamer >/dev/null
 systemctl restart pistreamer
-ok "Service enabled and started"
+ok "Services enabled and started"
 
 sleep 2
 if systemctl is-active --quiet pistreamer; then

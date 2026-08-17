@@ -285,6 +285,21 @@ def status() -> dict:
     return _discovery.status()
 
 
+def gstreamer_available() -> tuple[bool, str]:
+    """Can we build any pipeline at all? (Used by the standby screen.)"""
+    try:
+        import gi  # type: ignore
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst  # type: ignore
+
+        if not Gst.is_initialized():
+            Gst.init(None)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"python3-gi / GStreamer bindings unavailable: {exc}"
+    return True, ""
+
+
 def ndi_available() -> tuple[bool, str]:
     """Pre-flight check: can we actually build an NDI pipeline?
 

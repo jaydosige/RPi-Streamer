@@ -75,7 +75,7 @@
   .card h2 { margin: 0 0 12px; font-size: 14px; font-weight: 600;
              text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
 
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(176px, 1fr)); gap: 12px; }
   .stat { background: var(--panel-2); border-radius: 8px; padding: 11px 13px; }
   .stat .k { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
   .stat .v { font-size: 19px; font-weight: 600; margin-top: 3px; font-variant-numeric: tabular-nums; }
@@ -135,6 +135,8 @@
 
   /* --- stat tiles, meters, charts, tables --- */
   .stat .row2 { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; }
+  .stat .row2 > div { min-width: 0; }
+  .stat .v { white-space: nowrap; }
   .stat .sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
   svg.spark { display: block; flex: none; }
 
@@ -188,6 +190,23 @@
         border-bottom: 1px solid var(--line); font-size: 13px; }
   .kv .k { color: var(--muted); }
   .kv .v { text-align: right; word-break: break-all; }
+
+  .verdict .head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+  .verdict .ico { font-size: 17px; font-weight: 700; }
+  .verdict .headline { font-size: 16px; font-weight: 600; }
+  .verdict .detail { font-size: 14px; color: var(--text); margin-bottom: 12px; }
+  .verdict ul { margin: 0 0 4px; padding-left: 18px; font-size: 13px; }
+  .verdict ul li { margin-bottom: 4px; }
+  .verdict .sect { font-size: 11px; text-transform: uppercase; letter-spacing: .5px;
+                   color: var(--muted); margin: 12px 0 6px; }
+  .ev { display: flex; gap: 8px; align-items: baseline; font-size: 13px; padding: 3px 0; }
+  .ev .m { flex: none; font-weight: 700; width: 12px; }
+  .ev.good .m { color: var(--good); }
+  .ev.warn .m { color: var(--warn); }
+  .ev.bad .m { color: var(--bad); }
+  .verdict.network .ico, .verdict.pi .ico, .verdict.power .ico { color: var(--bad); }
+  .verdict.healthy .ico { color: var(--good); }
+  .verdict.inconclusive .ico { color: var(--warn); }
 </style>
 </head>
 <body>
@@ -203,6 +222,7 @@
   <button data-tab="ndi">NDI sources</button>
   <button data-tab="media">Local media</button>
   <button data-tab="display">Display &amp; audio</button>
+  <button data-tab="perf">Performance</button>
   <button data-tab="diag">Diagnostics</button>
   <button data-tab="system">System</button>
 </nav>
@@ -211,6 +231,10 @@
   <!-- NOW PLAYING -->
   <section id="tab-now" class="active">
     <div id="playerError"></div>
+    <div class="card" id="verdictCard" style="display:none">
+      <h2>Diagnosis</h2>
+      <div id="verdict"></div>
+    </div>
     <div class="card">
       <h2>Output</h2>
       <div class="stat" style="margin-bottom:12px">
@@ -339,6 +363,147 @@
     <button class="btn primary" id="btnSaveDisplay">Save &amp; apply</button>
   </section>
 
+  <!-- PERFORMANCE -->
+  <section id="tab-perf">
+    <div class="banner warn" style="margin-bottom:14px">
+      These change the pipeline, so saving restarts the stream — expect a
+      one-second black frame. If something goes wrong, <em>Reset to defaults</em>
+      at the bottom puts everything back.
+    </div>
+
+    <div class="card">
+      <h2>Dropped frames</h2>
+      <div class="checkline">
+        <input type="checkbox" id="cfgSinkQos">
+        <label for="cfgSinkQos">Drop late frames to stay in time (QoS)</label>
+      </div>
+      <div class="host" style="margin:-6px 0 14px">
+        On by default. The sink discards frames that arrive late so the picture
+        stays in sync with the clock. If the Pi is only slightly too slow, this
+        is usually the thing turning "a bit behind" into visible dropped frames
+        — turning it off often fixes the symptom outright.
+      </div>
+      <div class="checkline">
+        <input type="checkbox" id="cfgSinkSync">
+        <label for="cfgSinkSync">Sync to the pipeline clock</label>
+      </div>
+      <div class="host" style="margin:-6px 0 14px">
+        Off means every frame is shown the moment it arrives. Motion can judder
+        very slightly, but nothing is thrown away. For signage and IMAG that is
+        usually the better trade.
+      </div>
+      <label class="field">
+        <span class="lbl">Drop frames later than (ms) &mdash; blank or -1 for no limit</span>
+        <input type="number" id="cfgMaxLateness" min="-1" max="5000" step="10">
+      </label>
+    </div>
+
+    <div class="card">
+      <h2>CPU cost</h2>
+      <label class="field">
+        <span class="lbl">Scaling quality &mdash; free when no scaling is needed</span>
+        <select id="cfgScaleMethod">
+          <option value="0">Nearest neighbour (cheapest)</option>
+          <option value="1">Bilinear (default)</option>
+          <option value="2">4-tap</option>
+          <option value="3">Lanczos (best, most expensive)</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="lbl">NDI colour format &mdash; what the receiver asks the SDK for</span>
+        <select id="cfgColorFormat">
+          <option value="uyvy-bgra">UYVY / BGRA (default)</option>
+          <option value="fastest">Fastest — least work for the SDK</option>
+          <option value="best">Best — most work for the SDK</option>
+          <option value="bgrx-bgra">BGRX / BGRA</option>
+          <option value="rgbx-rgba">RGBX / RGBA</option>
+          <option value="uyvy-rgba">UYVY / RGBA</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="lbl">Output pixel format &mdash; BGRx is the safe choice on a Pi</span>
+        <select id="cfgVideoFormat"></select>
+      </label>
+      <label class="field">
+        <span class="lbl">Colour conversion threads &mdash; 0 lets GStreamer decide</span>
+        <input type="number" id="cfgConvertThreads" min="0" max="8" step="1">
+      </label>
+    </div>
+
+    <div class="card">
+      <h2>Buffering</h2>
+      <label class="field">
+        <span class="lbl">When the Pi falls behind</span>
+        <select id="cfgQueueLeaky">
+          <option value="downstream">Drop the oldest frames (keeps latency low)</option>
+          <option value="upstream">Drop the newest frames</option>
+          <option value="none">Drop nothing — let the queue block</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="lbl">Queue depth in frames &mdash; 0 for unlimited (time limit still applies)</span>
+        <input type="number" id="cfgQueueBuffers" min="0" max="120" step="1">
+      </label>
+      <label class="field">
+        <span class="lbl">NDI receiver queue length</span>
+        <input type="number" id="cfgNdiQueue" min="1" max="60" step="1">
+      </label>
+      <label class="field">
+        <span class="lbl">Connect timeout (ms)</span>
+        <input type="number" id="cfgConnectTimeout" min="1000" max="60000" step="500">
+      </label>
+      <label class="field">
+        <span class="lbl">Receive timeout (ms) &mdash; how long before a silent sender counts as gone</span>
+        <input type="number" id="cfgRecvTimeout" min="500" max="60000" step="500">
+      </label>
+    </div>
+
+    <div class="card">
+      <h2>Standby screen</h2>
+      <div class="host" style="margin-bottom:12px">
+        What the display shows when nothing is playing. The standby screen is a
+        live output, not the absence of one — that is what keeps the Linux
+        console off the screen.
+      </div>
+      <label class="field">
+        <span class="lbl">When idle, show</span>
+        <select id="cfgIdleMode">
+          <option value="black">Black</option>
+          <option value="lastframe">Hold the last NDI frame</option>
+          <option value="image">A chosen image or video</option>
+        </select>
+      </label>
+      <label class="field" id="standbyPick">
+        <span class="lbl">Standby file &mdash; upload it on the Local media tab first</span>
+        <select id="cfgStandbyFile"></select>
+      </label>
+      <div class="checkline">
+        <input type="checkbox" id="cfgSnapshot">
+        <label for="cfgSnapshot">Keep saving the latest frame (needed for "hold the last frame")</label>
+      </div>
+      <label class="field">
+        <span class="lbl">Save a frame every (seconds)</span>
+        <input type="number" id="cfgSnapshotInterval" min="1" max="60" step="1">
+      </label>
+      <div class="row">
+        <img id="snapPreview" alt="Most recent captured frame" style="display:none;
+             max-width:260px;border-radius:8px;border:1px solid var(--line)">
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Advanced</h2>
+      <div class="checkline">
+        <input type="checkbox" id="cfgUseGstLaunch">
+        <label for="cfgUseGstLaunch">Use the old gst-launch path (loses all stream statistics)</label>
+      </div>
+      <div class="row">
+        <button class="btn primary" id="btnSavePerf">Save &amp; apply</button>
+        <button class="btn danger" id="btnResetPerf">Reset to defaults</button>
+      </div>
+    </div>
+  </section>
+
   <!-- DIAGNOSTICS -->
   <section id="tab-diag">
     <div class="card">
@@ -354,6 +519,12 @@
     <div class="card">
       <h2>Capacity</h2>
       <div id="meters"></div>
+    </div>
+
+    <div class="card" id="wifiCard" style="display:none">
+      <h2>Wi-Fi</h2>
+      <div class="grid" id="wifiGrid"></div>
+      <div class="banner warn" id="wifiNote" style="margin:12px 0 0;display:none"></div>
     </div>
 
     <div class="card">
@@ -486,6 +657,7 @@ document.querySelectorAll("nav button").forEach((btn) => {
     if (btn.dataset.tab === "media") loadMedia();
     if (btn.dataset.tab === "display") loadConnectors();
     if (btn.dataset.tab === "diag") loadTelemetry();
+    if (btn.dataset.tab === "perf") loadPerf();
   };
 });
 
@@ -517,6 +689,7 @@ async function poll() {
     SPARKS = (await api("/api/telemetry?points=14")).series || {};
   } catch (_) { /* sparklines are decoration */ }
   if (activeTab() === "diag") loadTelemetry();
+  loadVerdict();
 }
 
 // ---------- stat tiles ----------
@@ -637,8 +810,11 @@ function renderStream(st, p) {
   const stale = st.since_last_frame !== null && st.since_last_frame > 2;
   const res = (st.width && st.height) ? `${st.width}×${st.height}` : "—";
   const tiles = [
-    ["Frame rate", st.fps !== null ? st.fps.toFixed(1) + "<small> fps</small>" : "—",
-      { sub: st.declared_fps ? `sender declares ${st.declared_fps}` : null,
+    ["Arriving", st.arrival_fps !== null && st.arrival_fps !== undefined
+      ? st.arrival_fps.toFixed(1) + "<small> fps</small>" : "—",
+      { sub: st.declared_fps ? `sender declares ${st.declared_fps}` : "from the network" }],
+    ["On screen", st.fps !== null ? st.fps.toFixed(1) + "<small> fps</small>" : "—",
+      { sub: st.arrival_fps ? `of ${st.arrival_fps.toFixed(1)} arriving` : null,
         spark: H.fps, sparkId: "s-fps" }],
     ["Resolution", res, { sub: st.format || null }],
     ["To display", st.render_mbps !== null ? st.render_mbps + "<small> Mbps</small>" : "—",
@@ -646,6 +822,8 @@ function renderStream(st, p) {
     ["Frames shown", st.rendered !== null && st.rendered !== undefined ? st.rendered.toLocaleString() : st.frames_total.toLocaleString(), {}],
     ["Frames dropped", st.dropped !== null && st.dropped !== undefined ? st.dropped.toLocaleString() : "—",
       { sub: st.qos_events ? st.qos_events + " QoS events" : null }],
+    ["Queue overruns", (st.queue_overruns || 0).toLocaleString(),
+      { sub: st.queue_overruns ? "the Pi fell behind" : "display path keeping up" }],
     ["Last frame", st.since_last_frame !== null ? st.since_last_frame.toFixed(1) + "<small> s ago</small>" : "—",
       { sub: st.time_to_first_frame !== null ? `first frame in ${st.time_to_first_frame}s` : null }],
   ];
@@ -671,6 +849,122 @@ function applyConfigToForm(c) {
   }
 }
 
+// ---------- verdict ----------
+
+const VERDICT_ICONS = {
+  healthy: "✓", network: "✕", pi: "✕", power: "✕",
+  inconclusive: "!", idle: "–",
+};
+
+async function loadVerdict() {
+  let v;
+  try { v = await api("/api/diagnose"); } catch (_) { return; }
+  const card = $("verdictCard");
+  if (v.verdict === "idle") { card.style.display = "none"; return; }
+  card.style.display = "";
+  const ev = (v.evidence || []).map((e) =>
+    `<div class="ev ${e.level}"><span class="m">${
+      e.level === "good" ? "✓" : e.level === "warn" ? "!" : "✕"}</span><span>${e.text}</span></div>`
+  ).join("");
+  const sug = (v.suggestions || []).length
+    ? `<div class="sect">What to try</div><ul>${
+        v.suggestions.map((s) => `<li>${s}</li>`).join("")}</ul>`
+    : "";
+  $("verdict").innerHTML = `<div class="verdict ${v.verdict}">
+    <div class="head"><span class="ico">${VERDICT_ICONS[v.verdict] || "?"}</span>
+      <span class="headline">${v.headline}</span></div>
+    <div class="detail">${v.detail || ""}</div>
+    ${ev ? `<div class="sect">Evidence</div>${ev}` : ""}
+    ${sug}
+  </div>`;
+}
+
+// ---------- performance tab ----------
+
+const PERF_FIELDS = {
+  cfgSinkQos: ["sink_qos", "check"],
+  cfgSinkSync: ["sink_sync", "check"],
+  cfgMaxLateness: ["sink_max_lateness_ms", "int"],
+  cfgScaleMethod: ["scale_method", "int"],
+  cfgColorFormat: ["ndi_color_format", "str"],
+  cfgVideoFormat: ["video_format", "str"],
+  cfgConvertThreads: ["convert_threads", "int"],
+  cfgQueueLeaky: ["queue_leaky", "str"],
+  cfgQueueBuffers: ["queue_max_buffers", "int"],
+  cfgNdiQueue: ["ndi_max_queue", "int"],
+  cfgConnectTimeout: ["ndi_connect_timeout_ms", "int"],
+  cfgRecvTimeout: ["ndi_timeout_ms", "int"],
+  cfgIdleMode: ["idle_mode", "str"],
+  cfgStandbyFile: ["standby_file", "str"],
+  cfgSnapshot: ["snapshot_enabled", "check"],
+  cfgSnapshotInterval: ["snapshot_interval_s", "int"],
+  cfgUseGstLaunch: ["use_gst_launch", "check"],
+};
+const VIDEO_FORMATS = ["BGRx", "RGBx", "BGRA", "RGB16", "NV12", "I420"];
+
+async function loadPerf() {
+  if (!STATE) return;
+  const c = STATE.config;
+  if (!$("cfgVideoFormat").options.length) {
+    $("cfgVideoFormat").innerHTML = VIDEO_FORMATS.map(
+      (f) => `<option value="${f}">${f}${f === "BGRx" ? " (default)" : ""}</option>`).join("");
+  }
+  try {
+    const media = await api("/api/media");
+    $("cfgStandbyFile").innerHTML = `<option value="">— none —</option>` + media.files
+      .filter((f) => f.kind !== "audio")
+      .map((f) => `<option value="${f.name}">${f.name} (${f.kind})</option>`).join("");
+  } catch (_) { /* list is best-effort */ }
+
+  for (const [id, [key, kind]] of Object.entries(PERF_FIELDS)) {
+    const elm = $(id);
+    if (kind === "check") elm.checked = !!c[key];
+    else elm.value = c[key];
+  }
+  toggleStandbyPick();
+  const img = $("snapPreview");
+  img.src = "/api/snapshot?ts=" + Date.now();
+  img.onload = () => { img.style.display = ""; };
+  img.onerror = () => { img.style.display = "none"; };
+}
+
+function toggleStandbyPick() {
+  $("standbyPick").style.display = $("cfgIdleMode").value === "image" ? "" : "none";
+}
+$("cfgIdleMode").onchange = toggleStandbyPick;
+
+$("btnSavePerf").onclick = async () => {
+  const patch = {};
+  for (const [id, [key, kind]] of Object.entries(PERF_FIELDS)) {
+    const elm = $(id);
+    if (kind === "check") patch[key] = elm.checked;
+    else if (kind === "int") patch[key] = parseInt(elm.value, 10) || (elm.value === "-1" ? -1 : 0);
+    else patch[key] = elm.value;
+  }
+  if (patch.idle_mode !== "image") patch.standby_file = "";
+  try {
+    await post("/api/config", patch);
+    toast("Saved — pipeline restarting");
+    poll();
+  } catch (err) { toast(err.message, true); }
+};
+
+$("btnResetPerf").onclick = async () => {
+  if (!confirm("Reset every performance and standby setting to its default?")) return;
+  try {
+    await post("/api/config", {
+      sink_qos: true, sink_sync: true, sink_max_lateness_ms: -1,
+      scale_method: 1, ndi_color_format: "uyvy-bgra", video_format: "BGRx",
+      convert_threads: 0, queue_leaky: "downstream", queue_max_buffers: 0,
+      ndi_max_queue: 10, ndi_connect_timeout_ms: 10000, ndi_timeout_ms: 5000,
+      idle_mode: "black", standby_file: "", snapshot_enabled: true,
+      snapshot_interval_s: 3, use_gst_launch: false,
+    });
+    toast("Defaults restored");
+    await poll(); loadPerf();
+  } catch (err) { toast(err.message, true); }
+};
+
 // ---------- diagnostics ----------
 
 const CHARTS = [
@@ -687,6 +981,7 @@ async function loadTelemetry() {
   renderCharts();
   renderMeters();
   renderNetTable();
+  renderWifi();
   renderThrottle();
   renderDiscovery();
   renderVersions();
@@ -777,6 +1072,41 @@ function renderNetTable() {
   } else if (primary && primary.speed_mbps && primary.speed_mbps < 1000) {
     note.textContent = `This interface has negotiated ${primary.speed_mbps} Mbps, not gigabit.`
       + " Check the cable and switch port before running full-bandwidth NDI.";
+    note.style.display = "";
+  } else {
+    note.style.display = "none";
+  }
+}
+
+function renderWifi() {
+  if (!STATE) return;
+  const w = STATE.system.wifi || {};
+  const card = $("wifiCard");
+  if (!w.present) { card.style.display = "none"; return; }
+  card.style.display = "";
+  const sig = w.signal_dbm;
+  const quality = sig === null || sig === undefined ? "—"
+    : sig > -60 ? "good" : sig > -70 ? "marginal" : "weak";
+  $("wifiGrid").innerHTML = [
+    ["Signal", sig != null ? sig.toFixed(0) + "<small> dBm</small>" : "—", { sub: quality }],
+    ["Network", w.ssid || "—", { sub: w.frequency_ghz ? w.frequency_ghz + " GHz" : null }],
+    ["Link rate in", w.rx_bitrate_mbps != null ? w.rx_bitrate_mbps + "<small> Mbps</small>" : "—", {}],
+    ["Link rate out", w.tx_bitrate_mbps != null ? w.tx_bitrate_mbps + "<small> Mbps</small>" : "—", {}],
+    ["Power saving", w.power_save === true ? "ON" : w.power_save === false ? "off" : "—",
+      { sub: w.power_save === true ? "causes periodic frame loss" : null }],
+    ["Missed beacons", w.missed_beacons != null ? w.missed_beacons.toLocaleString() : "—", {}],
+  ].map(([k, v, o]) => tile(k, v, o)).join("");
+
+  const note = $("wifiNote");
+  const problems = [];
+  if (sig != null && sig <= -70) problems.push(`signal is ${sig.toFixed(0)} dBm, which is weak`);
+  if (w.power_save === true) problems.push("power saving is on");
+  if (w.rx_bitrate_mbps != null && w.rx_bitrate_mbps < 200) {
+    problems.push(`link rate is only ${w.rx_bitrate_mbps} Mbps`);
+  }
+  if (problems.length) {
+    note.textContent = "Wi-Fi problems: " + problems.join("; ")
+      + ". Full-bandwidth NDI at 1080p60 needs roughly 130 Mbps sustained — test over Ethernet to rule the network out.";
     note.style.display = "";
   } else {
     note.style.display = "none";

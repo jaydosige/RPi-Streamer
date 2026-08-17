@@ -49,7 +49,18 @@ TIMESTAMP_MODES = {
 FLIP_METHODS = {90: 1, 180: 2, 270: 3}
 
 # queue leaky enum: 0 none, 1 upstream, 2 downstream.
+LEAKY = {"none": 0, "upstream": 1, "downstream": 2}
 LEAKY_DOWNSTREAM = 2
+
+# ndisrc color-format enum nicks.
+COLOR_FORMATS = {
+    "bgrx-bgra": 0,
+    "uyvy-bgra": 1,
+    "rgbx-rgba": 2,
+    "uyvy-rgba": 3,
+    "fastest": 4,
+    "best": 5,
+}
 
 STATS_PREFIX = "@STATS "
 
@@ -104,6 +115,12 @@ class Runner:
         self._started = time.monotonic()
         self._exit_code = 0
         self._caps: Dict[str, Any] = {}
+        self.video_queue = None
+        self._arrivals = 0
+        self._last_arrivals = 0
+        self._arrival_bytes = 0
+        self._last_arrival_bytes = 0
+        self._queue_overruns = 0
 
     # -- construction ------------------------------------------------------
 
@@ -115,10 +132,17 @@ class Runner:
         queue = make("queue", "vqueue")
         set_prop(queue, "max-size-time", latency_ns)
         set_prop(queue, "max-size-bytes", 0)
-        set_prop(queue, "max-size-buffers", 0)
-        set_prop(queue, "leaky", LEAKY_DOWNSTREAM)
+        set_prop(queue, "max-size-buffers", int(spec.get("queue_max_buffers", 0)))
+        set_prop(queue, "leaky", LEAKY.get(spec.get("queue_leaky", "downstream"), LEAKY_DOWNSTREAM))
+        # A queue that overruns is the pipeline telling us, in so many words,
+        # that the far end cannot keep up with the near end.
+        queue.connect("overrun", self._on_queue_overrun)
+        self.video_queue = queue
 
         convert = make("videoconvert", "vconvert")
+        threads = int(spec.get("convert_threads", 0) or 0)
+        if threads and convert.find_property("n-threads") is not None:
+            set_prop(convert, "n-threads", threads)
         elements = [queue, convert]
 
         rotation = int(spec.get("rotation", 0) or 0)
@@ -129,12 +153,15 @@ class Runner:
 
         scale = make("videoscale", "vscale")
         set_prop(scale, "add-borders", True)
+        # videoscale is passthrough when input and output sizes already match,
+        # so the method only costs anything when scaling is actually needed.
+        set_prop(scale, "method", int(spec.get("scale_method", 1)))
         elements.append(scale)
 
         # kmssink only sets a mode whose size matches the frame exactly, so
         # pin the output to a mode the connector actually advertises.
         capsfilter = make("capsfilter", "vcaps")
-        caps_str = "video/x-raw,format=BGRx"
+        caps_str = f"video/x-raw,format={spec.get('video_format', 'BGRx')}"
         width, height = spec.get("width"), spec.get("height")
         if width and height:
             caps_str += f",width={int(width)},height={int(height)}"
@@ -143,7 +170,6 @@ class Runner:
 
         if spec.get("sink") == "fake":
             sink = make("fakesink", "vsink")
-            set_prop(sink, "sync", True)
         else:
             sink = make("kmssink", "vsink")
             set_prop(sink, "force-modesetting", True)
@@ -151,22 +177,104 @@ class Runner:
                 set_prop(sink, "connector-id", int(spec["connector_id"]))
             if spec.get("driver_name"):
                 set_prop(sink, "driver-name", spec["driver_name"])
-        elements.append(sink)
+
+        set_prop(sink, "sync", bool(spec.get("sink_sync", True)))
+        if sink.find_property("qos") is not None:
+            set_prop(sink, "qos", bool(spec.get("sink_qos", True)))
+        lateness_ms = int(spec.get("sink_max_lateness_ms", -1))
+        if sink.find_property("max-lateness") is not None:
+            set_prop(sink, "max-lateness", -1 if lateness_ms < 0 else lateness_ms * 1_000_000)
         self.video_sink = sink
+
+        # Optional snapshot branch: keep the most recent frame on disk so the
+        # standby screen can hold the last picture when a feed stops, instead
+        # of cutting to black. Throttled hard and leaky, so it can never
+        # apply back-pressure to the display path.
+        snapshot_path = spec.get("snapshot_path")
+        tee = None
+        if snapshot_path:
+            tee = make("tee", "vtee")
+            set_prop(tee, "allow-not-linked", True)
+            elements.append(tee)
 
         for element in elements:
             pipeline.add(element)
         for a, b in zip(elements, elements[1:]):
             if not a.link(b):
-                raise PipelineError(
-                    f"could not link {a.get_name()} -> {b.get_name()}"
-                )
+                raise PipelineError(f"could not link {a.get_name()} -> {b.get_name()}")
 
-        # Measure at the sink's own pad: this counts what is actually being
-        # handed to the display, not what the source produced.
-        sink_pad = sink.get_static_pad("sink")
-        sink_pad.add_probe(Gst.PadProbeType.BUFFER, self._on_buffer)
+        pipeline.add(sink)
+        if tee is not None:
+            sink_queue = make("queue", "sinkq")
+            set_prop(sink_queue, "leaky", 0)
+            set_prop(sink_queue, "max-size-buffers", 3)
+            pipeline.add(sink_queue)
+            if not tee.link(sink_queue) or not sink_queue.link(sink):
+                raise PipelineError("could not link tee -> display sink")
+            self._build_snapshot_branch(pipeline, tee, snapshot_path,
+                                        int(spec.get("snapshot_interval_s", 3)))
+        else:
+            if not elements[-1].link(sink):
+                raise PipelineError("could not link video chain -> sink")
+
+        # Two measurement points, and this is the whole diagnostic trick:
+        #   * the queue's sink pad counts frames ARRIVING from the network
+        #   * the video sink's pad counts frames REACHING the display
+        # If arrival is short of what the sender declares, the problem is
+        # upstream — network or sender. If arrival is fine but render is
+        # short, the Pi cannot keep up. One number cannot tell those apart;
+        # two can.
+        queue.get_static_pad("sink").add_probe(
+            Gst.PadProbeType.BUFFER, self._on_arrival
+        )
+        sink.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, self._on_buffer)
         return elements[0], sink
+
+    def _build_snapshot_branch(self, pipeline, tee, path: str, interval: int) -> None:
+        """tee -> leaky queue -> rate limit -> JPEG -> one file, overwritten."""
+        interval = max(1, interval)
+        queue = make("queue", "snapq")
+        set_prop(queue, "leaky", LEAKY_DOWNSTREAM)
+        set_prop(queue, "max-size-buffers", 1)
+        set_prop(queue, "max-size-time", 0)
+        set_prop(queue, "max-size-bytes", 0)
+
+        # Rate-limit with a dropping pad probe, NOT a framerate capsfilter.
+        # A capsfilter here negotiates upstream through the tee and throttles
+        # the display path to the snapshot rate — which is exactly what
+        # happened the first time this was written.
+        self._snap_interval = interval
+        self._last_snap = 0.0
+
+        def gate(_pad, info):
+            now = time.monotonic()
+            if now - self._last_snap < self._snap_interval:
+                return Gst.PadProbeReturn.DROP
+            self._last_snap = now
+            return Gst.PadProbeReturn.OK
+
+        queue.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, gate)
+
+        convert = make("videoconvert", "snapconvert")
+        enc = make("jpegenc", "snapenc")
+        set_prop(enc, "quality", 80)
+
+        sink = make("multifilesink", "snapsink")
+        # No %d in the location, so every buffer overwrites the same file.
+        set_prop(sink, "location", path)
+        set_prop(sink, "sync", False)
+        set_prop(sink, "async", False)
+        if sink.find_property("post-messages") is not None:
+            set_prop(sink, "post-messages", False)
+
+        chain = [queue, convert, enc, sink]
+        for element in chain:
+            pipeline.add(element)
+        for a, b in zip(chain, chain[1:]):
+            if not a.link(b):
+                raise PipelineError(f"snapshot branch: {a.get_name()} -> {b.get_name()}")
+        if not tee.link(queue):
+            raise PipelineError("could not link tee -> snapshot branch")
 
     def _build_audio_chain(self, pipeline):
         spec = self.spec
@@ -208,6 +316,56 @@ class Runner:
         video_head, _ = self._build_video_chain(pipeline)
         audio_head = self._build_audio_chain(pipeline) if spec.get("audio") else None
 
+        if spec.get("source_type") == "idle":
+            # A standby screen exists so the node never shows a Linux console.
+            # An image is frozen into a still video stream; with no image we
+            # emit black, which is still an active KMS output and therefore
+            # still keeps the console off the screen.
+            # A standby screen is static, so cap it to a few frames a second.
+            # Without this, imagefreeze pushes the same picture as fast as the
+            # CPU allows and the leaky queue throws almost all of it away.
+            idle_caps = make("capsfilter", "idlecaps")
+            set_prop(idle_caps, "caps", Gst.Caps.from_string("video/x-raw,framerate=5/1"))
+            pipeline.add(idle_caps)
+            if not idle_caps.link(video_head):
+                raise PipelineError("could not link idle caps -> video chain")
+
+            image = spec.get("idle_image")
+            if image:
+                src = make("filesrc", "src")
+                set_prop(src, "location", image)
+                decode = make("decodebin", "decode")
+                freeze = make("imagefreeze", "freeze")
+                # Without is-live, imagefreeze pushes the same still as fast
+                # as the CPU allows and relies on the sink to absorb it — the
+                # leaky queue then throws away tens of thousands of frames a
+                # second. is-live paces it to the negotiated framerate.
+                if freeze.find_property("is-live") is not None:
+                    set_prop(freeze, "is-live", True)
+                pipeline.add(src)
+                pipeline.add(decode)
+                pipeline.add(freeze)
+                if not src.link(decode):
+                    raise PipelineError("could not link filesrc -> decodebin")
+                if not freeze.link(idle_caps):
+                    raise PipelineError("could not link imagefreeze -> idle caps")
+
+                def on_decoded(_bin, pad):
+                    sink_pad = freeze.get_static_pad("sink")
+                    if not sink_pad.is_linked():
+                        pad.link(sink_pad)
+
+                decode.connect("pad-added", on_decoded)
+            else:
+                src = make("videotestsrc", "src")
+                set_prop(src, "pattern", 2)  # solid colour
+                set_prop(src, "foreground-color", 0xFF000000)  # opaque black
+                set_prop(src, "is-live", True)
+                pipeline.add(src)
+                if not src.link(idle_caps):
+                    raise PipelineError("could not link videotestsrc -> idle caps")
+            return pipeline
+
         if spec.get("source_type") == "test":
             src = make("videotestsrc", "src")
             set_prop(src, "is-live", True)
@@ -224,15 +382,21 @@ class Runner:
 
         src = make("ndisrc", "src")
         set_prop(src, "ndi-name", spec["source"])
-        set_prop(src, "bandwidth", int(spec.get("bandwidth", 100)))
         set_prop(src, "connect-timeout", int(spec.get("connect_timeout_ms", 10000)))
         set_prop(src, "timeout", int(spec.get("timeout_ms", 5000)))
+        set_prop(src, "bandwidth", int(spec.get("bandwidth", 100)))
         mode = spec.get("timestamp_mode", "receive-time")
         if mode not in TIMESTAMP_MODES:
             raise PipelineError(f"unknown timestamp mode: {mode}")
         set_prop(src, "timestamp-mode", TIMESTAMP_MODES[mode])
         if spec.get("receiver_name"):
             set_prop(src, "receiver-ndi-name", spec["receiver_name"])
+        color = spec.get("color_format", "uyvy-bgra")
+        if color not in COLOR_FORMATS:
+            raise PipelineError(f"unknown colour format: {color}")
+        set_prop(src, "color-format", COLOR_FORMATS[color])
+        if spec.get("max_queue"):
+            set_prop(src, "max-queue-length", int(spec["max_queue"]))
 
         demux = make("ndisrcdemux", "demux")
         pipeline.add(src)
@@ -262,6 +426,16 @@ class Runner:
         return pipeline
 
     # -- instrumentation ---------------------------------------------------
+
+    def _on_queue_overrun(self, _queue):
+        self._queue_overruns += 1
+
+    def _on_arrival(self, _pad, info):
+        buf = info.get_buffer()
+        if buf is not None:
+            self._arrivals += 1
+            self._arrival_bytes += buf.get_size()
+        return Gst.PadProbeReturn.OK
 
     def _on_buffer(self, _pad, info):
         buf = info.get_buffer()
@@ -319,9 +493,13 @@ class Runner:
 
         frames = self._frames - self._last_frames
         octets = self._bytes - self._last_bytes
+        arrivals = self._arrivals - self._last_arrivals
+        arrival_octets = self._arrival_bytes - self._last_arrival_bytes
         self._last_sample = now
         self._last_frames = self._frames
         self._last_bytes = self._bytes
+        self._last_arrivals = self._arrivals
+        self._last_arrival_bytes = self._arrival_bytes
 
         self._read_caps()
         stats = self._sink_stats()
@@ -330,6 +508,12 @@ class Runner:
             "t": time.time(),
             "uptime": round(now - self._started, 1),
             "fps": round(frames / elapsed, 2),
+            # Frames handed in by the NDI receiver, before any of our
+            # processing. Compare against declared_fps to judge the network.
+            "arrival_fps": round(arrivals / elapsed, 2),
+            "arrival_mbps": round((arrival_octets * 8) / elapsed / 1_000_000, 2),
+            "arrivals_total": self._arrivals,
+            "queue_overruns": self._queue_overruns,
             # Bytes at the sink after conversion, so this is the rate into the
             # display rather than the NDI wire rate. Labelled accordingly.
             "render_mbps": round((octets * 8) / elapsed / 1_000_000, 2),

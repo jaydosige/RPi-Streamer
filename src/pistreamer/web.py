@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import config, display, media, sources, system
+from . import config, diagnose, display, media, sources, system
 from .player import MODE_IDLE, MODE_LOCAL, MODE_NDI, player
 from .telemetry import telemetry
 
@@ -31,6 +31,16 @@ TIMESTAMP_MODES = (
     "timecode",
     "timestamp",
 )
+COLOR_FORMATS = (
+    "uyvy-bgra",
+    "bgrx-bgra",
+    "rgbx-rgba",
+    "uyvy-rgba",
+    "fastest",
+    "best",
+)
+# Formats worth offering for the sink. BGRx is the safe default on vc4.
+VIDEO_FORMATS = ("BGRx", "RGBx", "BGRA", "RGB16", "NV12", "I420")
 
 
 @asynccontextmanager
@@ -100,6 +110,23 @@ async def get_status() -> Dict[str, Any]:
     }
 
 
+@app.get("/api/snapshot")
+async def get_snapshot() -> FileResponse:
+    """The most recent captured frame, for the standby-screen preview."""
+    from .player import snapshot_path
+
+    path = snapshot_path()
+    if not path.is_file():
+        raise HTTPException(404, "no snapshot captured yet")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+@app.get("/api/diagnose")
+async def get_diagnose() -> Dict[str, Any]:
+    """Why are frames being lost — the network, or this Pi?"""
+    return diagnose.diagnose(player.stream_stats(), system.summary(), player.status())
+
+
 @app.get("/api/telemetry")
 async def get_telemetry(points: int = 0) -> Dict[str, Any]:
     """Rolling history as parallel arrays.
@@ -146,21 +173,37 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
             400, f"ndi_timestamp_mode must be one of: {', '.join(TIMESTAMP_MODES)}"
         )
 
+    for key, allowed in (
+        ("idle_mode", ("black", "image", "lastframe")),
+        ("queue_leaky", ("none", "upstream", "downstream")),
+        ("ndi_color_format", tuple(COLOR_FORMATS)),
+    ):
+        if key in patch and patch[key] not in allowed:
+            raise HTTPException(400, f"{key} must be one of: {', '.join(allowed)}")
+    if "scale_method" in patch and patch["scale_method"] not in (0, 1, 2, 3):
+        raise HTTPException(400, "scale_method must be 0 (nearest), 1, 2 or 3")
+    if "video_format" in patch and patch["video_format"] not in VIDEO_FORMATS:
+        raise HTTPException(400, f"video_format must be one of: {', '.join(VIDEO_FORMATS)}")
+    if patch.get("standby_file") and media.resolve(patch["standby_file"]) is None:
+        raise HTTPException(404, f"no such media file: {patch['standby_file']}")
+
     cfg = config.update(**patch)
-    # Display/audio/NDI settings only take effect on a fresh pipeline.
+    # Anything that changes the pipeline graph only takes effect on a restart.
     restart_keys = {
-        "connector",
-        "video_mode",
-        "rotation",
-        "audio_device",
-        "audio_enabled",
-        "volume",
-        "ndi_bandwidth",
-        "ndi_latency_ms",
-        "ndi_timestamp_mode",
+        "connector", "video_mode", "rotation",
+        "audio_device", "audio_enabled", "volume",
+        "ndi_bandwidth", "ndi_latency_ms", "ndi_timestamp_mode",
+        "ndi_color_format", "ndi_max_queue",
+        "ndi_connect_timeout_ms", "ndi_timeout_ms",
+        "sink_sync", "sink_qos", "sink_max_lateness_ms",
+        "scale_method", "video_format",
+        "queue_leaky", "queue_max_buffers", "convert_threads",
+        "snapshot_enabled", "snapshot_interval_s",
+        "idle_mode", "standby_file",
         "loop",
     }
-    if restart_keys & set(patch) and cfg.mode != MODE_IDLE:
+    # The standby screen is itself a live pipeline now, so idle restarts too.
+    if restart_keys & set(patch):
         player.restart()
     return cfg.to_dict()
 

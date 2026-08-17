@@ -34,7 +34,7 @@ const VIZ = (() => {
   /* 12-point sparkline: trend line in the de-emphasis hue, current value in
      the accent, per the stat-tile contract. */
   function sparkline(values, accent, opts) {
-    const o = Object.assign({ w: 104, h: 26, points: 12 }, opts || {});
+    const o = Object.assign({ w: 72, h: 24, points: 12 }, opts || {});
     const svg = el("svg", {
       width: o.w, height: o.h, viewBox: `0 0 ${o.w} ${o.h}`,
       class: "spark", "aria-hidden": "true", focusable: "false",

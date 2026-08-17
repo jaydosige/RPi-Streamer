@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+#
+# Host tuning applied at boot by pistreamer-tuning.service.
+#
+# These are the knobs that live outside the pipeline: CPU frequency policy,
+# kernel socket buffers, and Wi-Fi power management. All are safe to re-run and
+# all can be disabled individually in /etc/pistreamer/tuning.conf.
+#
+set -uo pipefail   # deliberately not -e: one failing tweak must not abort the rest
+
+CPU_GOVERNOR="${CPU_GOVERNOR:-performance}"
+SOCKET_BUFFER_MB="${SOCKET_BUFFER_MB:-16}"
+DISABLE_WIFI_POWERSAVE="${DISABLE_WIFI_POWERSAVE:-1}"
+
+log() { printf 'pistreamer-tuning: %s\n' "$*"; }
+
+# --- CPU governor ----------------------------------------------------------
+# The Pi defaults to "ondemand", which ramps the clock up only after load
+# appears. For steady video decode that lag shows up as periodic frame timing
+# wobble, so an appliance wants the clock pinned.
+if [[ -n "${CPU_GOVERNOR}" && "${CPU_GOVERNOR}" != "none" ]]; then
+  applied=0
+  for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    [[ -w "${gov}" ]] || continue
+    avail="$(cat "$(dirname "${gov}")/scaling_available_governors" 2>/dev/null || true)"
+    if [[ " ${avail} " == *" ${CPU_GOVERNOR} "* ]]; then
+      echo "${CPU_GOVERNOR}" > "${gov}" 2>/dev/null && applied=$((applied + 1))
+    fi
+  done
+  if [[ ${applied} -gt 0 ]]; then
+    log "CPU governor set to ${CPU_GOVERNOR} on ${applied} core(s)"
+  else
+    log "could not set CPU governor (not available on this kernel)"
+  fi
+fi
+
+# --- socket buffers --------------------------------------------------------
+# Full-bandwidth NDI is a fat stream and the default receive buffer is small
+# enough that a scheduling hiccup turns into lost packets.
+if [[ "${SOCKET_BUFFER_MB}" -gt 0 ]] 2>/dev/null; then
+  bytes=$((SOCKET_BUFFER_MB * 1024 * 1024))
+  sysctl -q -w net.core.rmem_max="${bytes}" 2>/dev/null
+  sysctl -q -w net.core.rmem_default="${bytes}" 2>/dev/null
+  sysctl -q -w net.core.netdev_max_backlog=4096 2>/dev/null
+  log "socket receive buffers set to ${SOCKET_BUFFER_MB} MB"
+fi
+
+# --- Wi-Fi power saving ----------------------------------------------------
+# The radio sleeping between beacons is fine for a laptop and fatal for a video
+# feed: it shows up as a burst of dropped frames every few seconds.
+if [[ "${DISABLE_WIFI_POWERSAVE}" == "1" ]] && command -v iw >/dev/null 2>&1; then
+  for dev in /sys/class/net/*; do
+    name="$(basename "${dev}")"
+    [[ -d "${dev}/wireless" ]] || continue
+    if iw dev "${name}" set power_save off 2>/dev/null; then
+      log "Wi-Fi power saving disabled on ${name}"
+    fi
+  done
+fi
+
+exit 0

@@ -48,7 +48,18 @@ def main() -> int:
 
         r = client.get("/api/config")
         check("GET /api/config -> 200", r.status_code == 200)
-        check("config exposes all 17 keys", len(r.json()) == 17, str(len(r.json())))
+        # Assert the keys that matter rather than a count, so adding a
+        # setting does not break the test for no reason.
+        keys = set(r.json())
+        required = {
+            "mode", "ndi_source", "local_file", "autostart", "connector",
+            "video_mode", "rotation", "ndi_bandwidth", "ndi_timestamp_mode",
+            "ndi_color_format", "sink_sync", "sink_qos", "scale_method",
+            "video_format", "queue_leaky", "idle_mode", "standby_file",
+            "snapshot_enabled", "use_gst_launch",
+        }
+        check("config exposes every documented key", required <= keys,
+              f"missing: {sorted(required - keys)}")
 
         print("\nconfig validation")
         r = client.post("/api/config", json={"rotation": 45})
@@ -134,6 +145,29 @@ def main() -> int:
         r = client.post("/api/stop")
         check("stop -> 200", r.status_code == 200, r.text)
         check("stop returns to idle", r.json()["mode"] == "idle", r.text)
+
+        print("\nnew settings validation")
+        for bad in ({"idle_mode": "rainbow"}, {"queue_leaky": "sideways"},
+                    {"scale_method": 9}, {"video_format": "XRGB9999"},
+                    {"ndi_color_format": "beige"}):
+            r = client.post("/api/config", json=bad)
+            check(f"reject {list(bad)[0]}={list(bad.values())[0]} -> 400",
+                  r.status_code == 400, r.text)
+        r = client.post("/api/config", json={"standby_file": "nope.png"})
+        check("standby_file must exist -> 404", r.status_code == 404, r.text)
+        r = client.post("/api/config", json={"sink_qos": False, "scale_method": 0,
+                                             "idle_mode": "lastframe"})
+        check("valid performance patch -> 200", r.status_code == 200, r.text)
+
+        print("\ndiagnosis")
+        r = client.get("/api/diagnose")
+        check("GET /api/diagnose -> 200", r.status_code == 200, r.text)
+        body = r.json()
+        check("diagnose returns a verdict", "verdict" in body and "headline" in body, r.text)
+        check("verdict is idle with nothing playing", body["verdict"] == "idle", r.text)
+
+        r = client.get("/api/telemetry?points=5")
+        check("telemetry honours points=5", r.status_code == 200 and len(r.json()["t"]) <= 5, r.text)
 
         print("\nmedia deletion")
         r = client.delete("/api/media/clip.mp4")

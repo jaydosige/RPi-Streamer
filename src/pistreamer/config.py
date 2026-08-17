@@ -59,6 +59,52 @@ class Config:
     # ("receive-time-vs-timecode") trusts the sender's timecode, which stalls
     # playback if the sender emits odd or non-advancing timecodes.
     ndi_timestamp_mode: str = "receive-time"
+    # Colour format the NDI receiver asks the SDK for. "uyvy-bgra" is the
+    # upstream default. "fastest" tells the SDK to hand back whatever is
+    # cheapest for it, which shifts work to videoconvert; "best" does the
+    # opposite. On a Pi 4 this is one of the larger CPU levers.
+    ndi_color_format: str = "uyvy-bgra"
+    # Frames the receiver will hold. Larger rides out network jitter at the
+    # cost of latency and memory.
+    ndi_max_queue: int = 10
+    ndi_connect_timeout_ms: int = 10000
+    ndi_timeout_ms: int = 5000
+
+    # --- pipeline performance ---
+    # Sink clock sync. With sync on, a frame that arrives late is dropped to
+    # stay in time. Turning it off renders every frame as it arrives — motion
+    # can judder slightly but nothing is discarded, which is usually what you
+    # want on a signage or IMAG feed.
+    sink_sync: bool = True
+    # Quality-of-service. The sink reports lateness upstream and drops frames
+    # to catch up. This is the single most common source of "dropped frames"
+    # on a Pi that is merely a little too slow.
+    sink_qos: bool = True
+    # Frames later than this are dropped outright. -1 = no limit.
+    sink_max_lateness_ms: int = -1
+    # videoscale method: 0 nearest, 1 bilinear, 2 4-tap, 3 lanczos.
+    # Nearest is dramatically cheaper and, when no scaling is needed, free.
+    scale_method: int = 1
+    # Pixel format handed to the sink.
+    video_format: str = "BGRx"
+    # Queue behaviour on the video branch. Leaking downstream drops the oldest
+    # frames when the Pi falls behind, which keeps latency bounded.
+    queue_leaky: str = "downstream"
+    queue_max_buffers: int = 0
+    # videoconvert worker threads; 0 lets GStreamer choose.
+    convert_threads: int = 0
+
+    # --- standby screen ---
+    # What to show when nothing is playing. An appliance should never show a
+    # console. "black" | "image" | "lastframe"
+    idle_mode: str = "black"
+    # Filename in the media directory used for "image" (a still or a video).
+    standby_file: str = ""
+    # Continuously save the most recent NDI frame so "lastframe" has something
+    # to hold when the feed stops. Cheap: one JPEG every few seconds.
+    snapshot_enabled: bool = True
+    snapshot_interval_s: int = 3
+
     # Fall back to shelling out to gst-launch-1.0 instead of the instrumented
     # runner. Loses all stream telemetry; kept as an escape hatch.
     use_gst_launch: bool = False

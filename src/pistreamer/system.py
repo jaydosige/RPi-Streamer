@@ -271,6 +271,98 @@ def _link_info(iface: str) -> Dict[str, object]:
     return info
 
 
+_WIRELESS = Path("/proc/net/wireless")
+
+
+def wifi() -> Dict[str, object]:
+    """Wireless link quality, if the node is on Wi-Fi.
+
+    Worth having in its own right: a marginal Wi-Fi link and an overloaded CPU
+    produce the same symptom — dropped frames — and this is how you tell them
+    apart without unplugging anything. Signal below about -70 dBm, or a link
+    rate well under the stream's bitrate, is the network's fault.
+    """
+    out: Dict[str, object] = {
+        "present": False, "interface": None, "ssid": None, "signal_dbm": None,
+        "link_quality": None, "noise_dbm": None, "tx_bitrate_mbps": None,
+        "rx_bitrate_mbps": None, "frequency_ghz": None, "retries": None,
+        "missed_beacons": None, "power_save": None,
+    }
+
+    iface = None
+    try:
+        for line in _WIRELESS.read_text().splitlines()[2:]:
+            if ":" not in line:
+                continue
+            name, rest = line.split(":", 1)
+            iface = name.strip()
+            f = rest.split()
+            # Columns: status link level noise nwid crypt frag retry misc beacon
+            if len(f) >= 4:
+                out["link_quality"] = float(f[1].rstrip("."))
+                out["signal_dbm"] = float(f[2].rstrip("."))
+                out["noise_dbm"] = float(f[3].rstrip("."))
+            if len(f) >= 9:
+                out["missed_beacons"] = int(float(f[8].rstrip(".")))
+            break
+    except (OSError, ValueError, IndexError):
+        pass
+
+    if iface is None:
+        return out
+    out["present"] = True
+    out["interface"] = iface
+
+    if shutil.which("iw"):
+        try:
+            proc = subprocess.run(
+                ["iw", "dev", iface, "link"], capture_output=True, text=True, timeout=5
+            )
+            text = proc.stdout
+            m = re.search(r"SSID:\s*(.+)", text)
+            if m:
+                out["ssid"] = m.group(1).strip()
+            m = re.search(r"signal:\s*(-?\d+)", text)
+            if m:
+                out["signal_dbm"] = float(m.group(1))
+            m = re.search(r"freq:\s*(\d+)", text)
+            if m:
+                out["frequency_ghz"] = round(int(m.group(1)) / 1000.0, 3)
+            m = re.search(r"tx bitrate:\s*([\d.]+)", text)
+            if m:
+                out["tx_bitrate_mbps"] = float(m.group(1))
+            m = re.search(r"rx bitrate:\s*([\d.]+)", text)
+            if m:
+                out["rx_bitrate_mbps"] = float(m.group(1))
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
+
+        try:
+            proc = subprocess.run(
+                ["iw", "dev", iface, "station", "dump"],
+                capture_output=True, text=True, timeout=5,
+            )
+            m = re.search(r"tx retries:\s*(\d+)", proc.stdout)
+            if m:
+                out["retries"] = int(m.group(1))
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
+
+    if shutil.which("iw"):
+        try:
+            proc = subprocess.run(
+                ["iw", "dev", iface, "get", "power_save"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if "on" in proc.stdout.lower():
+                out["power_save"] = True
+            elif "off" in proc.stdout.lower():
+                out["power_save"] = False
+        except (subprocess.SubprocessError, OSError):
+            pass
+    return out
+
+
 def _addresses() -> Dict[str, List[str]]:
     out: Dict[str, List[str]] = {}
     if not shutil.which("ip"):
@@ -457,6 +549,7 @@ def summary() -> dict:
         "memory": memory(),
         "disk": disk(),
         "network": network(),
+        "wifi": wifi(),
         "versions": versions(),
         "time": time.time(),
     }
