@@ -15,6 +15,10 @@ apt_install \
   gstreamer1.0-plugins-base-apps \
   gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad \
+  `# textoverlay lives here (in the pango plugin), NOT in gstreamer1.0-plugins-base` \
+  `# despite being built from gst-plugins-base. Without it the identify overlay` \
+  `# silently never appears: the runner logs one warning and plays on without it.` \
+  gstreamer1.0-x \
   gstreamer1.0-alsa \
   gstreamer1.0-libav \
   libgstreamer1.0-0 \

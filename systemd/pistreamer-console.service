@@ -1,0 +1,40 @@
+[Unit]
+Description=pi-streamer console blanking (clear the framebuffer console before playback)
+Documentation=man:setterm(1)
+# Must run before anything takes the display: once a player holds DRM master the
+# console is hidden, and the only chance to leave a blank VT underneath it is
+# beforehand.
+Before=pistreamer.service
+Wants=pistreamer.service
+
+[Service]
+Type=oneshot
+# Nothing re-dirties the console after this, so there is no work to redo; stay
+# "active" so systemd does not treat the unit as still pending.
+RemainAfterExit=yes
+
+# Why this exists at all: when a player process exits it releases DRM master and
+# the kernel repaints the framebuffer console from the VT's stored contents. Any
+# text still in that buffer reappears in the gap between one player stopping and
+# the next starting — which is exactly what shows when switching streams. Clear
+# the buffer once and the gap repaints as black instead.
+#
+# setterm writes escape sequences to its *stdout*; it does not act on a tty by
+# name. Redirecting to the console device is therefore load-bearing — without
+# the redirection the codes land in the journal and the screen is untouched.
+# ExecStart cannot redirect, hence /bin/sh -c.
+#
+# --term linux is also load-bearing: systemd starts services with no TERM, and
+# setterm exits 1 with "$TERM is not defined" rather than emitting anything.
+#
+# /dev/tty0 is whichever VT the framebuffer is currently showing; /dev/tty1 is
+# the one it settles on once the getty is masked and the kernel console has been
+# moved to tty3. Clearing both covers the boot ordering either way.
+#
+# Every step is tolerant and the line ends in exit 0: a missing or unwritable
+# console device must not fail the unit, because it would then be ordered
+# before pistreamer.service and drag playback down with it.
+ExecStart=/bin/sh -c 'setterm --term linux --clear=all --cursor off >/dev/tty0 2>/dev/null; setterm --term linux --clear=all --cursor off >/dev/tty1 2>/dev/null; exit 0'
+
+[Install]
+WantedBy=multi-user.target

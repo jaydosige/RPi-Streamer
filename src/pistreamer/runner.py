@@ -18,14 +18,20 @@ gst-launch-1.0. Two reasons:
 Protocol: one JSON object per line on stdout, prefixed with "@STATS ".
 Everything else (GStreamer warnings, errors) goes to stderr.
 
+Control in the other direction is one file. The spec's optional "overlay_file"
+names an absolute path that this process re-reads twice a second: whatever is
+in it is drawn over the picture, and empty or missing means nothing is drawn.
+That is the whole identify mechanism — see _poll_overlay.
+
 Usage:
     python -m pistreamer.runner '<json spec>'
-    python -m pistreamer.runner --self-test
+    python -m pistreamer.runner --self-test [seconds] [overlay_file]
 """
 
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from typing import Any, Dict, Optional
@@ -51,6 +57,42 @@ FLIP_METHODS = {90: 1, 180: 2, 270: 3}
 # queue leaky enum: 0 none, 1 upstream, 2 downstream.
 LEAKY = {"none": 0, "upstream": 1, "downstream": 2}
 LEAKY_DOWNSTREAM = 2
+
+# textoverlay alignment enums, by value, for the same reason as the others: a
+# wrong nick is a silent fallback to the default, a wrong number is not.
+# GstBaseTextOverlayVAlign: 0 baseline, 1 bottom, 2 top, 3 position, 4 center.
+VALIGN_TOP = 2
+# GstBaseTextOverlayHAlign / LineAlign: 0 left, 1 centre, 2 right.
+HALIGN_LEFT = 0
+LINE_ALIGN_LEFT = 0
+
+# How often the identify overlay's text file is re-read. Twice a second is
+# under the threshold where an operator walking the room notices a lag, and is
+# two stat() calls a second, which is nothing next to decoding NDI.
+OVERLAY_POLL_MS = 500
+
+# A cap on how much of the overlay file we will render. The file is written by
+# another process; if something ever truncates a log into it we want a clipped
+# line on screen, not a full-frame wall of text over the programme output.
+OVERLAY_MAX_CHARS = 512
+
+# The overlay is deliberately not configurable. It is an identify aid on an
+# event network: read from across a room, on top of content nobody chose, by
+# someone who needs to know which box in the rack is which.
+#   * Bold sans at size 18 with textoverlay's default auto-resize=true, which
+#     scales the font with the frame — so this is ~7% of picture height per
+#     line at any resolution, from 576p to 1080p, rather than a pixel size
+#     that is huge on one mode and unreadable on another.
+#   * Top left, left-aligned: the bottom of the frame is where lower thirds and
+#     mpv's own OSD live, so the top is the least likely place to cover
+#     something that matters. Left-aligned so a name and an address below it
+#     line up as a block instead of drifting about as the text changes.
+#   * shaded-background, because white-on-white is invisible and we have no
+#     idea what is underneath.
+#   * 40px padding: TVs still overscan, and text hard against the edge is the
+#     first thing to be cropped off.
+OVERLAY_FONT = "Sans Bold 18"
+OVERLAY_PAD = 40
 
 # ndisrc color-format enum nicks. The compressed-* values only exist when the
 # plugin was built against the NDI *Advanced* SDK (cargo --features
@@ -140,6 +182,17 @@ def make(factory: str, name: Optional[str] = None):
     return element
 
 
+def make_optional(factory: str, name: Optional[str] = None):
+    """Like make(), but None instead of an exception when the plugin is absent.
+
+    make() is right for everything the pipeline cannot work without. It is
+    wrong for the identify overlay: a node installed before textoverlay was
+    added to the package list would refuse to show any picture at all, which
+    is a far worse fault than losing a diagnostic caption.
+    """
+    return Gst.ElementFactory.make(factory, name)
+
+
 def set_prop(element, prop: str, value: Any) -> None:
     """Set a property, failing loudly if the element has no such property.
 
@@ -184,6 +237,24 @@ class Runner:
         self._decoder: Optional[str] = None
         self._match_source = bool(spec.get("match_source"))
 
+        # Identify overlay. The text comes from a file rather than from the
+        # spec because the web service cannot speak to this subprocess once it
+        # is running — there is no control channel — and restarting the
+        # pipeline to switch a caption on would black the display out for a
+        # second or two on every node in the building. A file both ends can
+        # see, polled from the main loop, gives a live toggle with no restart.
+        self._overlay = None
+        self._overlay_file: Optional[str] = spec.get("overlay_file") or None
+        if self._overlay_file and not os.path.isabs(self._overlay_file):
+            # Nothing defines this subprocess's working directory, so a
+            # relative path here would resolve somewhere arbitrary.
+            log(f"WARNING: overlay_file '{self._overlay_file}' is not absolute; "
+                f"resolving against {os.getcwd()}")
+        # None means "not yet read", which is distinct from "" (read, and
+        # empty). Keeping them apart means the first poll always applies and
+        # logs a state rather than trusting the element's build-time defaults.
+        self._overlay_text: Optional[str] = None
+
     # -- construction ------------------------------------------------------
 
     def _build_video_chain(self, pipeline) -> tuple:
@@ -206,6 +277,52 @@ class Runner:
         if threads and convert.find_property("n-threads") is not None:
             set_prop(convert, "n-threads", threads)
         elements = [queue, convert]
+
+        # The overlay goes in at the head of the chain — after the queue, ahead
+        # of videoconvert, videoflip, videoscale and the output capsfilter — so
+        # everything downstream treats the caption as part of the picture.
+        # Three things depend on it being here and not just before the sink:
+        #
+        #   * Rotation. videoflip is downstream, so the text turns with the
+        #     content. On a portrait-mounted panel an overlay added after the
+        #     flip comes out sideways to the viewer.
+        #   * Negotiation. videoconvert and videoscale sit between the overlay
+        #     and the pinned output caps, so they can still give kmssink
+        #     exactly the format and size it demands. Spliced in after the
+        #     capsfilter instead, a format the overlay's blender does not
+        #     support would fail negotiation and take the whole picture down —
+        #     the opposite of what an optional caption should be able to do.
+        #   * Threading. Downstream of the queue the blend runs on the queue's
+        #     own thread, so it cannot push back on the NDI receive thread; if
+        #     it ever cost too much the leaky queue drops frames as usual
+        #     rather than stalling the receiver.
+        #
+        # Cost barely enters into the placement: textoverlay renders the text
+        # once into a cached bitmap and per frame only blends its bounding box,
+        # so the bill is set by the size of the caption, not by where in the
+        # chain the frame is or how big it is.
+        overlay = None
+        if self._overlay_file:
+            overlay = make_optional("textoverlay", "identify")
+            if overlay is None:
+                log("WARNING: textoverlay is missing, so the identify overlay "
+                    "is disabled — install the gstreamer1.0-x package "
+                    "(textoverlay is in its pango plugin). Playback continues "
+                    "without it.")
+            else:
+                set_prop(overlay, "text", "")
+                # Start hidden whatever the file says. The first poll turns it
+                # on, so a stale file cannot flash a caption up during startup.
+                set_prop(overlay, "silent", True)
+                set_prop(overlay, "font-desc", OVERLAY_FONT)
+                set_prop(overlay, "valignment", VALIGN_TOP)
+                set_prop(overlay, "halignment", HALIGN_LEFT)
+                set_prop(overlay, "line-alignment", LINE_ALIGN_LEFT)
+                set_prop(overlay, "shaded-background", True)
+                set_prop(overlay, "xpad", OVERLAY_PAD)
+                set_prop(overlay, "ypad", OVERLAY_PAD)
+                self._overlay = overlay
+                elements.insert(1, overlay)
 
         rotation = int(spec.get("rotation", 0) or 0)
         if rotation in FLIP_METHODS:
@@ -268,6 +385,10 @@ class Runner:
         # standby screen can hold the last picture when a feed stops, instead
         # of cutting to black. Throttled hard and leaky, so it can never
         # apply back-pressure to the display path.
+        # Note that the overlay is upstream of the tee, so while identify is on
+        # the snapshots carry the caption too. That is the price of a single
+        # overlay that covers every path; the snapshot is refreshed every few
+        # seconds, so it clears itself once identify goes off.
         snapshot_path = spec.get("snapshot_path")
         tee = None
         if snapshot_path:
@@ -685,6 +806,12 @@ class Runner:
                 else None
             ),
             "qos_events": self._qos_events,
+            # Whether the overlay could be built at all, and what it is showing.
+            # Reported because "identify does nothing" has two very different
+            # causes — nobody wrote the file, or this node has no textoverlay —
+            # and this tells them apart without reading the journal on the node.
+            "overlay_available": self._overlay is not None,
+            "overlay": self._overlay_text or None,
             "decoder": self._decoder,
             "hardware_decode": bool(self._decoder and _is_hardware_decoder(self._decoder)),
             "rendered": stats["rendered"],
@@ -692,6 +819,48 @@ class Runner:
             **self._caps,
         }
         print(STATS_PREFIX + json.dumps(payload), flush=True)
+        return True  # keep the timeout installed
+
+    # -- identify overlay --------------------------------------------------
+
+    def _read_overlay_file(self) -> str:
+        """The wanted caption, or "" for "show nothing".
+
+        Every failure — no file, no permission, a directory, a half-written
+        file — collapses to "", because there is no sensible way to render an
+        error onto someone's programme output. The overlay simply stays off.
+        """
+        path = self._overlay_file
+        if not path:
+            return ""
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read(OVERLAY_MAX_CHARS).strip()
+        except OSError:
+            return ""
+
+    def _poll_overlay(self) -> bool:
+        wanted = self._read_overlay_file()
+        if wanted == self._overlay_text:
+            # Setting text and silent every half second would re-render the
+            # font and re-blend on a box that is already flat out decoding
+            # NDI. Only a real change is worth paying for.
+            return True
+        self._overlay_text = wanted
+        # textoverlay parses the text property as Pango markup, not as plain
+        # text, and Pango's parser is strict: one bare "&" or "<" in a node
+        # name and the layout is rejected. Verified behaviour when that happens
+        # is worse than a missing caption — the element goes on rendering the
+        # PREVIOUS text, so the node stands there displaying another node's
+        # name. Escaping is what makes arbitrary names and addresses safe to
+        # show, and it also stops whoever writes the file from restyling the
+        # caption or hiding it inside markup.
+        set_prop(self._overlay, "text", GLib.markup_escape_text(wanted))
+        # silent is what makes the off state actually free: with no text to
+        # blend, textoverlay passes buffers straight through.
+        set_prop(self._overlay, "silent", not wanted)
+        log(f"identify overlay {'on' if wanted else 'off'}: "
+            f"{wanted.replace(chr(10), ' / ') if wanted else '(hidden)'}")
         return True  # keep the timeout installed
 
     # -- bus ---------------------------------------------------------------
@@ -728,6 +897,13 @@ class Runner:
 
         interval = float(self.spec.get("stats_interval", 1.0))
         GLib.timeout_add(int(interval * 1000), self._emit_stats)
+
+        if self._overlay is not None:
+            GLib.timeout_add(OVERLAY_POLL_MS, self._poll_overlay)
+            # Read once before PLAYING as well as on the timeout, so a node
+            # that is already being identified when its pipeline restarts comes
+            # up with the caption instead of half a second without it.
+            self._poll_overlay()
 
         for sig in ("SIGTERM", "SIGINT"):
             GLib.unix_signal_add(
@@ -803,6 +979,12 @@ def main(argv: Optional[list] = None) -> int:
             "run_for": float(argv[1]) if len(argv) > 1 else 3.0,
             "stats_interval": 1.0,
         }
+        # A third argument opts the identify overlay in, so the file-polling
+        # path can be driven by hand (write to the file while this runs and
+        # watch the log) without a Pi and without a display. Omitted, the
+        # self-test is exactly what it was before the overlay existed.
+        if len(argv) > 2:
+            spec["overlay_file"] = argv[2]
     elif argv:
         spec = json.loads(argv[0])
     else:

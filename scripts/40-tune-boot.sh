@@ -81,7 +81,20 @@ if [[ -f "${CMDLINE_TXT}" ]]; then
   # consoleblank=0 stops the console blanking after 10 minutes and taking the
   # HDMI output with it. logo.nologo + cursor off keep the screen clean before
   # the player takes over.
-  for opt in "consoleblank=0" "logo.nologo" "vt.global_cursor_default=0"; do
+  #
+  # quiet + loglevel=3 + systemd.show_status=false are what stop text appearing
+  # on a fresh boot: moving the console to tty3 does not silence the messages
+  # printed before the switch takes effect, nor systemd's per-unit status lines,
+  # so without these three the screen shows scrolling boot output until
+  # pistreamer takes the display.
+  #
+  # loglevel=3 goes through the same add-if-absent test as everything else, so
+  # an existing loglevel= is left at whatever value it already has. That is
+  # deliberate: someone who set loglevel=7 to debug this node should not have it
+  # silently reverted, and a second loglevel= on the cmdline would just be the
+  # last one winning at random.
+  for opt in "consoleblank=0" "logo.nologo" "vt.global_cursor_default=0" \
+             "quiet" "loglevel=3" "systemd.show_status=false"; do
     key="${opt%%=*}"
     if ! grep -qE "(^| )${key}(=|\$| )" <<<"${CMDLINE}"; then
       CMDLINE="${CMDLINE} ${opt}"

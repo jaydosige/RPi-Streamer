@@ -224,6 +224,7 @@
   <button data-tab="display">Display &amp; audio</button>
   <button data-tab="schedule">Schedule</button>
   <button data-tab="perf">Performance</button>
+  <button data-tab="nodes">Nodes</button>
   <button data-tab="diag">Diagnostics</button>
   <button data-tab="system">System</button>
 </nav>
@@ -710,6 +711,90 @@
   </section>
 
   <!-- DIAGNOSTICS -->
+  <section id="tab-nodes">
+    <div class="card">
+      <h2>This node</h2>
+      <ul class="list" id="clusterSelf"></ul>
+      <div class="checkline" style="margin-top:10px">
+        <input type="checkbox" id="cfgIdentify">
+        <label for="cfgIdentify">Identify &mdash; show every node's name and address on screen</label>
+      </div>
+      <div class="host">
+        Applies to the whole group, over whatever is playing, and to nodes that
+        are not playing anything. It survives a reboot on purpose: if you flagged
+        a node because you were looking for it, finding it should not depend on
+        the node staying up.
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Group</h2>
+      <div class="host" style="margin-bottom:10px">
+        Nodes announce themselves every two seconds and disappear from this list
+        twelve seconds after they stop. Only nodes in the same group, signed with
+        the same key, are ever listed.
+      </div>
+      <div id="clusterWarn"></div>
+      <ul class="list" id="peerList"></ul>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="btnNodesRefresh">Refresh</button>
+        <button class="btn" id="btnStandbyAll">Standby everywhere</button>
+        <button class="btn danger" id="btnRebootAll">Reboot the group</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Synchronised playback</h2>
+      <div class="host" style="margin-bottom:10px">
+        Send a playlist to every node, then play it in step. Each item is loaded
+        and held paused on all nodes, released on an agreed instant, and then
+        kept in line while it plays. Only files are synchronised &mdash; an NDI
+        source is already live and has its own timing.
+      </div>
+      <label class="field">
+        <span class="lbl">Playlist</span>
+        <select id="syncPlaylist"></select>
+      </label>
+      <div class="row">
+        <button class="btn" id="btnPushPlaylist">Send files to the group</button>
+        <button class="btn primary" id="btnSyncPlay">Play together</button>
+        <button class="btn" id="btnSyncStop">Stop</button>
+      </div>
+      <div class="host" id="pushResult" style="margin-top:10px"></div>
+      <ul class="list" id="syncState" style="margin-top:10px"></ul>
+    </div>
+
+    <div class="card">
+      <h2>Group settings</h2>
+      <div class="checkline">
+        <input type="checkbox" id="cfgClusterEnabled">
+        <label for="cfgClusterEnabled">Take part in a group</label>
+      </div>
+      <label class="field">
+        <span class="lbl">Group name &mdash; two shows on one network stay apart by using different names</span>
+        <input type="text" id="cfgClusterGroup">
+      </label>
+      <label class="field">
+        <span class="lbl">Shared key &mdash; must match on every node. Change it from the default.</span>
+        <input type="text" id="cfgClusterKey">
+      </label>
+      <label class="field">
+        <span class="lbl">Extra addresses &mdash; comma separated. Only needed if the switch drops broadcast.</span>
+        <input type="text" id="cfgClusterExtraIps" placeholder="192.168.20.32, 192.168.20.33">
+      </label>
+      <div class="checkline">
+        <input type="checkbox" id="cfgClusterDrift">
+        <label for="cfgClusterDrift">Correct drift while an item plays</label>
+      </div>
+      <div class="host">
+        With this off you still get a synchronised start for every item, just no
+        correction afterwards &mdash; which is enough for short clips and avoids
+        any chance of a visible correction mid-item.
+      </div>
+      <button class="btn" id="btnSaveCluster" style="margin-top:8px">Save group settings</button>
+    </div>
+  </section>
+
   <section id="tab-diag">
     <div class="card">
       <h2>Last 10 minutes</h2>
@@ -879,6 +964,7 @@ document.querySelectorAll("nav button").forEach((btn) => {
     if (btn.dataset.tab === "ndi") loadNdiNetwork();
     if (btn.dataset.tab === "schedule") loadSchedule();
     if (btn.dataset.tab === "system") loadOverclock();
+    if (btn.dataset.tab === "nodes") loadNodes();
   };
 });
 
@@ -910,6 +996,9 @@ async function poll() {
     SPARKS = (await api("/api/telemetry?points=14")).series || {};
   } catch (_) { /* sparklines are decoration */ }
   if (activeTab() === "diag") loadTelemetry();
+  // Only while the tab is open: peers move on a two-second beacon, and there is
+  // no point polling the group from a node nobody is looking at.
+  if (activeTab() === "nodes") loadNodes();
   loadVerdict();
 }
 
@@ -1356,6 +1445,181 @@ const OC_LABELS = {
   mild: ["Mild", "1.75 GHz, over_voltage 2. Newer Pi 4s already run 1.8 GHz, so this may do nothing for them."],
   moderate: ["Moderate", "2.0 GHz, over_voltage 6. The usual sweet spot with a heatsink."],
   maximum: ["Maximum", "2.147 GHz, over_voltage 6, GPU 750 MHz. Official guidance says you are unlikely to hold this long-term."],
+};
+
+// ---------- nodes ----------
+
+let CLUSTER = null;
+
+async function loadNodes() {
+  try { CLUSTER = await api("/api/cluster"); } catch (_) { return; }
+  const c = CLUSTER;
+  $("clusterSelf").innerHTML = kvs([
+    ["Name", c.self.name],
+    ["Address", `${c.self.ip}${c.self.port === 80 ? "" : ":" + c.self.port}`],
+    ["Group", c.group],
+    ["Node id", c.self.id],
+    ["Beacon", c.beacon.running
+      ? `announcing on UDP ${c.beacon.port} — ${c.beacon.sent} sent, ${c.beacon.received} received`
+      : "not running"],
+    ["Beacon problem", c.beacon.last_error || null],
+    // Only meaningful while a GStreamer pipeline is up, and only worth saying
+    // when it is bad news: a node that was installed before the overlay
+    // existed shows no caption and has no other symptom.
+    ["Identify overlay", STATE && STATE.stream
+      && STATE.stream.overlay_available === false
+      ? "unavailable — install gstreamer1.0-x (re-run install.sh)" : null],
+  ]);
+  $("cfgIdentify").checked = !!c.self.identify;
+
+  // Two nodes with one identity see nothing of each other and there is no other
+  // symptom, so this warning is worth more than it looks.
+  const dupes = c.beacon.duplicate_ids_at || [];
+  $("clusterWarn").innerHTML = dupes.length
+    ? `<div class="banner warn">Another node at ${dupes.join(", ")} is using this
+       node's id, so the two cannot see each other. This happens when an SD card
+       is cloned. Regenerate <code>/etc/machine-id</code> on one of them
+       (<code>sudo rm /etc/machine-id &amp;&amp; sudo systemd-machine-id-setup</code>)
+       and reboot.</div>`
+    : "";
+
+  if (!c.enabled) {
+    $("peerList").innerHTML = `<div class="empty">This node is not taking part in a group.</div>`;
+  } else if (!c.peers.length) {
+    $("peerList").innerHTML = `<div class="empty">No other nodes yet. They appear
+      within a few seconds of starting up; if they never do, check the group name
+      and key match, and add their addresses below if the switch drops broadcast.</div>`;
+  } else {
+    $("peerList").innerHTML = c.peers.map((p) => {
+      const what = p.playing
+        ? `${p.mode === "ndi" ? "NDI" : p.mode} — ${p.target || "?"}`
+        : "not playing";
+      const offset = p.clock_offset_ms === null || p.clock_offset_ms === undefined
+        ? "" : ` · clock ${p.clock_offset_ms > 0 ? "+" : ""}${p.clock_offset_ms}ms`;
+      // .meta takes the remaining width, which is what pushes the button to the
+      // right edge the way every other list in this GUI does it.
+      return `<li>
+        <div class="meta">
+          <div class="name">${p.name || "(unnamed)"}${p.identify ? " · identified" : ""}</div>
+          <div class="sub">${p.ip} · ${what} · last seen ${p.age}s ago${offset}</div>
+        </div>
+        <a class="btn" href="http://${p.ip}${p.port === 80 ? "" : ":" + p.port}/"
+           target="_blank" rel="noreferrer">Open</a>
+      </li>`;
+    }).join("");
+  }
+
+  const sync = c.sync || {};
+  $("syncState").innerHTML = sync.running
+    ? kvs([
+        ["Playing", sync.item || "(starting)"],
+        ["Item", `${(sync.index || 0) + 1} of ${(sync.files || []).length}`],
+        ["Nodes", (sync.nodes || []).join(", ")],
+        ["Started", sync.last && sync.last.started !== undefined
+          ? `${sync.last.started} of ${sync.last.nodes}` : null],
+        ["Clock spread", sync.last && sync.last.clock_spread_ms !== undefined
+          ? `${sync.last.clock_spread_ms} ms` : null],
+        ["Failed", sync.last && (sync.last.failed || []).length
+          ? sync.last.failed.map((f) => `${f.name}: ${f.error}`).join("; ") : null],
+      ])
+    : `<div class="empty">Not running a synchronised playlist.</div>`;
+
+  const cfg = STATE ? STATE.config : null;
+  if (cfg) {
+    $("cfgClusterEnabled").checked = cfg.cluster_enabled;
+    $("cfgClusterGroup").value = cfg.cluster_group;
+    $("cfgClusterKey").value = cfg.cluster_key;
+    $("cfgClusterExtraIps").value = cfg.cluster_extra_ips;
+    $("cfgClusterDrift").checked = cfg.cluster_drift_correct;
+  }
+  const sel = $("syncPlaylist");
+  const keep = sel.value;
+  try {
+    const pls = (await api("/api/playlists")).playlists;
+    sel.innerHTML = pls.length
+      ? pls.map((p) => `<option value="${p.name}">${p.name}</option>`).join("")
+      : `<option value="">no playlists yet</option>`;
+    if (keep) sel.value = keep;
+  } catch (_) { /* best effort */ }
+}
+
+$("cfgIdentify").onchange = async () => {
+  try {
+    const r = await post("/api/cluster/identify", { on: $("cfgIdentify").checked });
+    const bad = (r.peers || []).filter((p) => !p.ok);
+    toast(bad.length
+      ? `Identify set here; ${bad.length} node(s) did not answer`
+      : `Identify ${r.identify ? "on" : "off"} across the group`, bad.length > 0);
+  } catch (e) { toast(e.message, true); }
+  loadNodes();
+};
+
+$("btnNodesRefresh").onclick = loadNodes;
+
+$("btnStandbyAll").onclick = async () => {
+  try {
+    const r = await post("/api/cluster/command", { action: "standby" });
+    const bad = r.results.filter((x) => !x.ok);
+    toast(bad.length ? `${bad.length} node(s) failed: ${bad[0].error}` : "Group in standby",
+          bad.length > 0);
+  } catch (e) { toast(e.message, true); }
+  loadNodes();
+};
+
+$("btnRebootAll").onclick = async () => {
+  if (!confirm("Reboot every node in the group, including this one?")) return;
+  try {
+    await post("/api/cluster/command", { action: "reboot" });
+    toast("Rebooting the group");
+  } catch (e) { toast(e.message, true); }
+};
+
+$("btnPushPlaylist").onclick = async () => {
+  const name = $("syncPlaylist").value;
+  if (!name) { toast("No playlist selected", true); return; }
+  $("btnPushPlaylist").disabled = true;
+  $("pushResult").textContent = "Sending — large files take a while, this waits for them.";
+  try {
+    const r = await post("/api/cluster/push", { playlist: name });
+    $("pushResult").innerHTML = r.results.length
+      ? r.results.map((x) => `<div>${x.name}: ${x.ok
+          ? `${x.sent.length} sent, ${x.skipped.length} already there`
+          : `<span style="color:var(--bad)">${x.error}</span>`}</div>`).join("")
+      : "<div>No other nodes to send to.</div>";
+  } catch (e) {
+    $("pushResult").innerHTML = `<span style="color:var(--bad)">${e.message}</span>`;
+  }
+  $("btnPushPlaylist").disabled = false;
+};
+
+$("btnSyncPlay").onclick = async () => {
+  const name = $("syncPlaylist").value;
+  if (!name) { toast("No playlist selected", true); return; }
+  try {
+    await post("/api/cluster/sync/play", { playlist: name, loop: true });
+    toast("Starting together");
+  } catch (e) { toast(e.message, true); }
+  setTimeout(loadNodes, 1500);
+};
+
+$("btnSyncStop").onclick = async () => {
+  try { await post("/api/cluster/sync/stop", {}); toast("Stopped"); }
+  catch (e) { toast(e.message, true); }
+  loadNodes();
+};
+
+$("btnSaveCluster").onclick = async () => {
+  try {
+    await post("/api/config", {
+      cluster_enabled: $("cfgClusterEnabled").checked,
+      cluster_group: $("cfgClusterGroup").value.trim(),
+      cluster_key: $("cfgClusterKey").value,
+      cluster_extra_ips: $("cfgClusterExtraIps").value.trim(),
+      cluster_drift_correct: $("cfgClusterDrift").checked,
+    });
+    toast("Group settings saved — restart the service if you changed the group or key");
+  } catch (e) { toast(e.message, true); }
+  loadNodes();
 };
 
 async function loadOverclock() {

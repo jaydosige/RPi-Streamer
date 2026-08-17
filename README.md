@@ -249,21 +249,91 @@ player escaped teardown and is worth reporting. Local playback writes straight
 to ALSA (`--ao=alsa`) rather than through a sound server, because a server keeps
 its own buffer and would go on playing a stopped item underneath the next one.
 
+**Terminal text visible on the display.** Two separate causes. On a fresh boot
+it is kernel and systemd messages printed before playback starts: the cmdline
+gets `quiet loglevel=3 systemd.show_status=false` plus `console=tty3`, and the
+getty on tty1 is masked, so nothing writes to the visible console. When
+switching streams it is the old console contents being repainted: only one
+process can hold the display, so when a player exits it releases DRM master and
+the kernel redraws the framebuffer console underneath. `pistreamer-console`
+clears that console once at boot, which makes the redraw black rather than text.
+A brief black frame between items is therefore expected and cannot be removed
+without a second compositor holding the output.
+
+To get the console back for local debugging:
+
+```bash
+sudo systemctl unmask getty@tty1 && sudo systemctl enable --now getty@tty1
+sudo sed -i 's/ quiet//; s/ loglevel=3//; s/ systemd.show_status=false//' /boot/firmware/cmdline.txt
+sudo reboot
+```
+
+The originals are at `/boot/firmware/cmdline.txt.pistreamer.bak`. If text still
+gets through, the last resort is adding `fbcon=map:2` to `cmdline.txt`, which
+detaches the console from the framebuffer entirely. Untested on this hardware,
+and it costs you the local display for debugging — SSH becomes the only way in.
+
 **Overclock control unavailable, mentioning sudo.** The installed units are
 older than the app. The service cannot escalate at all by design; overclocking
 is applied by a root path-activated unit. Run `install.sh` again to install
 `pistreamer-overclock.path`, then check `systemctl status
 pistreamer-overclock.path` shows it active.
 
+## Several nodes together
+
+Nodes announce themselves on UDP 47600 every two seconds and appear in each
+other's **Nodes** tab. There is nothing to configure beyond a group name and a
+shared key, which must match on every unit — two shows on one network stay apart
+by using different group names, and the key stops a laptop on the guest VLAN
+from stopping playback. Change it from the default.
+
+From any node you can put the whole group into standby, reboot it, send a
+playlist to it, or play that playlist in step. There is no leader daemon and no
+cluster state: whichever node you have open acts as conductor for that
+operation, so there is no split-brain to debug on a show day.
+
+**Identify** puts each node's name and address on its own screen, over whatever
+is playing and on nodes that are playing nothing. It is how you work out which
+box is which without unplugging HDMI cables. It persists across a reboot on
+purpose.
+
+### How synchronised playback works
+
+Per item: every node loads the file and holds its first frame *paused*, reports
+ready, and is then told a wall-clock instant to un-pause — expressed in its own
+clock, because the conductor measures each node's clock offset and does the
+arithmetic itself. Spawning a player takes tens to hundreds of milliseconds and
+varies per node and per file; un-pausing one that has already decoded costs
+about a frame, which is the whole reason for the two-step start.
+
+While an item plays, the conductor publishes its playhead every two seconds. A
+node that is out by under a quarter second changes speed by 2% until it catches
+up, which is invisible and inaudible; one that is further out seeks, which is
+not invisible and is therefore reserved for genuinely lost sync. Turn drift
+correction off and you still get a synchronised start for every item.
+
+Only files are synchronised. An NDI source is already live with its own timing,
+so putting one in a synchronised playlist is not meaningful.
+
+**Node identity and cloned SD cards.** A node's identity is derived from the Pi's
+board serial first, then machine-id, then MAC. This matters because cloning a
+working card — the obvious way to deploy the second and third node — copies
+`/etc/machine-id`. Nodes sharing an identity treat each other's beacons as their
+own echo and discover nothing, with no other symptom, so the Nodes tab warns
+loudly if it sees one.
+
 ## Testing
 
 None of this needs a Pi:
 
 ```bash
-python3 tests/test_smoke.py      # API contract, config, uploads, degradation
-python3 tests/test_features.py   # playlist segments, validation, schedule cues
-python3 tests/test_teardown.py   # nothing outlives its segment (real processes)
-python3 tests/test_diagnose.py   # network-vs-Pi verdicts
+python3 tests/test_smoke.py        # API contract, config, uploads, degradation
+python3 tests/test_features.py     # playlist segments, validation, schedule cues
+python3 tests/test_teardown.py     # nothing outlives its segment (real processes)
+python3 tests/test_diagnose.py     # network-vs-Pi verdicts
+python3 tests/test_cluster.py      # beacons, group auth, sync maths, conductor
+python3 tests/test_cluster_live.py # two real nodes: discovery, auth, file push
+python3 tests/test_overlay.py      # the identify caption actually renders
 
 python -m pistreamer.runner --self-test             # the real video chain
 python -m pistreamer.runner --self-test-compressed  # decoder selection

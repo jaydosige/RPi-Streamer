@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import socket
+import time
 from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
@@ -100,6 +101,67 @@ def query(socket_path: str, properties: Optional[List[str]] = None,
         except OSError:
             pass
     return out
+
+
+def command(socket_path: str, *args: Any, timeout: float = 2.0) -> Dict[str, Any]:
+    """Send one command to a running mpv and return its reply.
+
+    Used for the things that cannot be expressed as a launch flag because they
+    have to happen at a precise moment or in response to another node: leaving
+    pause exactly on the beat, seeking to correct drift, and putting the
+    identify caption up without restarting playback.
+
+    Returns {} when mpv is not reachable, so callers can treat "no player" and
+    "player refused" the same way — neither is worth taking playback down for.
+    """
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect(socket_path)
+    except (OSError, socket.timeout):
+        return {}
+    try:
+        payload = json.dumps({"command": list(args), "request_id": 1}) + "\n"
+        sock.sendall(payload.encode())
+        buffer = b""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(65536)
+            except (OSError, socket.timeout):
+                break
+            if not chunk:
+                break
+            buffer += chunk
+            while b"\n" in buffer:
+                line, _, buffer = buffer.partition(b"\n")
+                if not line.strip():
+                    continue
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                # Events carry no request_id; keep reading past them.
+                if message.get("request_id") == 1:
+                    return message
+        return {}
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def position(socket_path: str) -> Optional[float]:
+    """Current playhead, asked for fresh.
+
+    Drift correction must not use the once-a-second stats cache: a position
+    that is up to a second old is indistinguishable from a second of drift,
+    which would make the corrector fight itself.
+    """
+    reply = command(socket_path, "get_property", "time-pos")
+    value = reply.get("data")
+    return value if isinstance(value, (int, float)) else None
 
 
 def to_stats(raw: Dict[str, Any]) -> Dict[str, Any]:

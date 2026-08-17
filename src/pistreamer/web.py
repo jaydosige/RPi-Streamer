@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -13,15 +14,74 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from fastapi import Body, FastAPI, HTTPException, UploadFile
+from fastapi import Body, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import (config, diagnose, display, media, ndiconfig, playlists,
-               schedule as schedule_mod, sources, system)
-from .player import MODE_IDLE, MODE_LOCAL, MODE_NDI, player
+from . import (cluster, config, diagnose, display, media, ndiconfig, playlists,
+               schedule as schedule_mod, sources, syncplay, system)
+from .player import MODE_IDLE, MODE_LOCAL, MODE_NDI, identify_text, player
 from .telemetry import telemetry
+
+# The conductor is given callables rather than importing the player and the
+# cluster itself: that keeps the synchronisation logic testable with fake nodes
+# and no display, which is the only way this feature could be developed at all
+# without a rack of Pis on the desk.
+conductor = syncplay.Conductor({
+    "prepare": lambda peer, item: _conductor_prepare(peer, item),
+    "start": lambda peer, at: _conductor_start(peer, at),
+    "pulse": lambda peer, body: _conductor_pulse(peer, body),
+    "offsets": lambda ids: _conductor_offsets(ids),
+    "position": lambda: player.sync_position(),
+})
+
+
+def _is_self(peer: cluster.Peer) -> bool:
+    return peer.id == cluster.node_id()
+
+
+def _conductor_prepare(peer: cluster.Peer, item: str) -> bool:
+    if _is_self(peer):
+        return bool(player.prepare(item).get("ready"))
+    reply = cluster.call(peer, "/api/cluster/prepare", method="POST",
+                         body={"file": item}, key=config.load().cluster_key,
+                         timeout=20)
+    return bool(reply.get("ready"))
+
+
+def _conductor_start(peer: cluster.Peer, at: float) -> None:
+    if _is_self(peer):
+        player.start_at(at)
+        return
+    cluster.call(peer, "/api/cluster/start", method="POST", body={"at": at},
+                 key=config.load().cluster_key, timeout=10)
+
+
+def _conductor_pulse(peer: cluster.Peer, body: dict) -> None:
+    if _is_self(peer):
+        return  # the conductor IS the reference; correcting it against itself
+                # would be a feedback loop with nothing outside it
+    cluster.call(peer, "/api/cluster/pulse", method="POST", body=body,
+                 key=config.load().cluster_key, timeout=5)
+
+
+def _conductor_offsets(ids):
+    """Measure each follower's clock offset, ourselves being zero by definition."""
+    cfg = config.load()
+    out = {}
+    for node in ids:
+        if node == cluster.node_id():
+            out[node] = 0.0
+            continue
+        peer = cluster.registry.get(node)
+        if peer is None:
+            out[node] = None
+            continue
+        offset, rtt = cluster.measure_offset(peer, key=cfg.cluster_key)
+        peer.clock_offset, peer.rtt_ms = offset, rtt
+        out[node] = offset
+    return out
 
 log = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
@@ -71,6 +131,14 @@ async def lifespan(app: FastAPI):
     # before anything else so it has been up for a while by the first poll.
     sources.start()
     player.start()
+    if cfg.cluster_enabled:
+        # status_fn is injected so cluster.py never imports the player: the
+        # beacon has to work on a node whose display is broken.
+        cluster.beacon(lambda: {**player.status(), "version": app.version}).start()
+    # Identify survives a reboot deliberately: if you flagged a node because you
+    # were looking for it, finding it should not depend on the node's uptime.
+    if cfg.identify:
+        player.set_identify(True, identify_text(cfg, cluster.primary_ip()))
     telemetry.bind_player(player.stream_stats)
     telemetry.start()
     schedule_mod.scheduler.bind(apply_cue_action)
@@ -81,6 +149,8 @@ async def lifespan(app: FastAPI):
         log.info("autostarting mode=%s target=%s", cfg.mode, target)
         player.apply(cfg.mode, target)
     yield
+    conductor.stop()
+    cluster.beacon().stop()
     player.shutdown()
     sources.stop()
     telemetry.stop()
@@ -431,8 +501,16 @@ async def restart_player() -> Dict[str, Any]:
 
 
 @app.get("/api/media")
-async def get_media(probe: bool = False) -> Dict[str, Any]:
-    return {"files": [m.to_dict() for m in media.list_media(probe=probe)]}
+async def get_media(probe: bool = False, hashes: bool = False) -> Dict[str, Any]:
+    files = [m.to_dict() for m in media.list_media(probe=probe)]
+    if hashes:
+        # Only on request: hashing a folder of 4 GB videos takes real time, and
+        # the GUI polls this endpoint. The cluster push is the one caller that
+        # needs it, to work out which files a node is actually missing.
+        for entry in files:
+            path = media.resolve(entry["name"])
+            entry["sha256"] = cluster.sha256_file(path) if path else None
+    return {"files": files}
 
 
 @app.post("/api/media")
@@ -458,6 +536,38 @@ async def upload_media(file: UploadFile) -> Dict[str, Any]:
     finally:
         await file.close()
     return {"name": name, "size": dest.stat().st_size}
+
+
+@app.put("/api/media/raw/{name}")
+async def upload_media_raw(name: str, request: Request) -> Dict[str, Any]:
+    """Take a media file as a raw request body.
+
+    This exists for node-to-node pushes. A multipart POST has to be assembled
+    around the file, which for a multi-gigabyte video means either buffering it
+    or hand-rolling a streaming encoder in the sender; a raw body lets the
+    sender hand a file object straight to http.client. Browsers keep using the
+    multipart endpoint above.
+    """
+    require_cluster_key(request)
+    if not media.is_allowed(name):
+        raise HTTPException(400, f"unsupported file type: {Path(name).suffix or '(none)'}")
+    safe = media.sanitise_name(name)
+    config.MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    dest = config.MEDIA_DIR / safe
+    tmp = config.MEDIA_DIR / f".{safe}.part"
+    written = 0
+    try:
+        with tmp.open("wb") as fh:
+            async for chunk in request.stream():
+                fh.write(chunk)
+                written += len(chunk)
+        # Rename only once the whole body has arrived, so an interrupted push
+        # cannot leave a truncated file that plays for three seconds and stops.
+        tmp.replace(dest)
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(500, f"write failed: {exc}") from exc
+    return {"name": safe, "size": written}
 
 
 @app.delete("/api/media/{name}")
@@ -744,6 +854,290 @@ async def post_reboot() -> JSONResponse:
 async def post_poweroff() -> JSONResponse:
     system.poweroff()
     return JSONResponse({"status": "shutting down"})
+
+
+# ----------------------------------------------------------------------
+# Cluster
+# ----------------------------------------------------------------------
+#
+# Only these endpoints are authenticated. The rest of the API is deliberately
+# open, because the GUI is a browser on the same LAN with no login — but a
+# neighbouring node being able to reboot this one, or overwrite its media, is a
+# different proposition, so anything that arrives from another node has to carry
+# the group key.
+
+
+def require_cluster_key(request: Request) -> None:
+    cfg = config.load()
+    if not cfg.cluster_enabled:
+        raise HTTPException(403, "clustering is disabled on this node")
+    supplied = request.headers.get(cluster.AUTH_HEADER, "")
+    # compare_digest, not ==: string comparison short-circuits on the first
+    # wrong character, which leaks the key one character at a time to anything
+    # that can measure the response.
+    if not hmac.compare_digest(supplied, cfg.cluster_key):
+        raise HTTPException(401, "wrong or missing cluster key")
+
+
+def _own_peer() -> cluster.Peer:
+    """This node, as a Peer, so the conductor drives it through the same path.
+
+    Two code paths — one for "me" and one for "them" — is how a leader ends up
+    behaving subtly differently from its followers. There is one path.
+    """
+    cfg = config.load()
+    return cluster.Peer(
+        id=cluster.node_id(), name=cfg.device_name or system.hostname(),
+        ip="127.0.0.1", port=cfg.web_port,
+    )
+
+
+def _peers_by_id(ids: List[str]) -> List[cluster.Peer]:
+    """Resolve ids to peers, including ourselves, preserving the caller's order."""
+    own = _own_peer()
+    known = {p.id: p for p in cluster.registry.all()}
+    known[own.id] = own
+    return [known[i] for i in ids if i in known]
+
+
+@app.get("/api/cluster/time")
+async def get_cluster_time(request: Request) -> Dict[str, Any]:
+    """This node's wall clock, for offset measurement.
+
+    Answered as early and cheaply as possible: everything this handler does
+    before reading the clock is added to the measured offset.
+    """
+    require_cluster_key(request)
+    return {"t": time.time(), "id": cluster.node_id()}
+
+
+@app.get("/api/cluster")
+async def get_cluster() -> Dict[str, Any]:
+    cfg = config.load()
+    own = _own_peer()
+    return {
+        "enabled": cfg.cluster_enabled,
+        "group": cfg.cluster_group,
+        "self": {"id": own.id, "name": own.name, "ip": cluster.primary_ip(),
+                 "port": cfg.web_port, "identify": cfg.identify},
+        "beacon": cluster.beacon().stats(),
+        "peers": [p.to_dict() for p in cluster.registry.all()],
+        "sync": conductor.state(),
+    }
+
+
+class IdentifyBody(BaseModel):
+    on: bool = True
+    # Empty means "work it out yourself", which is what a node does for itself.
+    # The leader does not dictate the caption: a node knows its own name and
+    # address better than anyone else does.
+    nodes: List[str] = Field(default_factory=list)
+    propagate: bool = True
+
+
+@app.post("/api/cluster/identify")
+async def post_identify(body: IdentifyBody, request: Request) -> Dict[str, Any]:
+    # An inbound identify from another node carries the key; one from our own
+    # GUI does not, and does not need to — so the key is checked only when it
+    # was offered, rather than locking the browser out of its own node.
+    if request.headers.get(cluster.AUTH_HEADER) is not None:
+        require_cluster_key(request)
+    config.update(identify=body.on)
+    cfg = config.load()
+    applied = player.set_identify(
+        body.on, identify_text(cfg, cluster.primary_ip())
+    )
+    out: Dict[str, Any] = {"identify": body.on, "applied": applied, "peers": []}
+    if body.propagate:
+        targets = (_peers_by_id(body.nodes) if body.nodes
+                   else cluster.registry.all())
+        for peer in targets:
+            if peer.id == cluster.node_id():
+                continue
+            try:
+                cluster.call(peer, "/api/cluster/identify", method="POST",
+                             body={"on": body.on, "propagate": False},
+                             key=cfg.cluster_key)
+                out["peers"].append({"name": peer.name, "ok": True})
+            except cluster.PeerError as exc:
+                out["peers"].append({"name": peer.name, "ok": False, "error": str(exc)})
+    return out
+
+
+class CommandBody(BaseModel):
+    # Same vocabulary the schedule cues use, so "do this everywhere" and "do
+    # this here" cannot drift apart.
+    action: Literal["ndi", "playlist", "file", "standby", "stop", "reboot"]
+    target: str = ""
+    nodes: List[str] = Field(default_factory=list)
+
+
+@app.post("/api/cluster/command")
+async def post_cluster_command(body: CommandBody, request: Request) -> Dict[str, Any]:
+    """Tell every node in the group (or a subset) to do one thing."""
+    cfg = config.load()
+    targets = _peers_by_id(body.nodes) if body.nodes else (
+        [_own_peer()] + cluster.registry.all())
+    results = []
+    for peer in targets:
+        name = peer.name or peer.ip
+        try:
+            if peer.id == cluster.node_id():
+                if body.action == "reboot":
+                    system.reboot()
+                else:
+                    apply_cue_action(body.action, body.target)
+            else:
+                path = ("/api/system/reboot" if body.action == "reboot"
+                        else "/api/cluster/local")
+                payload = (None if body.action == "reboot"
+                           else {"action": body.action, "target": body.target})
+                cluster.call(peer, path, method="POST", body=payload,
+                             key=cfg.cluster_key)
+            results.append({"name": name, "ok": True})
+        except Exception as exc:  # noqa: BLE001 - one node must not stop the rest
+            results.append({"name": name, "ok": False, "error": str(exc)})
+    return {"action": body.action, "results": results}
+
+
+class LocalActionBody(BaseModel):
+    action: str
+    target: str = ""
+
+
+@app.post("/api/cluster/local")
+async def post_cluster_local(body: LocalActionBody, request: Request) -> Dict[str, Any]:
+    """Apply one action to this node only. The receiving end of /command."""
+    require_cluster_key(request)
+    try:
+        apply_cue_action(body.action, body.target)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"applied": body.action, "target": body.target}
+
+
+class PrepareBody(BaseModel):
+    file: str
+
+
+@app.post("/api/cluster/prepare")
+async def post_prepare(body: PrepareBody, request: Request) -> Dict[str, Any]:
+    require_cluster_key(request)
+    try:
+        return player.prepare(body.file)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class StartAtBody(BaseModel):
+    # An instant on THIS node's clock. The leader has already converted it.
+    at: float
+
+
+@app.post("/api/cluster/start")
+async def post_start_at(body: StartAtBody, request: Request) -> Dict[str, Any]:
+    require_cluster_key(request)
+    try:
+        return player.start_at(body.at)
+    except RuntimeError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class PulseBody(BaseModel):
+    item: str = ""
+    pos: float
+    at: float
+
+
+@app.post("/api/cluster/pulse")
+async def post_pulse(body: PulseBody, request: Request) -> Dict[str, Any]:
+    require_cluster_key(request)
+    if not config.load().cluster_drift_correct:
+        return {"action": "hold", "reason": "drift correction disabled"}
+    return player.apply_pulse(body.model_dump())
+
+
+class SyncPushBody(BaseModel):
+    playlist: str
+    nodes: List[str] = Field(default_factory=list)
+
+
+@app.post("/api/cluster/push")
+async def post_cluster_push(body: SyncPushBody) -> Dict[str, Any]:
+    """Copy a playlist and every file it needs to the other nodes.
+
+    Only what is missing is sent, decided by hash rather than by name and size:
+    two different cuts of a video exported the same afternoon are the same size
+    surprisingly often, and sending nothing because of that would put the wrong
+    content on a screen.
+    """
+    cfg = config.load()
+    playlist = playlists.get(body.playlist)
+    if playlist is None:
+        raise HTTPException(404, f"playlist not found: {body.playlist}")
+    wanted: Dict[str, str] = {}
+    for segment in playlists.resolved_segments(body.playlist):
+        if segment["type"] != "file":
+            continue
+        path = Path(segment["path"])
+        wanted[segment["target"]] = cluster.sha256_file(path)
+
+    targets = _peers_by_id(body.nodes) if body.nodes else cluster.registry.all()
+    results = []
+    for peer in targets:
+        if peer.id == cluster.node_id():
+            continue
+        entry: Dict[str, Any] = {"name": peer.name or peer.ip, "sent": [],
+                                 "skipped": [], "ok": True}
+        try:
+            remote = cluster.call(peer, "/api/media?hashes=1", key=cfg.cluster_key,
+                                  timeout=600)
+            have = {f["name"]: f.get("sha256") for f in remote.get("files", [])}
+            for name, digest in wanted.items():
+                if have.get(name) == digest:
+                    entry["skipped"].append(name)
+                    continue
+                path = media.resolve(name)
+                if path is None:
+                    continue
+                cluster.upload(peer, name, path, key=cfg.cluster_key)
+                entry["sent"].append(name)
+            cluster.call(peer, "/api/playlists", method="POST",
+                         body={"name": playlist.name, "items": playlist.items,
+                               "loop": playlist.loop, "shuffle": playlist.shuffle,
+                               "image_duration": playlist.image_duration},
+                         key=cfg.cluster_key)
+        except Exception as exc:  # noqa: BLE001
+            entry["ok"] = False
+            entry["error"] = str(exc)
+        results.append(entry)
+    return {"playlist": body.playlist, "files": list(wanted), "results": results}
+
+
+class SyncPlayBody(BaseModel):
+    playlist: str
+    nodes: List[str] = Field(default_factory=list)
+    loop: bool = True
+
+
+@app.post("/api/cluster/sync/play")
+async def post_sync_play(body: SyncPlayBody) -> Dict[str, Any]:
+    files = [s["target"] for s in playlists.resolved_segments(body.playlist)
+             if s["type"] == "file"]
+    if not files:
+        raise HTTPException(400, "synchronised playback needs a playlist of files")
+    targets = ([_own_peer()] + cluster.registry.all() if not body.nodes
+               else _peers_by_id(body.nodes))
+    try:
+        return conductor.start(files, targets, loop=body.loop)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/cluster/sync/stop")
+async def post_sync_stop() -> Dict[str, Any]:
+    conductor.stop()
+    return conductor.state()
 
 
 # Serve the rest of the GUI assets. Mounted last so /api routes win.

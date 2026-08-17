@@ -130,7 +130,11 @@ fi
 install -m 0644 "${REPO_DIR}/systemd/pistreamer.service" /etc/systemd/system/pistreamer.service
 install -m 0644 "${REPO_DIR}/systemd/pistreamer-tuning.service" \
   /etc/systemd/system/pistreamer-tuning.service
+# Clears the console so the DRM gap between players shows black, not old text.
+install -m 0644 "${REPO_DIR}/systemd/pistreamer-console.service" \
+  /etc/systemd/system/pistreamer-console.service
 systemctl daemon-reload
+systemctl enable pistreamer-console >/dev/null
 systemctl enable pistreamer-tuning >/dev/null
 systemctl restart pistreamer-tuning || warn "host tuning reported a problem (not fatal)"
 systemctl enable pistreamer >/dev/null

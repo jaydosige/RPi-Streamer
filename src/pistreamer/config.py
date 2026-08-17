@@ -146,6 +146,28 @@ class Config:
     device_name: str = "pistreamer"
     web_port: int = 80
 
+    # --- cluster ---
+    # Announce this node on the LAN and accept commands from its group. Off
+    # makes the node completely invisible and uncontrollable from other nodes.
+    cluster_enabled: bool = True
+    # Nodes only ever see and command others in the same group. Two shows on
+    # one network stay apart by using different group names.
+    cluster_group: str = "default"
+    # Shared secret. Every beacon is signed with it and every inbound command
+    # must carry it, so a laptop on the guest VLAN cannot reboot the rig. The
+    # default is deliberately not a secret — change it per install.
+    cluster_key: str = "pistreamer"
+    # Beacons are UDP broadcast, which some managed switches drop. Add peer
+    # addresses here (comma separated) to unicast to them as well; the same
+    # escape hatch NDI needs on the same networks.
+    cluster_extra_ips: str = ""
+    # Correct playback drift against the leader while a synchronised playlist
+    # runs. Off still gives a synchronised *start*, just no correction after it.
+    cluster_drift_correct: bool = True
+    # Show the node name and IP over the picture. Toggled from the GUI across
+    # the whole group; persisted so a reboot mid-show comes back identified.
+    identify: bool = False
+
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 

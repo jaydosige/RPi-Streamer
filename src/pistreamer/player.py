@@ -27,9 +27,9 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Deque, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
-from . import config, display, media, mpvipc, playlists, sources
+from . import config, display, media, mpvipc, playlists, sources, syncplay
 
 log = logging.getLogger(__name__)
 
@@ -218,6 +218,45 @@ def snapshot_path() -> Path:
     return config.STATE_DIR / "lastframe.jpg"
 
 
+def overlay_path() -> Path:
+    """The identify caption, read by the GStreamer runner twice a second.
+
+    A file rather than a control channel: the runner is a separate process that
+    owns the display, and an overlay must never require restarting it. Empty or
+    absent means no caption.
+    """
+    return config.STATE_DIR / "overlay.txt"
+
+
+def write_overlay(text: str) -> None:
+    """Publish (or clear) the identify caption.
+
+    Written atomically because the runner polls it: a torn read would show half
+    a caption, and on a wall of screens that looks like a fault.
+    """
+    path = overlay_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not text:
+            path.write_text("")
+            return
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(text)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning("could not write the identify caption: %s", exc)
+
+
+def identify_text(cfg: config.Config, ip: str) -> str:
+    """What an identified node shows: who it is and how to reach it.
+
+    Name first and largest by position, address underneath — the name is what
+    somebody is looking for when they are stood in front of six screens, and the
+    address is what they need once they have found it.
+    """
+    return f"{cfg.device_name or 'pistreamer'}\n{ip}"
+
+
 def _usable_jpeg(path: Path) -> bool:
     """Is this a complete JPEG?
 
@@ -276,6 +315,12 @@ class Player:
         self._segment_idx = 0
         self._segment_deadline: Optional[float] = None
         self._segment_loop = True
+        # Set while a synchronised session owns playback, so the supervisor
+        # does not treat a prepared-and-paused player as a crash to restart.
+        self._sync_active = False
+        # While a speed nudge is settling, leave it alone rather than stacking
+        # corrections on top of each other.
+        self._nudging_until = 0.0
         # How many unsupervised player processes we have had to clean up. If
         # this is not zero, something is escaping teardown and the user is
         # hearing two soundtracks — worth surfacing rather than hiding.
@@ -505,6 +550,7 @@ class Player:
             "url_address": cfg.ndi_url_address,
             "snapshot_path": str(snapshot_path()) if cfg.snapshot_enabled else None,
             "snapshot_interval_s": cfg.snapshot_interval_s,
+            "overlay_file": str(overlay_path()),
         }
         return [sys.executable, "-m", "pistreamer.runner", json.dumps(spec)]
 
@@ -550,6 +596,10 @@ class Player:
             "sink_sync": True,
             "sink_qos": False,
             "stats_interval": 5.0,
+            # Standby carries the caption too: "identify" has to work on a node
+            # that is not playing anything, which is exactly when you are
+            # hunting for which box is which.
+            "overlay_file": str(overlay_path()),
         }
         return [sys.executable, "-m", "pistreamer.runner", json.dumps(spec)]
 
@@ -837,6 +887,10 @@ class Player:
             self._status.fallback = False
             self._segments = []
             self._segment_deadline = None
+            # Any explicit mode change ends a synchronised session: the operator
+            # has taken local control of this node.
+            self._sync_active = False
+            self._nudging_until = 0.0
             try:
                 if mode == MODE_LOCAL and cfg_playlist_needs_sequencer():
                     cfg = config.load()
@@ -876,6 +930,151 @@ class Player:
 
     def logs(self) -> List[str]:
         return list(self._logs)
+
+    # ------------------------------------------------------------------
+    # Identify
+    # ------------------------------------------------------------------
+
+    def set_identify(self, on: bool, text: str = "") -> Dict[str, Any]:
+        """Show or hide the node's name and address over whatever is playing.
+
+        Both backends have to be told, in their own idiom, and neither may be
+        restarted to do it — identify is used to find a node *during* a show.
+        The GStreamer runner polls a file; mpv is told over its IPC socket.
+        """
+        caption = text if on else ""
+        write_overlay(caption)
+        applied = {"overlay_file": True, "mpv": False}
+        if mpvipc.command(str(mpv_socket()), "set_property", "osd-msg1", caption):
+            applied["mpv"] = True
+            # The default OSD font is sized for a desktop window; on a screen
+            # being read from across a room the caption needs to be larger, and
+            # top-left keeps it clear of lower-third graphics in the content.
+            mpvipc.command(str(mpv_socket()), "set_property", "osd-font-size", 40)
+            mpvipc.command(str(mpv_socket()), "set_property", "osd-align-x", "left")
+            mpvipc.command(str(mpv_socket()), "set_property", "osd-align-y", "top")
+        return applied
+
+    # ------------------------------------------------------------------
+    # Synchronised playback
+    # ------------------------------------------------------------------
+
+    def prepare(self, filename: str) -> Dict[str, Any]:
+        """Load a file and hold on its first frame, paused, ready to be released.
+
+        This is half of an aligned start. Spawning a player costs tens to
+        hundreds of milliseconds and differs per node and per file; un-pausing
+        one that has already decoded its first frame costs about a frame. So the
+        expensive, variable part happens before the beat and only the cheap part
+        happens on it.
+        """
+        path = media.resolve(filename)
+        if path is None:
+            raise RuntimeError(f"not in the media library: {filename}")
+        cfg = config.load()
+        with self._lock:
+            self._wanted_mode = MODE_LOCAL
+            self._wanted_target = filename
+            self._segments = []
+            self._segment_deadline = None
+            self._fallback = False
+            self._sync_active = True
+            self._terminate()
+            cmd = self._mpv_base(cfg, 10) + [
+                # Hold the first frame rather than the last: mpv paused at
+                # position 0 with the frame decoded is exactly the state we
+                # want to release on the beat.
+                "--pause=yes",
+                "--", str(path),
+            ]
+            self._status.mode = MODE_LOCAL
+            self._status.target = filename
+            self._spawn_command(cmd, f"prepare {filename}")
+        ready = self._await_ready()
+        return {"ready": ready, "file": filename}
+
+    def _await_ready(self, timeout: float = 8.0) -> bool:
+        """Wait until mpv has the file open and is genuinely holding a frame.
+
+        Asking for a real property rather than sleeping: a fixed sleep is either
+        too short on a cold SD card or wasted time on a warm one, and the whole
+        point of preparing is to take the variance out of the start.
+        """
+        deadline = time.monotonic() + timeout
+        sock = str(mpv_socket())
+        while time.monotonic() < deadline:
+            reply = mpvipc.command(sock, "get_property", "seekable")
+            if reply.get("error") == "success":
+                return True
+            proc = self._proc
+            if proc is not None and proc.poll() is not None:
+                return False
+            time.sleep(0.05)
+        return False
+
+    def start_at(self, at: float) -> Dict[str, Any]:
+        """Release a prepared file at an instant on *this node's* clock.
+
+        The leader converts the agreed instant into each follower's clock before
+        sending it, so there is no clock arithmetic here — which is deliberate:
+        every node doing its own conversion is how two nodes end up disagreeing
+        about which of them is wrong.
+        """
+        delay = at - time.time()
+        if delay > 30:
+            raise RuntimeError(f"start time is {delay:.0f}s away; refusing")
+        thread = threading.Thread(
+            target=self._release_at, args=(at,), name="sync-start", daemon=True
+        )
+        thread.start()
+        return {"scheduled": True, "in_ms": round(max(0.0, delay) * 1000, 1)}
+
+    def _release_at(self, at: float) -> None:
+        # Sleep most of the way, then spin for the last few milliseconds.
+        # time.sleep() alone is only accurate to the scheduler's granularity,
+        # and on a start that is meant to be frame-accurate that granularity is
+        # the whole error budget.
+        remaining = at - time.time()
+        if remaining > 0.05:
+            time.sleep(remaining - 0.05)
+        while time.time() < at:
+            time.sleep(0.0005)
+        sock = str(mpv_socket())
+        mpvipc.command(sock, "set_property", "pause", False)
+        self._logs.append(
+            f"{time.strftime('%H:%M:%S')} · released on the beat "
+            f"({(time.time() - at) * 1000:+.1f}ms)"
+        )
+
+    def sync_position(self) -> Optional[float]:
+        """This node's playhead, asked for fresh rather than from the cache."""
+        return mpvipc.position(str(mpv_socket()))
+
+    def apply_pulse(self, pulse: Dict[str, Any]) -> Dict[str, Any]:
+        """Act on the leader's position report: hold, nudge or seek."""
+        own = self.sync_position()
+        with self._lock:
+            nudging_until = self._nudging_until
+        decision = syncplay.decide(pulse, own, time.time(), nudging_until)
+        sock = str(mpv_socket())
+        if decision.action == "seek" and decision.seek_to is not None:
+            # exact, not keyframe: a keyframe seek can land a second away, which
+            # would be a correction that causes the very problem it is fixing.
+            mpvipc.command(sock, "seek", decision.seek_to, "absolute+exact")
+            mpvipc.command(sock, "set_property", "speed", 1.0)
+            with self._lock:
+                self._nudging_until = 0.0
+        elif decision.action == "nudge":
+            mpvipc.command(sock, "set_property", "speed", decision.speed)
+            with self._lock:
+                self._nudging_until = time.time() + syncplay.NUDGE_HOLD_S
+        elif decision.reason == "in sync":
+            mpvipc.command(sock, "set_property", "speed", 1.0)
+            with self._lock:
+                self._nudging_until = 0.0
+        out = decision.to_dict()
+        out["position"] = own
+        return out
 
     # ------------------------------------------------------------------
     # Supervisor
@@ -1001,6 +1200,13 @@ class Player:
                 except Exception as exc:  # noqa: BLE001
                     self._status.last_error = str(exc)
                     log.error("could not advance the playlist: %s", exc)
+                return
+
+            # A synchronised item that has played out is not a crash. The
+            # leader decides what comes next, so restarting here would race it
+            # and play the previous item again underneath the new one.
+            if self._sync_active:
+                self._status.last_error = ""
                 return
 
             self._status.restarts += 1
