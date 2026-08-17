@@ -117,8 +117,16 @@ class Config:
     # What to show when nothing is playing. An appliance should never show a
     # console. "black" | "image" | "lastframe"
     idle_mode: str = "black"
+    # When an NDI sender vanishes, put the standby screen up while retrying
+    # instead of leaving the display to whatever the console shows. This is
+    # what makes "hold the last frame" work for the case that matters.
+    fallback_to_standby: bool = True
     # Filename in the media directory used for "image" (a still or a video).
     standby_file: str = ""
+    # Playlist to play in local mode. Takes precedence over local_file.
+    local_playlist: str = ""
+    # Run the schedule. Cues still exist when off, they just do not fire.
+    schedule_enabled: bool = True
     # Continuously save the most recent NDI frame so "lastframe" has something
     # to hold when the feed stops. Cheap: one JPEG every few seconds.
     snapshot_enabled: bool = True

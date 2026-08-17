@@ -222,6 +222,7 @@
   <button data-tab="ndi">NDI sources</button>
   <button data-tab="media">Local media</button>
   <button data-tab="display">Display &amp; audio</button>
+  <button data-tab="schedule">Schedule</button>
   <button data-tab="perf">Performance</button>
   <button data-tab="diag">Diagnostics</button>
   <button data-tab="system">System</button>
@@ -341,6 +342,44 @@
       </div>
       <ul class="list" id="mediaList"></ul>
     </div>
+    <div class="card">
+      <h2>Playlists</h2>
+      <div class="host" style="margin-bottom:12px">
+        A playlist carries its own loop, shuffle and still-image dwell settings.
+        Videos always play to their natural end.
+      </div>
+      <ul class="list" id="playlistList"></ul>
+      <div class="row" style="margin-top:8px">
+        <button class="btn" id="btnNewPlaylist">New playlist</button>
+      </div>
+    </div>
+
+    <div class="card" id="playlistEditor" style="display:none">
+      <h2>Edit playlist</h2>
+      <label class="field">
+        <span class="lbl">Name &mdash; letters, numbers, spaces, _ and -</span>
+        <input type="text" id="plName" placeholder="Doors Open">
+      </label>
+      <label class="field">
+        <span class="lbl">Items &mdash; tick to include, drag not supported; order follows the list</span>
+        <div id="plItems" style="max-height:260px;overflow:auto"></div>
+      </label>
+      <div class="checkline">
+        <input type="checkbox" id="plLoop"><label for="plLoop">Loop forever</label>
+      </div>
+      <div class="checkline">
+        <input type="checkbox" id="plShuffle"><label for="plShuffle">Shuffle each time it starts</label>
+      </div>
+      <label class="field">
+        <span class="lbl">Hold each still image for (seconds)</span>
+        <input type="number" id="plDuration" min="1" max="3600" value="10">
+      </label>
+      <div class="row">
+        <button class="btn primary" id="btnSavePlaylist">Save playlist</button>
+        <button class="btn" id="btnCancelPlaylist">Cancel</button>
+      </div>
+    </div>
+
   </section>
 
   <!-- DISPLAY -->
@@ -409,6 +448,62 @@
       </div>
     </div>
     <button class="btn primary" id="btnSaveDisplay">Save &amp; apply</button>
+  </section>
+
+  <!-- SCHEDULE -->
+  <section id="tab-schedule">
+    <div class="card">
+      <h2>Running order</h2>
+      <div class="host" style="margin-bottom:12px">
+        Each cue fires once at its time and the node stays where it was put, so
+        you can always override by hand without fighting the schedule. Times are
+        this node's local time.
+      </div>
+      <div class="checkline">
+        <input type="checkbox" id="cfgScheduleEnabled">
+        <label for="cfgScheduleEnabled">Schedule running</label>
+      </div>
+      <div class="host" id="nextCue" style="margin-bottom:12px"></div>
+      <ul class="list" id="cueList"></ul>
+      <div class="row" style="margin-top:8px">
+        <button class="btn" id="btnNewCue">Add cue</button>
+      </div>
+    </div>
+
+    <div class="card" id="cueEditor" style="display:none">
+      <h2>Edit cue</h2>
+      <label class="field">
+        <span class="lbl">Label &mdash; what this cue is for</span>
+        <input type="text" id="cueLabel" placeholder="Doors open">
+      </label>
+      <label class="field">
+        <span class="lbl">Time (24-hour, HH:MM)</span>
+        <input type="text" id="cueTime" placeholder="09:00">
+      </label>
+      <label class="field">
+        <span class="lbl">Days</span>
+        <div class="row" id="cueDays"></div>
+      </label>
+      <label class="field">
+        <span class="lbl">Switch to</span>
+        <select id="cueAction">
+          <option value="ndi">An NDI source</option>
+          <option value="playlist">A playlist</option>
+          <option value="file">A single media file</option>
+          <option value="folder">The whole media folder</option>
+          <option value="standby">Standby screen</option>
+        </select>
+      </label>
+      <label class="field" id="cueTargetField">
+        <span class="lbl">Target</span>
+        <input type="text" id="cueTarget" list="cueTargets" placeholder="">
+        <datalist id="cueTargets"></datalist>
+      </label>
+      <div class="row">
+        <button class="btn primary" id="btnSaveCue">Save cue</button>
+        <button class="btn" id="btnCancelCue">Cancel</button>
+      </div>
+    </div>
   </section>
 
   <!-- PERFORMANCE -->
@@ -655,6 +750,19 @@
       <ul class="list" id="netList"></ul>
     </div>
     <div class="card">
+      <h2>Overclocking</h2>
+      <div class="banner warn">
+        Overclocking needs a genuine 3A supply and at least a heatsink. Check the
+        Diagnostics tab first: if under-voltage or throttling is already flagged,
+        fix that before adding clock. Presets come from the official Raspberry Pi
+        guidance; each takes effect on the next reboot.
+      </div>
+      <div class="grid" id="ocStatus" style="margin-bottom:12px"></div>
+      <div class="row" id="ocButtons"></div>
+      <div class="host" id="ocNote" style="margin-top:10px"></div>
+    </div>
+
+    <div class="card">
       <h2>Power</h2>
       <div class="row">
         <button class="btn danger" id="btnReboot">Reboot</button>
@@ -732,11 +840,13 @@ document.querySelectorAll("nav button").forEach((btn) => {
     document.querySelectorAll("main section").forEach((s) => s.classList.remove("active"));
     btn.classList.add("active");
     $("tab-" + btn.dataset.tab).classList.add("active");
-    if (btn.dataset.tab === "media") loadMedia();
+    if (btn.dataset.tab === "media") { loadMedia(); loadPlaylists(); }
     if (btn.dataset.tab === "display") loadConnectors();
     if (btn.dataset.tab === "diag") loadTelemetry();
     if (btn.dataset.tab === "perf") loadPerf();
     if (btn.dataset.tab === "ndi") loadNdiNetwork();
+    if (btn.dataset.tab === "schedule") loadSchedule();
+    if (btn.dataset.tab === "system") loadOverclock();
   };
 });
 
@@ -804,13 +914,15 @@ function renderStatus() {
   if (p.mode === "idle") {
     dot.className = "dot"; txt.textContent = "idle";
   } else if (p.running) {
-    dot.className = "dot on"; txt.textContent = p.mode === "ndi" ? "receiving NDI" : "playing local";
+    if (p.fallback) { dot.className = "dot err"; txt.textContent = "source lost — standby"; }
+    else { dot.className = "dot on"; txt.textContent = p.mode === "ndi" ? "receiving NDI" : "playing local"; }
   } else {
     dot.className = "dot err"; txt.textContent = "stopped";
   }
 
   let label = "Nothing — output is idle";
-  if (p.mode === "ndi") label = p.target || "(no source selected)";
+  if (p.fallback) label = `Standby — waiting for ${p.target || "the source"}`;
+  else if (p.mode === "ndi") label = p.target || "(no source selected)";
   else if (p.mode === "local") label = p.target || "Whole media folder";
   $("nowTarget").textContent = label;
 
@@ -926,6 +1038,237 @@ function applyConfigToForm(c) {
   if (document.activeElement !== $("cfgHostname")) {
     $("cfgHostname").value = STATE.system.hostname || c.device_name;
   }
+}
+
+// ---------- playlists ----------
+
+let EDITING_PLAYLIST = null;
+
+async function loadPlaylists() {
+  let data, files;
+  try {
+    data = await api("/api/playlists");
+    files = (await api("/api/media")).files;
+  } catch (_) { return; }
+  const cur = STATE && STATE.config.local_playlist;
+  const playing = STATE && STATE.player.mode === "local";
+  $("playlistList").innerHTML = data.playlists.length
+    ? data.playlists.map((p) => `<li class="${p.name === cur && playing ? "playing" : ""}">
+        <div class="meta">
+          <div class="name">${p.name}</div>
+          <div class="sub">${p.items.length} item${p.items.length === 1 ? "" : "s"}${
+            p.loop ? " · loop" : ""}${p.shuffle ? " · shuffle" : ""} · stills ${p.image_duration}s</div>
+        </div>
+        <button class="btn primary" data-plplay="${encodeURIComponent(p.name)}">Play</button>
+        <button class="btn" data-pledit="${encodeURIComponent(p.name)}">Edit</button>
+        <button class="btn danger" data-pldel="${encodeURIComponent(p.name)}">Delete</button>
+      </li>`).join("")
+    : `<div class="empty">No playlists yet.</div>`;
+
+  $("playlistList").querySelectorAll("[data-plplay]").forEach((b) => {
+    b.onclick = async () => {
+      try {
+        await post("/api/play/playlist", { name: decodeURIComponent(b.dataset.plplay) });
+        toast("Playing playlist"); poll(); loadPlaylists();
+      } catch (err) { toast(err.message, true); }
+    };
+  });
+  $("playlistList").querySelectorAll("[data-pledit]").forEach((b) => {
+    b.onclick = () => editPlaylist(data.playlists.find(
+      (p) => p.name === decodeURIComponent(b.dataset.pledit)), files);
+  });
+  $("playlistList").querySelectorAll("[data-pldel]").forEach((b) => {
+    b.onclick = async () => {
+      const name = decodeURIComponent(b.dataset.pldel);
+      if (!confirm(`Delete playlist "${name}"?`)) return;
+      try { await api("/api/playlists/" + encodeURIComponent(name), { method: "DELETE" });
+        toast("Deleted"); loadPlaylists();
+      } catch (err) { toast(err.message, true); }
+    };
+  });
+  window.__mediaFiles = files;
+}
+
+function editPlaylist(pl, files) {
+  files = files || window.__mediaFiles || [];
+  EDITING_PLAYLIST = pl ? pl.name : null;
+  $("playlistEditor").style.display = "";
+  $("plName").value = pl ? pl.name : "";
+  $("plLoop").checked = pl ? pl.loop : true;
+  $("plShuffle").checked = pl ? pl.shuffle : false;
+  $("plDuration").value = pl ? pl.image_duration : 10;
+  const chosen = new Set(pl ? pl.items : []);
+  $("plItems").innerHTML = files.length
+    ? files.map((f) => `<div class="checkline">
+        <input type="checkbox" class="plitem" value="${f.name}" ${chosen.has(f.name) ? "checked" : ""}>
+        <label>${f.name} <span class="host">(${f.kind})</span></label></div>`).join("")
+    : `<div class="empty">Upload some media first.</div>`;
+  $("playlistEditor").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+$("btnNewPlaylist").onclick = () => editPlaylist(null);
+$("btnCancelPlaylist").onclick = () => { $("playlistEditor").style.display = "none"; };
+$("btnSavePlaylist").onclick = async () => {
+  const items = [...document.querySelectorAll(".plitem:checked")].map((c) => c.value);
+  try {
+    await post("/api/playlists", {
+      name: $("plName").value.trim(), items,
+      loop: $("plLoop").checked, shuffle: $("plShuffle").checked,
+      image_duration: parseInt($("plDuration").value, 10) || 10,
+    });
+    if (EDITING_PLAYLIST && EDITING_PLAYLIST !== $("plName").value.trim()) {
+      await api("/api/playlists/" + encodeURIComponent(EDITING_PLAYLIST), { method: "DELETE" });
+    }
+    $("playlistEditor").style.display = "none";
+    toast("Playlist saved"); loadPlaylists();
+  } catch (err) { toast(err.message, true); }
+};
+
+// ---------- schedule ----------
+
+let EDITING_CUE = null;
+let SCHEDULE = { cues: [], day_names: ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"] };
+
+async function loadSchedule() {
+  try { SCHEDULE = await api("/api/schedule"); } catch (_) { return; }
+  $("cfgScheduleEnabled").checked = SCHEDULE.enabled;
+  const n = SCHEDULE.next;
+  $("nextCue").textContent = !SCHEDULE.enabled ? "Schedule is off — no cues will fire."
+    : n ? `Next: ${n.cue.label || n.cue.action} at ${n.cue.time}, in ${fmtDuration(n.in_minutes * 60)}.`
+        : "No cues scheduled.";
+
+  $("cueList").innerHTML = SCHEDULE.cues.length
+    ? SCHEDULE.cues.map((c) => `<li>
+        <div class="meta">
+          <div class="name">${c.time} · ${c.label || describeAction(c)}</div>
+          <div class="sub">${c.days.map((d) => SCHEDULE.day_names[d]).join(" ")} · ${describeAction(c)}${
+            c.enabled ? "" : " · disabled"}</div>
+        </div>
+        <button class="btn" data-cuerun="${c.id}">Run now</button>
+        <button class="btn" data-cueedit="${c.id}">Edit</button>
+        <button class="btn danger" data-cuedel="${c.id}">Delete</button>
+      </li>`).join("")
+    : `<div class="empty">No cues yet. Add one to switch source automatically.</div>`;
+
+  $("cueList").querySelectorAll("[data-cuerun]").forEach((b) => {
+    b.onclick = async () => {
+      try { await post("/api/schedule/run/" + b.dataset.cuerun); toast("Cue fired"); poll(); }
+      catch (err) { toast(err.message, true); }
+    };
+  });
+  $("cueList").querySelectorAll("[data-cueedit]").forEach((b) => {
+    b.onclick = () => editCue(SCHEDULE.cues.find((c) => c.id === b.dataset.cueedit));
+  });
+  $("cueList").querySelectorAll("[data-cuedel]").forEach((b) => {
+    b.onclick = async () => {
+      if (!confirm("Delete this cue?")) return;
+      try { await api("/api/schedule/" + b.dataset.cuedel, { method: "DELETE" });
+        toast("Deleted"); loadSchedule();
+      } catch (err) { toast(err.message, true); }
+    };
+  });
+}
+
+function describeAction(c) {
+  if (c.action === "ndi") return `NDI: ${c.target}`;
+  if (c.action === "playlist") return `Playlist: ${c.target}`;
+  if (c.action === "file") return `File: ${c.target}`;
+  if (c.action === "folder") return "Whole media folder";
+  return "Standby screen";
+}
+
+async function editCue(cue) {
+  EDITING_CUE = cue ? cue.id : "";
+  $("cueEditor").style.display = "";
+  $("cueLabel").value = cue ? cue.label : "";
+  $("cueTime").value = cue ? cue.time : "09:00";
+  $("cueAction").value = cue ? cue.action : "ndi";
+  $("cueTarget").value = cue ? cue.target : "";
+  const days = new Set(cue ? cue.days : [0,1,2,3,4,5,6]);
+  $("cueDays").innerHTML = SCHEDULE.day_names.map((d, i) =>
+    `<label class="badge"><input type="checkbox" class="cueday" value="${i}" ${
+      days.has(i) ? "checked" : ""}> ${d}</label>`).join("");
+  await refreshCueTargets();
+  $("cueEditor").scrollIntoView({ behavior: "smooth", block: "nearest" });
+}
+
+async function refreshCueTargets() {
+  const action = $("cueAction").value;
+  $("cueTargetField").style.display = ["ndi", "playlist", "file"].includes(action) ? "" : "none";
+  let options = [];
+  try {
+    if (action === "ndi") options = (await api("/api/ndi/sources")).sources.map((s) => s.name);
+    else if (action === "playlist") options = (await api("/api/playlists")).playlists.map((p) => p.name);
+    else if (action === "file") options = (await api("/api/media")).files.map((f) => f.name);
+  } catch (_) { /* suggestions only */ }
+  $("cueTargets").innerHTML = options.map((o) => `<option value="${o}">`).join("");
+}
+$("cueAction").onchange = refreshCueTargets;
+
+$("btnNewCue").onclick = () => editCue(null);
+$("btnCancelCue").onclick = () => { $("cueEditor").style.display = "none"; };
+$("btnSaveCue").onclick = async () => {
+  const days = [...document.querySelectorAll(".cueday:checked")].map((c) => parseInt(c.value, 10));
+  try {
+    await post("/api/schedule", {
+      id: EDITING_CUE || "", label: $("cueLabel").value.trim(),
+      time: $("cueTime").value.trim(), action: $("cueAction").value,
+      target: $("cueTarget").value.trim(), days, enabled: true,
+    });
+    $("cueEditor").style.display = "none";
+    toast("Cue saved"); loadSchedule();
+  } catch (err) { toast(err.message, true); }
+};
+$("cfgScheduleEnabled").onchange = async () => {
+  try { await post("/api/config", { schedule_enabled: $("cfgScheduleEnabled").checked });
+    loadSchedule();
+  } catch (err) { toast(err.message, true); }
+};
+
+// ---------- overclocking ----------
+
+const OC_LABELS = {
+  stock: ["Stock", "1.5 GHz, no extra voltage. The safe baseline."],
+  mild: ["Mild", "1.75 GHz, over_voltage 2. Newer Pi 4s already run 1.8 GHz, so this may do nothing for them."],
+  moderate: ["Moderate", "2.0 GHz, over_voltage 6. The usual sweet spot with a heatsink."],
+  maximum: ["Maximum", "2.147 GHz, over_voltage 6, GPU 750 MHz. Official guidance says you are unlikely to hold this long-term."],
+};
+
+async function loadOverclock() {
+  let oc;
+  try { oc = await api("/api/overclock"); } catch (_) { return; }
+  if (!oc.available) {
+    $("ocStatus").innerHTML = `<div class="empty">Overclock control unavailable: ${
+      oc.error || "helper not installed"}. Re-run install.sh to add it.</div>`;
+    $("ocButtons").innerHTML = "";
+    return;
+  }
+  const applied = oc.preset || "stock";
+  $("ocStatus").innerHTML = [
+    ["Applied preset", (OC_LABELS[applied] || [applied])[0]],
+    ["Current max clock", oc.max_mhz && oc.max_mhz !== "0" ? oc.max_mhz + "<small> MHz</small>" : "—"],
+    ["Settings", oc.settings || "none"],
+  ].map(([k, v]) => tile(k, v, {})).join("");
+
+  $("ocButtons").innerHTML = (oc.presets || []).map((p) => {
+    const [label] = OC_LABELS[p] || [p];
+    return `<button class="btn ${p === applied ? "" : p === "maximum" ? "danger" : "primary"}"
+      data-oc="${p}" ${p === applied ? "disabled" : ""}>${label}</button>`;
+  }).join("");
+  $("ocNote").textContent = (OC_LABELS[applied] || ["", ""])[1] || "";
+
+  $("ocButtons").querySelectorAll("[data-oc]").forEach((b) => {
+    b.onclick = async () => {
+      const preset = b.dataset.oc;
+      const [label, blurb] = OC_LABELS[preset] || [preset, ""];
+      if (!confirm(`Apply the "${label}" preset?\n\n${blurb}\n\nTakes effect on the next reboot.`)) return;
+      try {
+        await post("/api/overclock", { preset });
+        toast(`${label} applied — reboot to take effect`);
+        loadOverclock();
+      } catch (err) { toast(err.message, true); }
+    };
+  });
 }
 
 // ---------- verdict ----------

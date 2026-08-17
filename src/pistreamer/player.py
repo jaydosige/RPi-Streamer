@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, List, Optional
 
-from . import config, display, media, sources
+from . import config, display, media, playlists, sources
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +56,8 @@ class PlayerStatus:
     since: Optional[float] = None
     restarts: int = 0
     last_error: str = ""
+    # Standby is on screen because the wanted source went away.
+    fallback: bool = False
 
     def to_dict(self) -> dict:
         uptime = time.time() - self.since if self.since else None
@@ -67,6 +69,7 @@ class PlayerStatus:
             "uptime": round(uptime, 1) if uptime is not None else None,
             "restarts": self.restarts,
             "last_error": self.last_error,
+            "fallback": self.fallback,
         }
 
 
@@ -151,6 +154,9 @@ class Player:
         self._reader: Optional[threading.Thread] = None
         self._stats_reader: Optional[threading.Thread] = None
         self._stream_stats: dict = {}
+        # True while the standby screen is covering for a lost source.
+        self._fallback = False
+        self._next_attempt = 0.0
 
     # ------------------------------------------------------------------
     # Command construction
@@ -251,7 +257,20 @@ class Player:
         return cmd
 
     def _local_command(self, cfg: config.Config, selection: str) -> List[str]:
-        files = media.playlist_paths(selection)
+        # A named playlist wins over a single file or the whole folder, and
+        # brings its own loop/shuffle/dwell settings with it.
+        playlist = None
+        if cfg.local_playlist:
+            playlist = playlists.get(cfg.local_playlist)
+            if playlist is None:
+                raise RuntimeError(f"playlist not found: {cfg.local_playlist}")
+            files = playlists.resolved_files(cfg.local_playlist)
+            if not files:
+                raise RuntimeError(
+                    f"playlist {cfg.local_playlist!r} has no playable files left"
+                )
+        else:
+            files = media.playlist_paths(selection)
         if not files:
             raise RuntimeError("no playable media files found")
 
@@ -266,7 +285,7 @@ class Player:
             "--gpu-context=drm",
             "--hwdec=auto-safe",
             "--keep-open=no",
-            "--image-display-duration=10",
+            f"--image-display-duration={playlist.image_duration if playlist else 10}",
         ]
         if conn:
             cmd.append(f"--drm-connector={conn.name}")
@@ -276,7 +295,7 @@ class Player:
             cmd.append(f"--drm-mode={cfg.video_mode}")
         if cfg.rotation:
             cmd.append(f"--video-rotate={cfg.rotation}")
-        if cfg.loop:
+        if (playlist.loop if playlist else cfg.loop):
             cmd.append("--loop-playlist=inf")
         if cfg.audio_enabled:
             cmd.append(f"--volume={max(0, min(100, cfg.volume))}")
@@ -440,8 +459,10 @@ class Player:
         return stats
 
     def _spawn(self, cfg: config.Config, mode: str, target: str) -> None:
-        cmd = self._build_command(cfg, mode, target)
-        log.info("starting: %s", " ".join(shlex.quote(c) for c in cmd))
+        self._spawn_command(self._build_command(cfg, mode, target), mode)
+
+    def _spawn_command(self, cmd: List[str], what: str) -> None:
+        log.info("starting %s: %s", what, " ".join(shlex.quote(c) for c in cmd))
         self._logs.append(f"{time.strftime('%H:%M:%S')} $ {' '.join(shlex.quote(c) for c in cmd)}")
 
         env = dict(os.environ)
@@ -532,6 +553,8 @@ class Player:
             self._terminate()
             self._status.mode = mode
             self._status.target = target
+            self._fallback = False
+            self._status.fallback = False
             try:
                 self._spawn(config.load(), mode, target)
             except Exception as exc:  # noqa: BLE001 - surfaced to the GUI
@@ -548,6 +571,7 @@ class Player:
             proc = self._proc
             if proc is not None and proc.poll() is not None:
                 self._status.running = False
+            self._status.fallback = self._fallback
             return self._status.to_dict()
 
     def logs(self) -> List[str]:
@@ -557,43 +581,137 @@ class Player:
     # Supervisor
     # ------------------------------------------------------------------
 
+    def _backoff_delay(self) -> int:
+        delay = _BACKOFF[min(self._backoff_idx, len(_BACKOFF) - 1)]
+        self._backoff_idx += 1
+        return delay
+
+    def _enter_fallback(self, cfg: config.Config) -> None:
+        """Put the standby screen up while we wait for the source to return.
+
+        This is the fix for a real design hole: the supervisor used to retry
+        the dead source directly, which left the display showing whatever the
+        console had — so "hold the last frame" only ever worked on an explicit
+        stop, never on the case that actually matters, a feed dropping
+        mid-show. Standby is a real pipeline holding DRM, so it has to be
+        started and torn down like any other mode.
+        """
+        self._terminate()
+        self._fallback = True
+        try:
+            cmd = self._idle_command(cfg)
+            log.info("source lost — showing standby while retrying")
+            self._spawn_command(cmd, "standby")
+        except Exception as exc:  # noqa: BLE001
+            self._status.last_error = f"standby screen failed: {exc}"
+            log.error("%s", self._status.last_error)
+        self._next_attempt = time.monotonic() + self._backoff_delay()
+
+    def _source_ready(self, mode: str, target: str) -> bool:
+        """Is it worth tearing down standby to try the source again?
+
+        For a named NDI source we can ask the finder, which runs continuously
+        and needs no display — so we only interrupt standby once the sender is
+        actually visible again. With an explicit address there is nothing to
+        ask, so we just retry on the backoff schedule.
+        """
+        if mode != MODE_NDI:
+            return True
+        if config.load().ndi_url_address.strip():
+            return True
+        try:
+            names = {s.name for s in sources.discover(timeout=0.0)}
+        except Exception:  # noqa: BLE001
+            return True
+        return target in names
+
+    def _try_resume(self, cfg: config.Config, mode: str, target: str) -> None:
+        self._terminate()
+        self._fallback = False
+        try:
+            self._spawn(cfg, mode, target)
+        except Exception as exc:  # noqa: BLE001
+            self._status.last_error = str(exc)
+            log.error("resume failed: %s", exc)
+            self._enter_fallback(cfg)
+
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            self._stop_event.wait(1.0)
-            if self._stop_event.is_set():
+            if self._stop_event.wait(1.0):
                 break
-            with self._lock:
-                proc = self._proc
-                if proc is not None and proc.poll() is None:
-                    # Healthy for long enough? Reset backoff.
-                    if self._status.since and (time.time() - self._status.since) > _HEALTHY_AFTER:
-                        self._backoff_idx = 0
-                    continue
+            try:
+                self._supervise()
+            except Exception:  # noqa: BLE001 - a supervisor must never die
+                log.exception("supervisor tick failed")
 
-                # Process is gone (crashed, or the NDI sender vanished).
-                rc = proc.returncode if proc is not None else None
-                if proc is not None:
-                    self._status.last_error = f"player exited with code {rc}"
-                self._status.running = False
-                self._proc = None
+    def _supervise(self) -> None:
+        with self._lock:
+            mode, target = self._wanted_mode, self._wanted_target
+            cfg = config.load()
+            proc = self._proc
+            alive = proc is not None and proc.poll() is None
 
-                delay = _BACKOFF[min(self._backoff_idx, len(_BACKOFF) - 1)]
-                self._backoff_idx += 1
-                self._status.restarts += 1
-                mode, target = self._wanted_mode, self._wanted_target
+            if alive:
+                if self._fallback:
+                    # Standby is on screen. Check periodically whether the
+                    # real source is back.
+                    if time.monotonic() >= self._next_attempt:
+                        if self._source_ready(mode, target):
+                            log.info("source available again; leaving standby")
+                            self._try_resume(cfg, mode, target)
+                        else:
+                            self._next_attempt = time.monotonic() + self._backoff_delay()
+                elif self._status.since and (time.time() - self._status.since) > _HEALTHY_AFTER:
+                    self._backoff_idx = 0  # been up a while; forget the backoff
+                return
 
-            log.info("player down (%s); retrying in %ss", self._status.last_error, delay)
-            if self._stop_event.wait(delay):
-                break
+            # Whatever was running has exited.
+            if proc is not None:
+                self._status.last_error = (
+                    f"standby screen exited with code {proc.returncode}"
+                    if self._fallback
+                    else f"player exited with code {proc.returncode}"
+                )
+            self._status.running = False
+            self._proc = None
 
-            with self._lock:
-                if self._wanted_mode != mode or self._wanted_target != target:
-                    continue  # user changed their mind while we waited
+            if mode == MODE_IDLE:
+                # The standby screen is the point of idle; bring it back.
+                self._next_attempt = time.monotonic() + self._backoff_delay()
                 try:
-                    self._spawn(config.load(), mode, target)
+                    self._spawn(cfg, mode, target)
                 except Exception as exc:  # noqa: BLE001
                     self._status.last_error = str(exc)
-                    log.error("restart failed: %s", exc)
+                return
+
+            self._status.restarts += 1
+
+            if self._fallback:
+                # Standby died rather than the source. Try to get it back up.
+                self._enter_fallback(cfg)
+                return
+
+            if mode == MODE_NDI and cfg.fallback_to_standby:
+                self._enter_fallback(cfg)
+                return
+
+            # Local playback, or fallback disabled: straight retry on backoff.
+            self._next_attempt = time.monotonic() + self._backoff_delay()
+
+        # Outside the lock: wait out the backoff, then retry if nothing changed.
+        delay = max(0.0, self._next_attempt - time.monotonic())
+        if delay and self._stop_event.wait(delay):
+            return
+        with self._lock:
+            if (self._wanted_mode, self._wanted_target) != (mode, target):
+                return  # the user changed their mind while we waited
+            if self._proc is not None and self._proc.poll() is None:
+                return  # something already restarted it
+            try:
+                self._spawn(config.load(), self._wanted_mode, self._wanted_target)
+            except Exception as exc:  # noqa: BLE001
+                self._status.last_error = str(exc)
+                log.error("restart failed: %s", exc)
 
 
 # Module-level singleton the web layer talks to.

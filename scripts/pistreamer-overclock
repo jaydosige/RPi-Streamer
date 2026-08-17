@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+#
+# Apply one of a fixed set of overclock presets to /boot/firmware/config.txt.
+#
+# Runs as root via a narrow sudoers rule. It accepts ONLY a preset name — no
+# arbitrary frequencies or voltages from the caller — because the caller is an
+# unauthenticated web GUI on the event network. Values come from the official
+# Raspberry Pi guidance, not from experiment.
+#
+#   pistreamer-overclock status
+#   pistreamer-overclock stock|mild|moderate|maximum
+#
+set -uo pipefail
+
+BOOT_DIR="/boot/firmware"
+[[ -d "${BOOT_DIR}" ]] || BOOT_DIR="/boot"
+CONFIG_TXT="${BOOT_DIR}/config.txt"
+
+BEGIN="# --- pi-streamer overclock (managed, do not edit inside) ---"
+END="# --- end pi-streamer overclock ---"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# Preset table. Stock Pi 4B is arm_freq=1500, gpu_freq=500, over_voltage=0.
+# over_voltage accepts -16..8. Newer Pi 4 revisions ship at 1800, so "mild"
+# may be a no-op or even a downclock on those — the status output reports the
+# measured maximum so the GUI can say so.
+preset_settings() {
+  case "$1" in
+    stock)    printf '' ;;
+    mild)     printf 'over_voltage=2\narm_freq=1750\n' ;;
+    moderate) printf 'over_voltage=6\narm_freq=2000\n' ;;
+    maximum)  printf 'over_voltage=6\narm_freq=2147\ngpu_freq=750\n' ;;
+    *)        return 1 ;;
+  esac
+}
+
+current_max_mhz() {
+  local f=/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq
+  [[ -r "${f}" ]] && echo $(( $(cat "${f}") / 1000 )) || echo 0
+}
+
+show_status() {
+  local applied="stock" block=""
+  if [[ -f "${CONFIG_TXT}" ]] && grep -qF "${BEGIN}" "${CONFIG_TXT}"; then
+    block="$(sed -n "/^${BEGIN}\$/,/^${END}\$/p" "${CONFIG_TXT}" | grep -E '^(arm_freq|over_voltage|gpu_freq)=' || true)"
+    applied="$(sed -n "/^${BEGIN}\$/,/^${END}\$/p" "${CONFIG_TXT}" | sed -n 's/^# preset: //p' | head -n1)"
+    [[ -n "${applied}" ]] || applied="custom"
+  fi
+  printf 'preset=%s\n' "${applied}"
+  printf 'max_mhz=%s\n' "$(current_max_mhz)"
+  printf 'config=%s\n' "${CONFIG_TXT}"
+  if [[ -n "${block}" ]]; then
+    printf 'settings=%s\n' "$(echo "${block}" | tr '\n' ' ')"
+  else
+    printf 'settings=\n'
+  fi
+  # A board that has already flagged throttling should not be pushed further.
+  if command -v vcgencmd >/dev/null 2>&1; then
+    printf 'throttled=%s\n' "$(vcgencmd get_throttled | sed 's/throttled=//')"
+  fi
+}
+
+[[ $# -ge 1 ]] || die "usage: pistreamer-overclock status|stock|mild|moderate|maximum"
+
+if [[ "$1" == "status" ]]; then
+  show_status
+  exit 0
+fi
+
+PRESET="$1"
+SETTINGS="$(preset_settings "${PRESET}")" || die "unknown preset: ${PRESET}"
+[[ -f "${CONFIG_TXT}" ]] || die "no ${CONFIG_TXT} on this system"
+[[ -w "${CONFIG_TXT}" ]] || die "cannot write ${CONFIG_TXT} (run as root)"
+
+# One backup, kept from the first change ever made.
+[[ -f "${CONFIG_TXT}.pistreamer-oc.bak" ]] || cp -a "${CONFIG_TXT}" "${CONFIG_TXT}.pistreamer-oc.bak"
+
+# Strip any previous managed block, then append the new one. Editing in place
+# with a delimited block means we never touch the user's own settings.
+TMP="$(mktemp)"
+trap 'rm -f "${TMP}"' EXIT
+sed "/^${BEGIN}\$/,/^${END}\$/d" "${CONFIG_TXT}" > "${TMP}"
+
+if [[ -n "${SETTINGS}" ]]; then
+  {
+    printf '\n%s\n' "${BEGIN}"
+    printf '# preset: %s\n' "${PRESET}"
+    printf '# Overclocking needs cooling and a genuine 3A supply. If the\n'
+    printf '# Diagnostics tab reports throttling or under-voltage, step back.\n'
+    # printf '%s\n' and not '%s': $(...) strips the trailing newline, so
+    # without this the END marker gets glued onto the last setting and the
+    # firmware sees "arm_freq=2000# --- end ...".
+    printf '%s\n' "${SETTINGS}"
+    printf '%s\n' "${END}"
+  } >> "${TMP}"
+fi
+
+# Never leave a truncated config.txt on the boot partition — that is an
+# unbootable Pi and an SD card in a card reader.
+if [[ ! -s "${TMP}" ]]; then
+  die "refusing to write an empty config.txt"
+fi
+cat "${TMP}" > "${CONFIG_TXT}"
+sync
+
+printf 'applied=%s\n' "${PRESET}"
+printf 'reboot_required=1\n'
+show_status

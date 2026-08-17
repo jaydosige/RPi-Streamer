@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List
@@ -15,7 +16,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import config, diagnose, display, media, ndiconfig, sources, system
+from . import (config, diagnose, display, media, ndiconfig, playlists,
+               schedule as schedule_mod, sources, system)
 from .player import MODE_IDLE, MODE_LOCAL, MODE_NDI, player
 from .telemetry import telemetry
 
@@ -69,6 +71,9 @@ async def lifespan(app: FastAPI):
     player.start()
     telemetry.bind_player(player.stream_stats)
     telemetry.start()
+    schedule_mod.scheduler.bind(apply_cue_action)
+    if cfg.schedule_enabled:
+        schedule_mod.scheduler.start()
     if cfg.autostart and cfg.mode != MODE_IDLE:
         target = cfg.ndi_source if cfg.mode == MODE_NDI else cfg.local_file
         log.info("autostarting mode=%s target=%s", cfg.mode, target)
@@ -77,6 +82,37 @@ async def lifespan(app: FastAPI):
     player.shutdown()
     sources.stop()
     telemetry.stop()
+    schedule_mod.scheduler.stop()
+
+
+def apply_cue_action(action: str, target: str) -> None:
+    """Perform what a schedule cue asks for.
+
+    Cue actions map onto the same player modes the GUI uses, so a scheduled
+    switch and a manual one are indistinguishable afterwards — which matters
+    when someone overrides a cue by hand mid-show.
+    """
+    if action == "ndi":
+        config.update(mode=MODE_NDI, ndi_source=target)
+        player.apply(MODE_NDI, target)
+    elif action == "playlist":
+        if playlists.get(target) is None:
+            raise ValueError(f"playlist not found: {target}")
+        config.update(mode=MODE_LOCAL, local_playlist=target)
+        player.apply(MODE_LOCAL, "")
+    elif action == "file":
+        if media.resolve(target) is None:
+            raise ValueError(f"media file not found: {target}")
+        config.update(mode=MODE_LOCAL, local_playlist="", local_file=target)
+        player.apply(MODE_LOCAL, target)
+    elif action == "folder":
+        config.update(mode=MODE_LOCAL, local_playlist="", local_file="")
+        player.apply(MODE_LOCAL, "")
+    elif action == "standby":
+        config.update(mode=MODE_IDLE)
+        player.apply(MODE_IDLE)
+    else:
+        raise ValueError(f"unknown cue action: {action}")
 
 
 app = FastAPI(title="pi-streamer", version="0.1.0", lifespan=lifespan)
@@ -266,6 +302,12 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         sources.stop()
         sources.start()
 
+    if "schedule_enabled" in patch:
+        if cfg.schedule_enabled:
+            schedule_mod.scheduler.start()
+        else:
+            schedule_mod.scheduler.stop()
+
     # Anything that changes the pipeline graph only takes effect on a restart.
     restart_keys = {
         "connector", "video_mode", "rotation",
@@ -276,7 +318,7 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         "sink_sync", "sink_qos", "sink_max_lateness_ms",
         "scale_method", "video_format",
         "queue_leaky", "queue_max_buffers", "convert_threads", "match_source",
-        "ndi_url_address",
+        "ndi_url_address", "local_playlist", "fallback_to_standby",
         "snapshot_enabled", "snapshot_interval_s",
         "idle_mode", "standby_file",
         "loop",
@@ -424,6 +466,171 @@ async def delete_media(name: str) -> Dict[str, Any]:
     if not media.delete(name):
         raise HTTPException(404, f"no such media file: {name}")
     return {"deleted": name}
+
+
+# ----------------------------------------------------------------------
+# Playlists
+# ----------------------------------------------------------------------
+
+
+class PlaylistBody(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    items: List[str] = Field(default_factory=list)
+    loop: bool = True
+    shuffle: bool = False
+    image_duration: int = 10
+
+
+@app.get("/api/playlists")
+async def get_playlists() -> Dict[str, Any]:
+    return {"playlists": [p.to_dict() for p in playlists.all_playlists()]}
+
+
+@app.post("/api/playlists")
+async def post_playlist(body: PlaylistBody) -> Dict[str, Any]:
+    try:
+        saved = playlists.save(
+            playlists.Playlist(
+                name=body.name, items=body.items, loop=body.loop,
+                shuffle=body.shuffle, image_duration=body.image_duration,
+            )
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return saved.to_dict()
+
+
+@app.delete("/api/playlists/{name}")
+async def delete_playlist(name: str) -> Dict[str, Any]:
+    cfg = config.load()
+    if cfg.local_playlist == name and cfg.mode == MODE_LOCAL:
+        raise HTTPException(409, "playlist is currently playing; stop it first")
+    if not playlists.delete(name):
+        raise HTTPException(404, f"no such playlist: {name}")
+    return {"deleted": name}
+
+
+@app.post("/api/play/playlist")
+async def play_playlist(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    name = str(body.get("name", ""))
+    if playlists.get(name) is None:
+        raise HTTPException(404, f"no such playlist: {name}")
+    config.update(mode=MODE_LOCAL, local_playlist=name)
+    player.apply(MODE_LOCAL, "")
+    status = player.status()
+    if status["last_error"]:
+        raise HTTPException(500, status["last_error"])
+    return status
+
+
+# ----------------------------------------------------------------------
+# Schedule
+# ----------------------------------------------------------------------
+
+
+class CueBody(BaseModel):
+    id: str = ""
+    time: str
+    action: str
+    target: str = ""
+    days: List[int] = Field(default_factory=lambda: list(range(7)))
+    enabled: bool = True
+    label: str = ""
+
+
+@app.get("/api/schedule")
+async def get_schedule() -> Dict[str, Any]:
+    cues = schedule_mod.all_cues()
+    return {
+        "enabled": config.load().schedule_enabled,
+        "cues": [c.to_dict() for c in cues],
+        "next": schedule_mod.next_fire(cues),
+        "last_fired": schedule_mod.scheduler.last_fired(),
+        "day_names": schedule_mod.DAY_NAMES,
+        "actions": list(schedule_mod.ACTIONS),
+    }
+
+
+@app.post("/api/schedule")
+async def post_cue(body: CueBody) -> Dict[str, Any]:
+    cue = schedule_mod.Cue(
+        id=body.id or f"cue-{int(time.time() * 1000)}",
+        time=body.time, action=body.action, target=body.target,
+        days=body.days, enabled=body.enabled, label=body.label,
+    )
+    try:
+        schedule_mod.save(cue)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return cue.to_dict()
+
+
+@app.delete("/api/schedule/{cue_id}")
+async def delete_cue(cue_id: str) -> Dict[str, Any]:
+    if not schedule_mod.delete(cue_id):
+        raise HTTPException(404, f"no such cue: {cue_id}")
+    return {"deleted": cue_id}
+
+
+@app.post("/api/schedule/run/{cue_id}")
+async def run_cue(cue_id: str) -> Dict[str, Any]:
+    """Fire a cue now, to check it does what you meant before the show."""
+    cue = next((c for c in schedule_mod.all_cues() if c.id == cue_id), None)
+    if cue is None:
+        raise HTTPException(404, f"no such cue: {cue_id}")
+    try:
+        apply_cue_action(cue.action, cue.target)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(400, str(exc)) from exc
+    return {"fired": cue.to_dict(), "player": player.status()}
+
+
+# ----------------------------------------------------------------------
+# Overclocking
+# ----------------------------------------------------------------------
+
+OVERCLOCK_HELPER = "/opt/pistreamer/bin/pistreamer-overclock"
+OVERCLOCK_PRESETS = ("stock", "mild", "moderate", "maximum")
+
+
+def _overclock(args: List[str]) -> Dict[str, Any]:
+    """Call the privileged helper. It only accepts preset names, never values."""
+    if not Path(OVERCLOCK_HELPER).exists():
+        return {"available": False, "error": f"{OVERCLOCK_HELPER} not installed"}
+    try:
+        proc = subprocess.run(
+            ["sudo", "-n", OVERCLOCK_HELPER, *args],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return {"available": False, "error": str(exc)}
+    out: Dict[str, Any] = {"available": proc.returncode == 0}
+    if proc.returncode != 0:
+        out["error"] = (proc.stderr or proc.stdout).strip()
+    for line in proc.stdout.splitlines():
+        if "=" in line:
+            key, _, value = line.partition("=")
+            out[key.strip()] = value.strip()
+    return out
+
+
+@app.get("/api/overclock")
+async def get_overclock() -> Dict[str, Any]:
+    data = _overclock(["status"])
+    data["presets"] = list(OVERCLOCK_PRESETS)
+    return data
+
+
+@app.post("/api/overclock")
+async def post_overclock(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    preset = str(body.get("preset", ""))
+    if preset not in OVERCLOCK_PRESETS:
+        raise HTTPException(400, f"preset must be one of: {', '.join(OVERCLOCK_PRESETS)}")
+    data = _overclock([preset])
+    if not data.get("available"):
+        raise HTTPException(500, data.get("error", "overclock helper failed"))
+    data["reboot_required"] = True
+    return data
 
 
 # ----------------------------------------------------------------------
