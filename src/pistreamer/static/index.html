@@ -277,7 +277,55 @@
         <span class="lbl">NDI name, exactly as advertised &mdash; e.g. <code>STUDIO-PC (OBS)</code></span>
         <input type="text" id="manualNdi" placeholder="MACHINE (Stream name)">
       </label>
-      <button class="btn" id="btnManualNdi">Connect</button>
+      <button class="btn" id="btnManualNdi">Connect by name</button>
+    </div>
+
+    <div class="card">
+      <h2>Connect by address</h2>
+      <div class="host" style="margin-bottom:12px">
+        Bypasses discovery entirely. If the Pi can route to the sender, this
+        connects regardless of what mDNS is doing &mdash; which makes it the
+        thing to try when a source refuses to appear, and the reliable option
+        across VLANs or on a multi-homed node.
+      </div>
+      <label class="field">
+        <span class="lbl">Sender address and port &mdash; NDI listens on 5961 by default</span>
+        <input type="text" id="cfgUrlAddress" placeholder="10.0.0.20:5961">
+      </label>
+      <div class="row">
+        <button class="btn primary" id="btnConnectAddress">Connect</button>
+        <button class="btn" id="btnClearAddress">Clear and use discovery</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>NDI networking</h2>
+      <div class="host" style="margin-bottom:12px">
+        For a node with two networks &mdash; Wi-Fi for management, Ethernet for
+        media. These go into the NDI SDK's own config file, not the pipeline, and
+        changing them restarts discovery.
+      </div>
+      <label class="field">
+        <span class="lbl">Restrict NDI to these interfaces &mdash; give the Pi's <em>own</em> address on the media network</span>
+        <input type="text" id="cfgAdapterIps" placeholder="10.0.0.50">
+      </label>
+      <label class="field">
+        <span class="lbl">Also look for senders at these addresses (no mDNS needed)</span>
+        <input type="text" id="cfgExtraIps" placeholder="10.0.0.20, 10.0.0.21">
+      </label>
+      <label class="field">
+        <span class="lbl">NDI Discovery Server &mdash; for networks where mDNS is blocked</span>
+        <input type="text" id="cfgDiscoveryServer" placeholder="10.0.0.2">
+      </label>
+      <div class="row">
+        <button class="btn primary" id="btnSaveNdiNet">Save &amp; restart discovery</button>
+      </div>
+      <div class="banner warn" style="margin:12px 0 0">
+        Get the interface restriction wrong &mdash; an address that does not
+        exist on this Pi &mdash; and NDI may stop working entirely. Leave it
+        blank unless you are certain.
+      </div>
+      <pre class="log" id="ndiConfigDump" style="margin-top:12px;max-height:160px"></pre>
     </div>
   </section>
 
@@ -688,6 +736,7 @@ document.querySelectorAll("nav button").forEach((btn) => {
     if (btn.dataset.tab === "display") loadConnectors();
     if (btn.dataset.tab === "diag") loadTelemetry();
     if (btn.dataset.tab === "perf") loadPerf();
+    if (btn.dataset.tab === "ndi") loadNdiNetwork();
   };
 });
 
@@ -1301,6 +1350,58 @@ $("btnTable").onclick = () => {
 };
 
 // ---------- NDI ----------
+
+async function loadNdiNetwork() {
+  if (!STATE) return;
+  const c = STATE.config;
+  if (document.activeElement !== $("cfgAdapterIps")) $("cfgAdapterIps").value = c.ndi_adapter_ips;
+  if (document.activeElement !== $("cfgExtraIps")) $("cfgExtraIps").value = c.ndi_extra_ips;
+  if (document.activeElement !== $("cfgDiscoveryServer")) $("cfgDiscoveryServer").value = c.ndi_discovery_server;
+  if (document.activeElement !== $("cfgUrlAddress")) $("cfgUrlAddress").value = c.ndi_url_address;
+  try {
+    const caps = await api("/api/capabilities");
+    const nc = caps.ndi_config || {};
+    $("ndiConfigDump").textContent = nc.exists
+      ? `${nc.path}\n\n${JSON.stringify(nc.config, null, 2)}`
+      : `${nc.path || "(no path)"}\n\nNo overrides written — NDI is using every interface it can see.`;
+  } catch (_) { /* best-effort */ }
+}
+
+$("btnSaveNdiNet").onclick = async () => {
+  try {
+    await post("/api/config", {
+      ndi_adapter_ips: $("cfgAdapterIps").value.trim(),
+      ndi_extra_ips: $("cfgExtraIps").value.trim(),
+      ndi_discovery_server: $("cfgDiscoveryServer").value.trim(),
+    });
+    toast("Saved — discovery restarting");
+    await poll();
+    loadNdiNetwork();
+    setTimeout(() => scanNdi(true), 3000);
+  } catch (err) { toast(err.message, true); }
+};
+
+$("btnConnectAddress").onclick = async () => {
+  const addr = $("cfgUrlAddress").value.trim();
+  if (!addr) { toast("Enter an address first", true); return; }
+  try {
+    await post("/api/config", { ndi_url_address: addr });
+    // The source name is ignored when an address is set, but the player still
+    // needs a mode to switch into.
+    await post("/api/play/ndi", { source: STATE.config.ndi_source || addr });
+    toast("Connecting to " + addr);
+    poll();
+  } catch (err) { toast(err.message, true); }
+};
+
+$("btnClearAddress").onclick = async () => {
+  try {
+    await post("/api/config", { ndi_url_address: "" });
+    $("cfgUrlAddress").value = "";
+    toast("Back to discovery by name");
+    poll();
+  } catch (err) { toast(err.message, true); }
+};
 
 async function scanNdi(refresh) {
   $("btnScan").disabled = true;

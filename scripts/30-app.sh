@@ -21,6 +21,9 @@ install -d -o root -g root -m 0755 "${PISTREAMER_HOME}"
 install -d -o "${PISTREAMER_USER}" -g "${PISTREAMER_USER}" -m 0755 "${PISTREAMER_CONFIG_DIR}"
 install -d -o "${PISTREAMER_USER}" -g "${PISTREAMER_USER}" -m 0755 "${PISTREAMER_STATE_DIR}"
 install -d -o "${PISTREAMER_USER}" -g "${PISTREAMER_USER}" -m 0755 "${PISTREAMER_STATE_DIR}/media"
+# libndi reads $HOME/.ndi/ndi-config.v1.json; the unit sets HOME here so the
+# service can write it without being root.
+install -d -o "${PISTREAMER_USER}" -g "${PISTREAMER_USER}" -m 0755 "${PISTREAMER_STATE_DIR}/.ndi"
 install -d -o root -g root -m 0755 "${PISTREAMER_GST_PLUGIN_DIR}"
 
 # --- python venv -----------------------------------------------------------

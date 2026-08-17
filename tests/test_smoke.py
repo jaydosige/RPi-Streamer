@@ -159,6 +159,25 @@ def main() -> int:
                                              "idle_mode": "lastframe"})
         check("valid performance patch -> 200", r.status_code == 200, r.text)
 
+        print("\nNDI networking (multi-homed support)")
+        r = client.post("/api/config", json={"ndi_adapter_ips": "10.0.0.50",
+                                            "ndi_extra_ips": "10.0.0.20, 10.0.0.21",
+                                            "ndi_discovery_server": "10.0.0.2"})
+        check("NDI network settings accepted -> 200", r.status_code == 200, r.text)
+        from pistreamer import ndiconfig  # noqa: PLC0415
+        built = ndiconfig.build("10.0.0.50", "10.0.0.20, 10.0.0.21", "10.0.0.2")
+        check("adapters.allowed is a list of IPs",
+              built["ndi"]["adapters"]["allowed"] == ["10.0.0.50"], str(built))
+        check("networks.ips is a comma string, as the SDK wants",
+              built["ndi"]["networks"]["ips"] == "10.0.0.20,10.0.0.21,", str(built))
+        check("empty settings write no keys at all", ndiconfig.build() == {},
+              "an empty adapters list can stop NDI working entirely")
+        r = client.post("/api/config", json={"ndi_url_address": "10.0.0.20:5961"})
+        check("connect-by-address accepted -> 200", r.status_code == 200, r.text)
+        r = client.post("/api/config", json={"ndi_adapter_ips": "", "ndi_extra_ips": "",
+                                            "ndi_discovery_server": "", "ndi_url_address": ""})
+        check("clearing them again -> 200", r.status_code == 200, r.text)
+
         print("\ndiagnosis")
         r = client.get("/api/diagnose")
         check("GET /api/diagnose -> 200", r.status_code == 200, r.text)

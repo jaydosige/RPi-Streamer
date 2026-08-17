@@ -17,6 +17,11 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PISTREAMER_CONFIG=/etc/pistreamer/config.json
 Environment=PISTREAMER_MEDIA=/var/lib/pistreamer/media
 Environment=PISTREAMER_STATE=/var/lib/pistreamer
+# libndi keeps its config in $HOME/.ndi/. The service user's real home is
+# root-owned, so point HOME at the state directory to make that writable —
+# without this, NDI network overrides (adapter restriction, explicit sender
+# IPs, discovery server) cannot be applied at all.
+Environment=HOME=/var/lib/pistreamer
 # gst-plugin-ndi is installed outside the distro plugin path.
 Environment=GST_PLUGIN_PATH=/opt/pistreamer/gst-plugins
 Environment=LD_LIBRARY_PATH=/usr/local/lib

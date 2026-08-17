@@ -10,6 +10,9 @@ apt-get update -qq
 apt_install \
   gstreamer1.0-tools \
   gstreamer1.0-plugins-base \
+  `# gst-device-monitor-1.0 lives here, NOT in gstreamer1.0-tools. Without it` \
+  `# the CLI discovery fallback and the NDI diagnostics endpoint cannot run.` \
+  gstreamer1.0-plugins-base-apps \
   gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad \
   gstreamer1.0-alsa \

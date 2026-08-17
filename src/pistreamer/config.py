@@ -70,6 +70,20 @@ class Config:
     ndi_connect_timeout_ms: int = 10000
     ndi_timeout_ms: int = 5000
 
+    # --- NDI networking on a multi-homed node ---
+    # Restrict NDI to specific NICs, given as those NICs' own IP addresses.
+    # On a node with Wi-Fi for management and Ethernet for media, putting the
+    # Ethernet address here stops NDI using the wrong interface.
+    ndi_adapter_ips: str = ""
+    # Sender IPs to probe directly, bypassing mDNS entirely. Useful when
+    # discovery cannot cross the network but the route can.
+    ndi_extra_ips: str = ""
+    # An NDI Discovery Server, for networks where mDNS is blocked.
+    ndi_discovery_server: str = ""
+    # Connect straight to "host:port" instead of resolving a name. The last
+    # resort that always works if the route does.
+    ndi_url_address: str = ""
+
     # --- pipeline performance ---
     # Sink clock sync. With sync on, a frame that arrives late is dropped to
     # stay in time. Turning it off renders every frame as it arrives — motion

@@ -192,7 +192,11 @@ class _Discovery:
 
     def _run_cli(self) -> None:
         if not shutil.which("gst-device-monitor-1.0"):
-            raise RuntimeError("gst-device-monitor-1.0 not installed")
+            raise RuntimeError(
+                "gst-device-monitor-1.0 not installed — it ships in "
+                "gstreamer1.0-plugins-base-apps, not gstreamer1.0-tools "
+                "(sudo apt install gstreamer1.0-plugins-base-apps)"
+            )
 
         self._backend = "cli"
         self._started_at = time.monotonic()

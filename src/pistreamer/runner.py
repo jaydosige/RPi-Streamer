@@ -497,7 +497,15 @@ class Runner:
             return pipeline
 
         src = make("ndisrc", "src")
-        set_prop(src, "ndi-name", spec["source"])
+        # url-address bypasses discovery completely: if the route works, this
+        # connects, whatever mDNS is or is not doing. ndi-name and url-address
+        # are alternatives, so set exactly one.
+        url = (spec.get("url_address") or "").strip()
+        if url:
+            set_prop(src, "url-address", url)
+            log(f"connecting directly to {url} (discovery bypassed)")
+        else:
+            set_prop(src, "ndi-name", spec["source"])
         set_prop(src, "connect-timeout", int(spec.get("connect_timeout_ms", 10000)))
         set_prop(src, "timeout", int(spec.get("timeout_ms", 5000)))
         set_prop(src, "bandwidth", int(spec.get("bandwidth", 100)))

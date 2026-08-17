@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -14,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import config, diagnose, display, media, sources, system
+from . import config, diagnose, display, media, ndiconfig, sources, system
 from .player import MODE_IDLE, MODE_LOCAL, MODE_NDI, player
 from .telemetry import telemetry
 
@@ -59,6 +60,9 @@ VIDEO_FORMATS = ("auto", "BGRx", "RGBx", "BGRA", "RGB16", "NV12", "UYVY", "I420"
 async def lifespan(app: FastAPI):
     config.ensure_dirs()
     cfg = config.load()
+    # libndi reads its config when it initialises, so this has to happen
+    # before the finder starts.
+    ndiconfig.apply(cfg.ndi_adapter_ips, cfg.ndi_extra_ips, cfg.ndi_discovery_server)
     # The NDI finder needs to run continuously to see the network; start it
     # before anything else so it has been up for a while by the first poll.
     sources.start()
@@ -169,6 +173,7 @@ async def get_capabilities() -> Dict[str, Any]:
         "hardware_decoders": hardware,
         "hardware_decode_available": bool(hardware),
         "advanced_sdk": compressed_supported,
+        "ndi_config": ndiconfig.current(),
         "color_formats": list(COLOR_FORMATS),
         "video_formats": list(VIDEO_FORMATS),
     }
@@ -252,6 +257,15 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         raise HTTPException(404, f"no such media file: {patch['standby_file']}")
 
     cfg = config.update(**patch)
+
+    # These live in libndi's own config file, which it reads at init, so the
+    # finder has to be torn down and restarted for them to take effect.
+    ndi_network_keys = {"ndi_adapter_ips", "ndi_extra_ips", "ndi_discovery_server"}
+    if ndi_network_keys & set(patch):
+        ndiconfig.apply(cfg.ndi_adapter_ips, cfg.ndi_extra_ips, cfg.ndi_discovery_server)
+        sources.stop()
+        sources.start()
+
     # Anything that changes the pipeline graph only takes effect on a restart.
     restart_keys = {
         "connector", "video_mode", "rotation",
@@ -262,6 +276,7 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         "sink_sync", "sink_qos", "sink_max_lateness_ms",
         "scale_method", "video_format",
         "queue_leaky", "queue_max_buffers", "convert_threads", "match_source",
+        "ndi_url_address",
         "snapshot_enabled", "snapshot_interval_s",
         "idle_mode", "standby_file",
         "loop",
@@ -305,6 +320,11 @@ async def ndi_diagnostics() -> Dict[str, Any]:
     checks["libndi"] = [str(p) for p in libndi] or "MISSING"
 
     def _run(cmd: list[str]) -> str:
+        if shutil.which(cmd[0]) is None and shutil.which(cmd[-1]) is None:
+            hint = ""
+            if any("gst-device-monitor" in part for part in cmd):
+                hint = " (it ships in gstreamer1.0-plugins-base-apps)"
+            return f"not installed: {cmd[0]}{hint}"
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
             return (proc.stdout + proc.stderr).strip()[:4000]
