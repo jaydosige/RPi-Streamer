@@ -69,14 +69,49 @@ options, then:
 
 ```bash
 sudo apt update && sudo apt install -y git
-git clone <this-repo> pi-streamer
-cd pi-streamer
+git clone <this-repo> ~/RPi-Streamer
+cd ~/RPi-Streamer
+
+sudo -v                 # authenticate first, on its own line
 sudo ./install.sh
 sudo reboot
 ```
 
 The first run takes 20–40 minutes, almost all of it compiling the Rust NDI
 plugin. After the reboot the GUI is at `http://<hostname>.local/`.
+
+`sudo -v` on its own line matters if you paste a block of commands: `sudo`'s
+password prompt reads from stdin, so the *next pasted line* gets eaten as the
+password and both commands fail. Authenticate first and nothing that follows can
+be swallowed.
+
+### One command per node: `bootstrap.sh`
+
+`install.sh` turns a Pi into a node. `scripts/bootstrap.sh` does everything
+around it — installs git, fetches the code, gives the unit a unique name and
+identity, joins it to a group with the right key, and runs the installer:
+
+```bash
+sudo ./scripts/bootstrap.sh --name STAGE-LEFT --group wall --key 'your-secret'
+```
+
+It is idempotent, so **re-running it is also how you update a node**. It works
+out the git remote's name rather than assuming `origin`, stashes any local edits
+instead of refusing to pull, fixes the executable bits itself, and preserves
+every other setting in `config.json` when it writes the group settings.
+
+Useful flags:
+
+| Flag | For |
+| --- | --- |
+| `--from-archive FILE` | Install from a tarball — no git, no network needed |
+| `--fresh-identity` | **Use this on a cloned SD card.** Regenerates machine-id |
+| `--dry-run` | Print every step and change nothing |
+| `--skip-install` | Set name and group only, skip the long install |
+
+Deploying by cloning a card that already works is the sensible route for units
+three onwards. Do it with `--name` and `--fresh-identity`, so the new unit gets
+its own hostname and its own machine-id rather than the original's.
 
 ### NDI SDK
 
