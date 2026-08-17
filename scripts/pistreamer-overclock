@@ -2,15 +2,25 @@
 #
 # Apply one of a fixed set of overclock presets to /boot/firmware/config.txt.
 #
-# Runs as root via a narrow sudoers rule. It accepts ONLY a preset name — no
-# arbitrary frequencies or voltages from the caller — because the caller is an
-# unauthenticated web GUI on the event network. Values come from the official
-# Raspberry Pi guidance, not from experiment.
+# This runs as ROOT, triggered by pistreamer-overclock.path when the service
+# drops a request file. It is deliberately NOT invoked via sudo: the service
+# unit sets NoNewPrivileges=yes, which blocks sudo for the service and every
+# child of it, so an escalation-based design could never work there. Instead
+# the unprivileged service writes a file it already owns and this root oneshot
+# picks it up — no privilege boundary crossed in the wrong direction.
 #
-#   pistreamer-overclock status
-#   pistreamer-overclock stock|mild|moderate|maximum
+# Only preset NAMES are accepted, never frequencies or voltages, because the
+# thing writing the request is an unauthenticated web GUI on an event network.
+#
+#   pistreamer-overclock status          # read-only, safe as any user
+#   pistreamer-overclock <preset>        # needs root
+#   pistreamer-overclock --from-request  # what the path unit calls
 #
 set -uo pipefail
+
+STATE_DIR="${PISTREAMER_STATE:-/var/lib/pistreamer}"
+REQUEST="${STATE_DIR}/overclock.request"
+RESULT="${STATE_DIR}/overclock.result"
 
 BOOT_DIR="/boot/firmware"
 [[ -d "${BOOT_DIR}" ]] || BOOT_DIR="/boot"
@@ -21,10 +31,8 @@ END="# --- end pi-streamer overclock ---"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 
-# Preset table. Stock Pi 4B is arm_freq=1500, gpu_freq=500, over_voltage=0.
-# over_voltage accepts -16..8. Newer Pi 4 revisions ship at 1800, so "mild"
-# may be a no-op or even a downclock on those — the status output reports the
-# measured maximum so the GUI can say so.
+# Values from the official Raspberry Pi overclocking guidance. Stock Pi 4B is
+# arm_freq=1500, gpu_freq=500, over_voltage=0; over_voltage accepts -16..8.
 preset_settings() {
   case "$1" in
     stock)    printf '' ;;
@@ -40,70 +48,98 @@ current_max_mhz() {
   [[ -r "${f}" ]] && echo $(( $(cat "${f}") / 1000 )) || echo 0
 }
 
-show_status() {
-  local applied="stock" block=""
+applied_preset() {
   if [[ -f "${CONFIG_TXT}" ]] && grep -qF "${BEGIN}" "${CONFIG_TXT}"; then
-    block="$(sed -n "/^${BEGIN}\$/,/^${END}\$/p" "${CONFIG_TXT}" | grep -E '^(arm_freq|over_voltage|gpu_freq)=' || true)"
-    applied="$(sed -n "/^${BEGIN}\$/,/^${END}\$/p" "${CONFIG_TXT}" | sed -n 's/^# preset: //p' | head -n1)"
-    [[ -n "${applied}" ]] || applied="custom"
+    local p
+    p="$(sed -n "/^${BEGIN}\$/,/^${END}\$/p" "${CONFIG_TXT}" | sed -n 's/^# preset: //p' | head -n1)"
+    printf '%s' "${p:-custom}"
+  else
+    printf 'stock'
   fi
-  printf 'preset=%s\n' "${applied}"
+}
+
+show_status() {
+  printf 'preset=%s\n' "$(applied_preset)"
   printf 'max_mhz=%s\n' "$(current_max_mhz)"
   printf 'config=%s\n' "${CONFIG_TXT}"
-  if [[ -n "${block}" ]]; then
-    printf 'settings=%s\n' "$(echo "${block}" | tr '\n' ' ')"
-  else
-    printf 'settings=\n'
+  local block=""
+  if [[ -f "${CONFIG_TXT}" ]]; then
+    block="$(sed -n "/^${BEGIN}\$/,/^${END}\$/p" "${CONFIG_TXT}" \
+      | grep -E '^(arm_freq|over_voltage|gpu_freq)=' | tr '\n' ' ' || true)"
   fi
-  # A board that has already flagged throttling should not be pushed further.
+  printf 'settings=%s\n' "${block}"
   if command -v vcgencmd >/dev/null 2>&1; then
     printf 'throttled=%s\n' "$(vcgencmd get_throttled | sed 's/throttled=//')"
   fi
 }
 
-[[ $# -ge 1 ]] || die "usage: pistreamer-overclock status|stock|mild|moderate|maximum"
+apply_preset() {
+  local preset="$1" settings
+  settings="$(preset_settings "${preset}")" || die "unknown preset: ${preset}"
+  [[ -f "${CONFIG_TXT}" ]] || die "no ${CONFIG_TXT} on this system"
+  [[ -w "${CONFIG_TXT}" ]] || die "cannot write ${CONFIG_TXT} (must run as root)"
 
-if [[ "$1" == "status" ]]; then
-  show_status
-  exit 0
-fi
+  [[ -f "${CONFIG_TXT}.pistreamer-oc.bak" ]] || cp -a "${CONFIG_TXT}" "${CONFIG_TXT}.pistreamer-oc.bak"
 
-PRESET="$1"
-SETTINGS="$(preset_settings "${PRESET}")" || die "unknown preset: ${PRESET}"
-[[ -f "${CONFIG_TXT}" ]] || die "no ${CONFIG_TXT} on this system"
-[[ -w "${CONFIG_TXT}" ]] || die "cannot write ${CONFIG_TXT} (run as root)"
+  local tmp
+  tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '${tmp}'" RETURN
+  sed "/^${BEGIN}\$/,/^${END}\$/d" "${CONFIG_TXT}" > "${tmp}"
 
-# One backup, kept from the first change ever made.
-[[ -f "${CONFIG_TXT}.pistreamer-oc.bak" ]] || cp -a "${CONFIG_TXT}" "${CONFIG_TXT}.pistreamer-oc.bak"
+  if [[ -n "${settings}" ]]; then
+    {
+      printf '\n%s\n' "${BEGIN}"
+      printf '# preset: %s\n' "${preset}"
+      printf '# Needs cooling and a genuine 3A supply. If the Diagnostics tab\n'
+      printf '# reports throttling or under-voltage, step back a preset.\n'
+      # '%s\n' and not '%s': $(...) strips the trailing newline, so without
+      # this the END marker is glued onto the last setting and the firmware
+      # sees "arm_freq=2000# --- end ...".
+      printf '%s\n' "${settings}"
+      printf '%s\n' "${END}"
+    } >> "${tmp}"
+  fi
 
-# Strip any previous managed block, then append the new one. Editing in place
-# with a delimited block means we never touch the user's own settings.
-TMP="$(mktemp)"
-trap 'rm -f "${TMP}"' EXIT
-sed "/^${BEGIN}\$/,/^${END}\$/d" "${CONFIG_TXT}" > "${TMP}"
+  # An empty config.txt is an unbootable Pi and an SD card in a card reader.
+  [[ -s "${tmp}" ]] || die "refusing to write an empty config.txt"
+  cat "${tmp}" > "${CONFIG_TXT}"
+  sync
+}
 
-if [[ -n "${SETTINGS}" ]]; then
-  {
-    printf '\n%s\n' "${BEGIN}"
-    printf '# preset: %s\n' "${PRESET}"
-    printf '# Overclocking needs cooling and a genuine 3A supply. If the\n'
-    printf '# Diagnostics tab reports throttling or under-voltage, step back.\n'
-    # printf '%s\n' and not '%s': $(...) strips the trailing newline, so
-    # without this the END marker gets glued onto the last setting and the
-    # firmware sees "arm_freq=2000# --- end ...".
-    printf '%s\n' "${SETTINGS}"
-    printf '%s\n' "${END}"
-  } >> "${TMP}"
-fi
+write_result() {
+  local ok="$1" preset="$2" message="$3"
+  printf '{"ok":%s,"preset":"%s","message":"%s","at":%s,"reboot_required":%s}\n' \
+    "${ok}" "${preset}" "${message//\"/}" "$(date +%s)" "${ok}" > "${RESULT}.tmp"
+  mv -f "${RESULT}.tmp" "${RESULT}"
+  chmod 0644 "${RESULT}" 2>/dev/null || true
+}
 
-# Never leave a truncated config.txt on the boot partition — that is an
-# unbootable Pi and an SD card in a card reader.
-if [[ ! -s "${TMP}" ]]; then
-  die "refusing to write an empty config.txt"
-fi
-cat "${TMP}" > "${CONFIG_TXT}"
-sync
+[[ $# -ge 1 ]] || die "usage: pistreamer-overclock status|--from-request|stock|mild|moderate|maximum"
 
-printf 'applied=%s\n' "${PRESET}"
-printf 'reboot_required=1\n'
-show_status
+case "$1" in
+  status)
+    show_status
+    ;;
+  --from-request)
+    [[ -f "${REQUEST}" ]] || exit 0
+    preset="$(tr -d '[:space:]' < "${REQUEST}" | head -c 32)"
+    rm -f "${REQUEST}"
+    if ! preset_settings "${preset}" >/dev/null 2>&1; then
+      write_result false "${preset}" "unknown preset"
+      die "unknown preset in request: ${preset}"
+    fi
+    if msg="$(apply_preset "${preset}" 2>&1)"; then
+      write_result true "${preset}" "applied; reboot to take effect"
+      printf 'applied %s\n' "${preset}"
+    else
+      write_result false "${preset}" "${msg}"
+      die "${msg}"
+    fi
+    ;;
+  *)
+    apply_preset "$1" || exit 1
+    printf 'applied=%s\nreboot_required=1\n' "$1"
+    show_status
+    ;;
+esac

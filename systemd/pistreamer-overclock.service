@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply a pi-streamer overclock preset to config.txt
+Documentation=man:systemd.service(5)
+
+[Service]
+Type=oneshot
+# Runs as root: it edits config.txt on the boot partition. It accepts only
+# preset names from the request file, never raw frequencies or voltages.
+ExecStart=/opt/pistreamer/bin/pistreamer-overclock --from-request

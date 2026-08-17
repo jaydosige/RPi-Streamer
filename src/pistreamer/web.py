@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import os
 import shutil
@@ -589,48 +591,95 @@ async def run_cue(cue_id: str) -> Dict[str, Any]:
 # Overclocking
 # ----------------------------------------------------------------------
 
-OVERCLOCK_HELPER = "/opt/pistreamer/bin/pistreamer-overclock"
-OVERCLOCK_PRESETS = ("stock", "mild", "moderate", "maximum")
-
-
-def _overclock(args: List[str]) -> Dict[str, Any]:
-    """Call the privileged helper. It only accepts preset names, never values."""
-    if not Path(OVERCLOCK_HELPER).exists():
-        return {"available": False, "error": f"{OVERCLOCK_HELPER} not installed"}
-    try:
-        proc = subprocess.run(
-            ["sudo", "-n", OVERCLOCK_HELPER, *args],
-            capture_output=True, text=True, timeout=20,
-        )
-    except (subprocess.SubprocessError, OSError) as exc:
-        return {"available": False, "error": str(exc)}
-    out: Dict[str, Any] = {"available": proc.returncode == 0}
-    if proc.returncode != 0:
-        out["error"] = (proc.stderr or proc.stdout).strip()
-    for line in proc.stdout.splitlines():
-        if "=" in line:
-            key, _, value = line.partition("=")
-            out[key.strip()] = value.strip()
-    return out
+OVERCLOCK_REQUEST = "overclock.request"
+OVERCLOCK_RESULT = "overclock.result"
 
 
 @app.get("/api/overclock")
 async def get_overclock() -> Dict[str, Any]:
-    data = _overclock(["status"])
-    data["presets"] = list(OVERCLOCK_PRESETS)
+    """Current preset, read straight from config.txt — no privilege needed."""
+    data = system.overclock_status()
+    result_path = config.STATE_DIR / OVERCLOCK_RESULT
+    if result_path.exists():
+        try:
+            data["last_result"] = json.loads(result_path.read_text())
+        except (OSError, ValueError):
+            pass
+    unit = Path("/etc/systemd/system/pistreamer-overclock.path")
+    data["writable"] = unit.exists()
+    if not data["writable"]:
+        data["error"] = (
+            "the overclock helper unit is not installed — re-run install.sh. "
+            "(It is path-activated rather than sudo-based: the service sets "
+            "NoNewPrivileges, which blocks sudo entirely.)"
+        )
     return data
 
 
 @app.post("/api/overclock")
 async def post_overclock(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Request a preset by dropping a file a root path-unit is watching.
+
+    The service cannot escalate — NoNewPrivileges=yes — so it writes a request
+    it already owns and a root oneshot applies it. We then wait briefly for the
+    result file so the GUI can report success or failure rather than shrugging.
+    """
     preset = str(body.get("preset", ""))
-    if preset not in OVERCLOCK_PRESETS:
-        raise HTTPException(400, f"preset must be one of: {', '.join(OVERCLOCK_PRESETS)}")
-    data = _overclock([preset])
-    if not data.get("available"):
-        raise HTTPException(500, data.get("error", "overclock helper failed"))
-    data["reboot_required"] = True
-    return data
+    if preset not in system.OVERCLOCK_PRESETS:
+        raise HTTPException(
+            400, f"preset must be one of: {', '.join(system.OVERCLOCK_PRESETS)}"
+        )
+
+    result_path = config.STATE_DIR / OVERCLOCK_RESULT
+    request_path = config.STATE_DIR / OVERCLOCK_REQUEST
+    before = result_path.stat().st_mtime if result_path.exists() else 0
+    try:
+        config.STATE_DIR.mkdir(parents=True, exist_ok=True)
+        request_path.write_text(preset + "\n")
+    except OSError as exc:
+        raise HTTPException(500, f"could not write the request: {exc}") from exc
+
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        await asyncio.sleep(0.4)
+        if result_path.exists() and result_path.stat().st_mtime > before:
+            try:
+                result = json.loads(result_path.read_text())
+            except (OSError, ValueError):
+                continue
+            if not result.get("ok"):
+                raise HTTPException(500, result.get("message") or "overclock failed")
+            return {**system.overclock_status(), "last_result": result,
+                    "reboot_required": True}
+
+    raise HTTPException(
+        504,
+        "the overclock helper did not respond. Check "
+        "'systemctl status pistreamer-overclock.path' — it may not be enabled.",
+    )
+
+
+# ----------------------------------------------------------------------
+# Audio devices
+# ----------------------------------------------------------------------
+
+
+@app.get("/api/audio/devices")
+async def get_audio_devices() -> Dict[str, Any]:
+    """What we can actually play to. Guessing this is why audio 'does not work'."""
+    return system.audio_devices()
+
+
+@app.post("/api/audio/test")
+async def post_audio_test(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Play a tone to a device so the choice can be confirmed, not guessed."""
+    device = str(body.get("device", ""))
+    result = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: system.test_tone(device, int(body.get("seconds", 2)))
+    )
+    if not result.get("ok"):
+        raise HTTPException(500, result.get("error") or "test tone failed")
+    return result
 
 
 # ----------------------------------------------------------------------

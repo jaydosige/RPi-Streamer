@@ -553,3 +553,154 @@ def summary() -> dict:
         "versions": versions(),
         "time": time.time(),
     }
+
+
+# ----------------------------------------------------------------------
+# Overclocking and audio devices
+# ----------------------------------------------------------------------
+
+_OC_BEGIN = "# --- pi-streamer overclock (managed, do not edit inside) ---"
+_OC_END = "# --- end pi-streamer overclock ---"
+OVERCLOCK_PRESETS = ("stock", "mild", "moderate", "maximum")
+
+
+def boot_config_path() -> Path:
+    for candidate in (Path("/boot/firmware/config.txt"), Path("/boot/config.txt")):
+        if candidate.exists():
+            return candidate
+    return Path("/boot/firmware/config.txt")
+
+
+def overclock_status() -> Dict[str, object]:
+    """Read the applied preset straight from config.txt.
+
+    Reading needs no privilege — config.txt is world-readable — so only the
+    *write* path goes through the root helper. That keeps the common case
+    (showing the current state) free of any escalation machinery.
+    """
+    path = boot_config_path()
+    out: Dict[str, object] = {
+        "preset": "stock",
+        "settings": {},
+        "config": str(path),
+        "max_mhz": None,
+        "available": path.exists(),
+        "presets": list(OVERCLOCK_PRESETS),
+    }
+    freq = cpu_freq()
+    out["max_mhz"] = freq.get("max")
+    if not path.exists():
+        out["error"] = f"{path} not found — is this a Raspberry Pi?"
+        return out
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as exc:
+        out["error"] = str(exc)
+        return out
+
+    inside = False
+    settings: Dict[str, str] = {}
+    preset = "stock"
+    for line in lines:
+        if line.strip() == _OC_BEGIN:
+            inside = True
+            preset = "custom"
+            continue
+        if line.strip() == _OC_END:
+            inside = False
+            continue
+        if not inside:
+            continue
+        if line.startswith("# preset:"):
+            preset = line.split(":", 1)[1].strip() or "custom"
+        elif "=" in line and not line.lstrip().startswith("#"):
+            key, _, value = line.partition("=")
+            settings[key.strip()] = value.strip()
+    out["preset"] = preset
+    out["settings"] = settings
+    return out
+
+
+def audio_devices() -> Dict[str, object]:
+    """Enumerate what we can actually play audio to.
+
+    Guessing an ALSA device name is the single most common reason "audio does
+    not work" on a Pi: the HDMI outputs are separate cards (vc4hdmi0/1) and
+    "default" often is not one of them. So list the real names, with the
+    descriptions ALSA gives, and let the GUI offer them.
+    """
+    out: Dict[str, object] = {"alsa": [], "cards": [], "mpv": [], "error": ""}
+
+    try:
+        cards = Path("/proc/asound/cards").read_text()
+        for line in cards.splitlines():
+            line = line.strip()
+            m = re.match(r"^(\d+)\s+\[([^\]]+)\]:\s*(.*)$", line)
+            if m:
+                out["cards"].append(
+                    {"index": int(m.group(1)), "id": m.group(2).strip(), "name": m.group(3).strip()}
+                )
+    except OSError:
+        pass
+
+    if shutil.which("aplay"):
+        try:
+            proc = subprocess.run(["aplay", "-L"], capture_output=True, text=True, timeout=10)
+            name, desc = None, []
+            for raw in proc.stdout.splitlines():
+                if not raw.strip():
+                    continue
+                if not raw.startswith((" ", "\t")):
+                    if name:
+                        out["alsa"].append({"device": name, "description": " ".join(desc).strip()})
+                    name, desc = raw.strip(), []
+                else:
+                    desc.append(raw.strip())
+            if name:
+                out["alsa"].append({"device": name, "description": " ".join(desc).strip()})
+        except (subprocess.SubprocessError, OSError) as exc:
+            out["error"] = f"aplay -L failed: {exc}"
+    else:
+        out["error"] = "aplay not installed (alsa-utils)"
+
+    # mpv keeps its own device list and its own naming, so local playback
+    # needs those names rather than the raw ALSA ones.
+    if shutil.which("mpv"):
+        try:
+            proc = subprocess.run(
+                ["mpv", "--audio-device=help"], capture_output=True, text=True, timeout=10
+            )
+            for raw in proc.stdout.splitlines():
+                m = re.match(r"^\s*'([^']+)'\s*\((.*)\)\s*$", raw)
+                if m:
+                    out["mpv"].append({"device": m.group(1), "description": m.group(2)})
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+    # Prefer HDMI: on a Pi that is nearly always what is wanted, and it is
+    # never the ALSA default.
+    hdmi = [d for d in out["alsa"] if "vc4hdmi" in d["device"].lower()]
+    out["suggested"] = hdmi[0]["device"] if hdmi else ""
+    return out
+
+
+def test_tone(device: str = "", seconds: int = 2) -> Dict[str, object]:
+    """Play a short tone so a device choice can be confirmed, not guessed."""
+    if not shutil.which("speaker-test"):
+        return {"ok": False, "error": "speaker-test not installed (alsa-utils)"}
+    cmd = ["speaker-test", "-t", "sine", "-f", "440", "-l", "1", "-p", str(max(1, seconds) * 1000)]
+    if device:
+        cmd += ["-D", device]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=max(5, seconds + 8))
+        ok = proc.returncode == 0
+        return {
+            "ok": ok,
+            "device": device or "default",
+            "output": (proc.stdout + proc.stderr).strip()[-1200:],
+            "error": "" if ok else "speaker-test reported a failure",
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "device": device or "default", "error": "timed out"}
+    except (subprocess.SubprocessError, OSError) as exc:
+        return {"ok": False, "device": device or "default", "error": str(exc)}

@@ -361,9 +361,24 @@
         <input type="text" id="plName" placeholder="Doors Open">
       </label>
       <label class="field">
-        <span class="lbl">Items &mdash; tick to include, drag not supported; order follows the list</span>
-        <div id="plItems" style="max-height:260px;overflow:auto"></div>
+        <span class="lbl">Running order &mdash; plays top to bottom</span>
+        <div id="plItems"></div>
       </label>
+      <div class="row" style="margin-bottom:14px">
+        <select id="plAddKind" style="width:auto">
+          <option value="file">Media file</option>
+          <option value="ndi">NDI source</option>
+        </select>
+        <select id="plAddTarget" style="width:auto;max-width:320px"></select>
+        <input type="number" id="plAddDuration" placeholder="secs" min="1" max="86400"
+               style="width:90px">
+        <button class="btn" id="btnAddItem">Add to playlist</button>
+      </div>
+      <div class="host" style="margin:-8px 0 14px">
+        Leave the duration blank for a video to play it to its end. An NDI source
+        has no natural end, so it needs one. Mixing NDI into a playlist means each
+        item is a separate process, so expect a brief black frame between items.
+      </div>
       <div class="checkline">
         <input type="checkbox" id="plLoop"><label for="plLoop">Loop forever</label>
       </div>
@@ -410,9 +425,26 @@
         <input type="checkbox" id="cfgAudioEnabled"><label for="cfgAudioEnabled">Audio enabled</label>
       </div>
       <label class="field">
-        <span class="lbl">ALSA device (blank = system default)</span>
-        <input type="text" id="cfgAudioDevice" placeholder="hw:CARD=vc4hdmi0,DEV=0">
+        <span class="lbl">Output device for NDI (ALSA) &mdash; HDMI is a separate card, and rarely the default</span>
+        <select id="cfgAudioDevice"></select>
       </label>
+      <label class="field">
+        <span class="lbl">Output device for local media (mpv names these differently)</span>
+        <select id="cfgAudioDeviceMpv"></select>
+      </label>
+      <div class="row" style="margin-bottom:14px">
+        <button class="btn" id="btnTestTone">Play a test tone</button>
+        <span class="host" id="toneNote"></span>
+      </div>
+      <div class="checkline">
+        <input type="checkbox" id="cfgAudioSync">
+        <label for="cfgAudioSync">Pace audio on the pipeline clock (leave on)</label>
+      </div>
+      <div class="host" style="margin:-6px 0 14px">
+        Off writes to the sound card as fast as data arrives, which causes
+        crackle and drift. Only turn it off to test.
+      </div>
+      <div id="audioCards" class="kvs" style="margin-bottom:6px"></div>
       <label class="field">
         <span class="lbl">Volume &mdash; local playback only &mdash; <span id="volLabel">100</span>%</span>
         <input type="range" id="cfgVolume" min="0" max="100">
@@ -841,7 +873,7 @@ document.querySelectorAll("nav button").forEach((btn) => {
     btn.classList.add("active");
     $("tab-" + btn.dataset.tab).classList.add("active");
     if (btn.dataset.tab === "media") { loadMedia(); loadPlaylists(); }
-    if (btn.dataset.tab === "display") loadConnectors();
+    if (btn.dataset.tab === "display") { loadConnectors(); loadAudioDevices(); }
     if (btn.dataset.tab === "diag") loadTelemetry();
     if (btn.dataset.tab === "perf") loadPerf();
     if (btn.dataset.tab === "ndi") loadNdiNetwork();
@@ -985,8 +1017,30 @@ function renderStream(st, p) {
     return;
   }
   if (p.mode === "local") {
-    grid.innerHTML = `<div class="empty">Local playback runs through mpv, which does not report frame statistics here.</div>`;
-    note.textContent = "";
+    if (!st || st.backend !== "mpv") {
+      grid.innerHTML = `<div class="empty">Waiting for mpv to report…</div>`;
+      note.textContent = "";
+      return;
+    }
+    const pos = st.position != null ? fmtDuration(st.position) : "—";
+    const dur = st.duration != null ? fmtDuration(st.duration) : "—";
+    const tiles = [
+      ["Playing", st.file || "—",
+        { sub: st.playlist_count > 1 ? `item ${st.playlist_position} of ${st.playlist_count}` : null }],
+      ["Position", pos, { sub: st.duration != null ? `of ${dur}` : null }],
+      ["Frame rate", st.fps != null ? st.fps.toFixed(1) + "<small> fps</small>" : "—",
+        { sub: st.declared_fps ? `file says ${Number(st.declared_fps).toFixed(2)}` : null }],
+      ["Resolution", (st.width && st.height) ? `${st.width}×${st.height}` : "—",
+        { sub: st.format || null }],
+      ["Decoder", st.hardware_decode ? st.decoder : "software",
+        { sub: st.hardware_decode ? "hardware" : "CPU" }],
+      ["Frames dropped", st.dropped != null ? st.dropped.toLocaleString() : "—",
+        { sub: st.decoder_dropped ? `${st.decoder_dropped} in the decoder` : null }],
+      ["Audio", st.audio_codec || "none",
+        { sub: st.muted ? "muted" : (st.audio_device || null) }],
+    ];
+    grid.innerHTML = tiles.map(([k, v, o]) => tile(k, v, o)).join("");
+    note.textContent = st.buffering ? "Buffering — reading from disk is not keeping up." : "";
     return;
   }
   if (!st || st.fps === undefined) {
@@ -1028,7 +1082,7 @@ function renderStream(st, p) {
 function applyConfigToForm(c) {
   $("cfgRotation").value = String(c.rotation);
   $("cfgAudioEnabled").checked = c.audio_enabled;
-  $("cfgAudioDevice").value = c.audio_device;
+  $("cfgAudioSync").checked = c.audio_sync;
   $("cfgVolume").value = c.volume;
   $("volLabel").textContent = c.volume;
   $("cfgBandwidth").value = c.ndi_bandwidth;
@@ -1057,6 +1111,7 @@ async function loadPlaylists() {
         <div class="meta">
           <div class="name">${p.name}</div>
           <div class="sub">${p.items.length} item${p.items.length === 1 ? "" : "s"}${
+            p.items.some((i) => i.type === "ndi") ? " · includes NDI" : ""}${
             p.loop ? " · loop" : ""}${p.shuffle ? " · shuffle" : ""} · stills ${p.image_duration}s</div>
         </div>
         <button class="btn primary" data-plplay="${encodeURIComponent(p.name)}">Play</button>
@@ -1089,30 +1144,93 @@ async function loadPlaylists() {
   window.__mediaFiles = files;
 }
 
-function editPlaylist(pl, files) {
+let PL_ITEMS = [];
+
+async function editPlaylist(pl, files) {
   files = files || window.__mediaFiles || [];
   EDITING_PLAYLIST = pl ? pl.name : null;
+  PL_ITEMS = pl ? pl.items.map((i) => ({ ...i })) : [];
   $("playlistEditor").style.display = "";
   $("plName").value = pl ? pl.name : "";
   $("plLoop").checked = pl ? pl.loop : true;
   $("plShuffle").checked = pl ? pl.shuffle : false;
   $("plDuration").value = pl ? pl.image_duration : 10;
-  const chosen = new Set(pl ? pl.items : []);
-  $("plItems").innerHTML = files.length
-    ? files.map((f) => `<div class="checkline">
-        <input type="checkbox" class="plitem" value="${f.name}" ${chosen.has(f.name) ? "checked" : ""}>
-        <label>${f.name} <span class="host">(${f.kind})</span></label></div>`).join("")
-    : `<div class="empty">Upload some media first.</div>`;
+  await refreshAddTargets();
+  renderPlItems();
   $("playlistEditor").scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
+
+function renderPlItems() {
+  if (!PL_ITEMS.length) {
+    $("plItems").innerHTML = `<div class="empty">Nothing in this playlist yet — add items below.</div>`;
+    return;
+  }
+  $("plItems").innerHTML = `<ul class="list">${PL_ITEMS.map((it, i) => `
+    <li>
+      <div class="meta">
+        <div class="name">${i + 1}. ${it.target}</div>
+        <div class="sub">${it.type === "ndi" ? "NDI source" : "media file"}${
+          it.duration ? ` · ${it.duration}s` : " · plays to end"}</div>
+      </div>
+      <button class="btn" data-plup="${i}" ${i === 0 ? "disabled" : ""} title="Move up">↑</button>
+      <button class="btn" data-pldown="${i}" ${
+        i === PL_ITEMS.length - 1 ? "disabled" : ""} title="Move down">↓</button>
+      <button class="btn danger" data-plrm="${i}" title="Remove">✕</button>
+    </li>`).join("")}</ul>`;
+
+  $("plItems").querySelectorAll("[data-plup]").forEach((b) => {
+    b.onclick = () => { const i = +b.dataset.plup;
+      [PL_ITEMS[i - 1], PL_ITEMS[i]] = [PL_ITEMS[i], PL_ITEMS[i - 1]]; renderPlItems(); };
+  });
+  $("plItems").querySelectorAll("[data-pldown]").forEach((b) => {
+    b.onclick = () => { const i = +b.dataset.pldown;
+      [PL_ITEMS[i + 1], PL_ITEMS[i]] = [PL_ITEMS[i], PL_ITEMS[i + 1]]; renderPlItems(); };
+  });
+  $("plItems").querySelectorAll("[data-plrm]").forEach((b) => {
+    b.onclick = () => { PL_ITEMS.splice(+b.dataset.plrm, 1); renderPlItems(); };
+  });
+}
+
+async function refreshAddTargets() {
+  const kind = $("plAddKind").value;
+  let options = [];
+  try {
+    options = kind === "ndi"
+      ? (await api("/api/ndi/sources")).sources.map((s) => s.name)
+      : (await api("/api/media")).files.map((f) => `${f.name}`);
+  } catch (_) { /* best effort */ }
+  $("plAddTarget").innerHTML = options.length
+    ? options.map((o) => `<option value="${o}">${o}</option>`).join("")
+    : `<option value="">${kind === "ndi" ? "no NDI sources visible" : "no media uploaded"}</option>`;
+  // Short placeholders: the box is narrow enough that a longer string is
+  // clipped mid-word, which reads like a rendering fault.
+  $("plAddDuration").placeholder = kind === "ndi" ? "secs *" : "secs";
+  $("plAddDuration").title = kind === "ndi"
+    ? "Required for NDI — how long to hold this source"
+    : "Optional — blank plays a video to its end";
+}
+$("plAddKind").onchange = refreshAddTargets;
+
+$("btnAddItem").onclick = () => {
+  const target = $("plAddTarget").value;
+  if (!target) { toast("Nothing to add", true); return; }
+  const raw = parseInt($("plAddDuration").value, 10);
+  const duration = Number.isFinite(raw) && raw > 0 ? raw : null;
+  const kind = $("plAddKind").value;
+  if (kind === "ndi" && !duration) {
+    toast("An NDI item needs a duration — it has no natural end", true); return;
+  }
+  PL_ITEMS.push({ type: kind, target, duration });
+  $("plAddDuration").value = "";
+  renderPlItems();
+};
 
 $("btnNewPlaylist").onclick = () => editPlaylist(null);
 $("btnCancelPlaylist").onclick = () => { $("playlistEditor").style.display = "none"; };
 $("btnSavePlaylist").onclick = async () => {
-  const items = [...document.querySelectorAll(".plitem:checked")].map((c) => c.value);
   try {
     await post("/api/playlists", {
-      name: $("plName").value.trim(), items,
+      name: $("plName").value.trim(), items: PL_ITEMS,
       loop: $("plLoop").checked, shuffle: $("plShuffle").checked,
       image_duration: parseInt($("plDuration").value, 10) || 10,
     });
@@ -1880,6 +1998,43 @@ $("btnPlayAll").onclick = async () => {
 
 // ---------- display ----------
 
+async function loadAudioDevices() {
+  let a;
+  try { a = await api("/api/audio/devices"); } catch (_) { return; }
+  const cur = STATE ? STATE.config.audio_device : "";
+  const curMpv = STATE ? STATE.config.audio_device_mpv : "";
+  const opt = (v, label, sel) =>
+    `<option value="${v}"${v === sel ? " selected" : ""}>${label}</option>`;
+
+  $("cfgAudioDevice").innerHTML = opt("", "System default", cur) +
+    a.alsa.map((d) => opt(d.device,
+      d.device + (d.description ? ` — ${d.description.slice(0, 60)}` : ""), cur)).join("");
+  $("cfgAudioDeviceMpv").innerHTML = opt("", "Same as ALSA / mpv default", curMpv) +
+    a.mpv.map((d) => opt(d.device,
+      d.device + (d.description ? ` — ${d.description.slice(0, 60)}` : ""), curMpv)).join("");
+
+  $("audioCards").innerHTML = kvs([
+    ["Sound cards", a.cards.length ? a.cards.map((c) => `${c.id} (${c.name})`).join(", ") : "none found"],
+    ["Suggested for HDMI", a.suggested || "not detected"],
+    ["Discovery problem", a.error || null],
+  ]);
+  if (a.suggested && !cur) {
+    $("toneNote").textContent = `HDMI looks like ${a.suggested} — select it and test.`;
+  }
+}
+
+$("btnTestTone").onclick = async () => {
+  $("btnTestTone").disabled = true;
+  $("toneNote").textContent = "playing a 440 Hz tone…";
+  try {
+    const r = await post("/api/audio/test", { device: $("cfgAudioDevice").value, seconds: 2 });
+    $("toneNote").textContent = `Tone sent to ${r.device}. Heard it? Then save.`;
+  } catch (err) {
+    $("toneNote").textContent = "";
+    toast(err.message, true);
+  } finally { $("btnTestTone").disabled = false; }
+};
+
 async function loadConnectors() {
   try {
     const data = await api("/api/display/connectors");
@@ -1918,7 +2073,9 @@ $("btnSaveDisplay").onclick = async () => {
       video_mode: $("cfgMode").value,
       rotation: parseInt($("cfgRotation").value, 10),
       audio_enabled: $("cfgAudioEnabled").checked,
-      audio_device: $("cfgAudioDevice").value.trim(),
+      audio_sync: $("cfgAudioSync").checked,
+      audio_device: $("cfgAudioDevice").value,
+      audio_device_mpv: $("cfgAudioDeviceMpv").value,
       volume: parseInt($("cfgVolume").value, 10),
       ndi_bandwidth: $("cfgBandwidth").value,
       ndi_latency_ms: parseInt($("cfgLatency").value, 10) || 0,

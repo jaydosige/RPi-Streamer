@@ -1,6 +1,8 @@
 {
   "audio_device": "",
+  "audio_device_mpv": "",
   "audio_enabled": true,
+  "audio_sync": true,
   "autostart": true,
   "connector": "",
   "convert_threads": 0,

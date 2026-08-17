@@ -78,20 +78,20 @@ install -d "${PISTREAMER_HOME}/bin"
 install -m 0755 "${REPO_DIR}/scripts/pistreamer-tuning" "${PISTREAMER_HOME}/bin/pistreamer-tuning"
 install -m 0755 "${REPO_DIR}/scripts/pistreamer-overclock" "${PISTREAMER_HOME}/bin/pistreamer-overclock"
 
-# Overclocking edits config.txt on the boot partition, which needs root. The
-# service does not run as root, so grant exactly one command and nothing else.
-# The helper takes only preset NAMES, never frequencies or voltages, because
-# the caller is an unauthenticated web GUI on the event network.
-cat > /etc/sudoers.d/pistreamer-overclock <<EOF
-${PISTREAMER_USER} ALL=(root) NOPASSWD: ${PISTREAMER_HOME}/bin/pistreamer-overclock
-EOF
-chmod 0440 /etc/sudoers.d/pistreamer-overclock
-if visudo -c -f /etc/sudoers.d/pistreamer-overclock >/dev/null 2>&1; then
-  ok "overclock helper installed (sudoers rule limited to that one command)"
-else
-  rm -f /etc/sudoers.d/pistreamer-overclock
-  warn "sudoers rule failed validation and was removed; overclocking will be unavailable"
-fi
+# Overclocking edits config.txt, which needs root. The service cannot escalate
+# — its unit sets NoNewPrivileges=yes, which blocks sudo for the service and
+# every child — so this is done with path activation instead: the service
+# writes a request file it owns, and a root oneshot picks it up.
+rm -f /etc/sudoers.d/pistreamer-overclock   # remove the old, unusable approach
+install -m 0644 "${REPO_DIR}/systemd/pistreamer-overclock.service" \
+  /etc/systemd/system/pistreamer-overclock.service
+install -m 0644 "${REPO_DIR}/systemd/pistreamer-overclock.path" \
+  /etc/systemd/system/pistreamer-overclock.path
+systemctl daemon-reload
+systemctl enable --now pistreamer-overclock.path >/dev/null 2>&1 \
+  && ok "overclock helper armed (path-activated, no sudo)" \
+  || warn "could not enable pistreamer-overclock.path; overclocking will be unavailable"
+
 if [[ ! -f "${PISTREAMER_CONFIG_DIR}/tuning.conf" ]]; then
   cat > "${PISTREAMER_CONFIG_DIR}/tuning.conf" <<'EOF'
 # Host tuning applied at boot by pistreamer-tuning.service.

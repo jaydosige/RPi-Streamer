@@ -46,6 +46,12 @@ class Config:
     # ALSA device string, "" = default. e.g. "hw:CARD=vc4hdmi0,DEV=0"
     audio_device: str = ""
     audio_enabled: bool = True
+    # Pace audio on the pipeline clock. On means correct timing; off writes to
+    # ALSA as fast as buffers arrive, which is what causes crackle and drift.
+    audio_sync: bool = True
+    # mpv names audio devices differently from ALSA, so local playback needs
+    # its own value. Blank uses mpv's default.
+    audio_device_mpv: str = ""
     volume: int = 100  # 0-100, applied to local playback only
 
     # --- ndi tuning ---

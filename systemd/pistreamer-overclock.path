@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch for a pi-streamer overclock request
+Documentation=man:systemd.path(5)
+
+[Path]
+# The service writes this file; this unit notices and runs the root oneshot.
+# Path activation is used instead of sudo because pistreamer.service sets
+# NoNewPrivileges=yes, which makes any sudo-based escalation impossible.
+PathExists=/var/lib/pistreamer/overclock.request
+Unit=pistreamer-overclock.service
+
+[Install]
+WantedBy=multi-user.target

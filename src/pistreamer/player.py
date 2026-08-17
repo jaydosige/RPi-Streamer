@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Deque, List, Optional
 
-from . import config, display, media, playlists, sources
+from . import config, display, media, mpvipc, playlists, sources
 
 log = logging.getLogger(__name__)
 
@@ -100,6 +100,11 @@ def _bandwidth_value(setting: str) -> int:
     return {"highest": 100, "lowest": 0}.get(setting, 100)
 
 
+def mpv_socket() -> Path:
+    """Where mpv listens for JSON IPC, so local playback can be measured."""
+    return config.STATE_DIR / "mpv.sock"
+
+
 def snapshot_path() -> Path:
     """Where the running pipeline keeps the most recent frame."""
     return config.STATE_DIR / "lastframe.jpg"
@@ -157,6 +162,12 @@ class Player:
         # True while the standby screen is covering for a lost source.
         self._fallback = False
         self._next_attempt = 0.0
+        # Playlist sequencer: used when a playlist mixes NDI with files, or
+        # sets explicit durations, so mpv alone cannot play it.
+        self._segments: List[dict] = []
+        self._segment_idx = 0
+        self._segment_deadline: Optional[float] = None
+        self._segment_loop = True
 
     # ------------------------------------------------------------------
     # Command construction
@@ -279,6 +290,7 @@ class Player:
             "mpv",
             "--no-config",
             "--no-terminal",
+            f"--input-ipc-server={mpv_socket()}",
             "--msg-level=all=warn",
             "--fullscreen",
             "--vo=gpu",
@@ -299,7 +311,11 @@ class Player:
             cmd.append("--loop-playlist=inf")
         if cfg.audio_enabled:
             cmd.append(f"--volume={max(0, min(100, cfg.volume))}")
-            if cfg.audio_device:
+            # mpv's device names are its own; if one has been chosen use it
+            # verbatim, otherwise derive an alsa/ name from the ALSA device.
+            if cfg.audio_device_mpv:
+                cmd.append(f"--audio-device={cfg.audio_device_mpv}")
+            elif cfg.audio_device:
                 cmd.append(f"--audio-device=alsa/{cfg.audio_device}")
         else:
             cmd.append("--no-audio")
@@ -329,6 +345,7 @@ class Player:
             "driver_name": display.drm_driver_for(conn_name) if conn_name else None,
             "audio": cfg.audio_enabled,
             "audio_device": cfg.audio_device,
+            "audio_sync": cfg.audio_sync,
             "stats_interval": 1.0,
             "color_format": cfg.ndi_color_format,
             "max_queue": cfg.ndi_max_queue,
@@ -388,6 +405,68 @@ class Player:
             "stats_interval": 5.0,
         }
         return [sys.executable, "-m", "pistreamer.runner", json.dumps(spec)]
+
+    def _segment_command(self, cfg: config.Config, segment: dict) -> List[str]:
+        """The command for a single playlist segment."""
+        if segment["type"] == "ndi":
+            return self._runner_command(cfg, segment["target"])
+        conn = display.pick_connector(cfg.connector)
+        cmd = [
+            "mpv", "--no-config", "--no-terminal", "--msg-level=all=warn",
+            f"--input-ipc-server={mpv_socket()}",
+            "--fullscreen", "--vo=gpu", "--gpu-context=drm",
+            "--hwdec=auto-safe", "--keep-open=no",
+            f"--image-display-duration={segment['duration'] or 10}",
+        ]
+        if conn:
+            cmd.append(f"--drm-connector={conn.name}")
+        if cfg.video_mode:
+            cmd.append(f"--drm-mode={cfg.video_mode}")
+        if cfg.rotation:
+            cmd.append(f"--video-rotate={cfg.rotation}")
+        if cfg.audio_enabled:
+            cmd.append(f"--volume={max(0, min(100, cfg.volume))}")
+            if cfg.audio_device_mpv:
+                cmd.append(f"--audio-device={cfg.audio_device_mpv}")
+            elif cfg.audio_device:
+                cmd.append(f"--audio-device=alsa/{cfg.audio_device}")
+        else:
+            cmd.append("--no-audio")
+        # A duration on a video means cut it short; images are handled by
+        # --image-display-duration above.
+        if segment["duration"] and not segment["image"]:
+            cmd.append(f"--length={segment['duration']}")
+        cmd += ["--", segment["path"]]
+        return cmd
+
+    def _start_segment(self, cfg: config.Config, idx: int) -> None:
+        """Play segment `idx`, wrapping round if the playlist loops."""
+        if not self._segments:
+            raise RuntimeError("playlist has no playable segments")
+        if idx >= len(self._segments):
+            if not self._segment_loop:
+                log.info("playlist finished; going to standby")
+                self._segments = []
+                self.apply(MODE_IDLE)
+                return
+            idx = 0
+        self._segment_idx = idx
+        segment = self._segments[idx]
+        self._terminate()
+        label = segment["target"] or segment.get("path", "")
+        log.info(
+            "playlist segment %d/%d: %s %s",
+            idx + 1, len(self._segments), segment["type"], label,
+        )
+        self._status.target = f"{label} ({idx + 1}/{len(self._segments)})"
+        self._spawn_command(self._segment_command(cfg, segment), f"segment {idx + 1}")
+        # An NDI segment never ends by itself, and a video cut short by
+        # --length still exits on its own, so only timed segments need a
+        # deadline. A little slack keeps us from cutting a file off early.
+        if segment["type"] == "ndi" or segment["image"]:
+            self._segment_deadline = time.monotonic() + (segment["duration"] or 30)
+        else:
+            self._segment_deadline = None
 
     def _build_command(self, cfg: config.Config, mode: str, target: str) -> List[str]:
         if mode == MODE_IDLE:
@@ -449,6 +528,23 @@ class Player:
         except (OSError, ValueError):
             pass
 
+    def _poll_mpv(self, proc: subprocess.Popen) -> None:
+        """Fill stream stats from mpv while it runs.
+
+        mpv creates its IPC socket a moment after starting, so the first few
+        attempts are expected to fail; we simply keep trying until the process
+        goes away.
+        """
+        sock = str(mpv_socket())
+        while proc.poll() is None and not self._stop_event.is_set():
+            stats = mpvipc.to_stats(mpvipc.query(sock))
+            if stats:
+                stats["t"] = time.time()
+                with self._lock:
+                    self._stream_stats = stats
+            if self._stop_event.wait(1.0):
+                break
+
     def stream_stats(self) -> dict:
         """Latest per-second stats from the runner, or {} on the fallback path."""
         with self._lock:
@@ -488,6 +584,16 @@ class Player:
             target=self._drain_stats, args=(proc,), daemon=True
         )
         self._stats_reader.start()
+        if cmd and cmd[0] == "mpv":
+            # Stale socket from a previous run would make the first polls
+            # answer for a process that no longer exists.
+            try:
+                mpv_socket().unlink(missing_ok=True)
+            except OSError:
+                pass
+            threading.Thread(
+                target=self._poll_mpv, args=(proc,), name="mpv-stats", daemon=True
+            ).start()
 
     def _terminate(self, timeout: float = 5.0) -> None:
         """Stop the current process and wait for it to release the display."""
@@ -555,6 +661,25 @@ class Player:
             self._status.target = target
             self._fallback = False
             self._status.fallback = False
+            self._segments = []
+            self._segment_deadline = None
+            try:
+                if mode == MODE_LOCAL and cfg_playlist_needs_sequencer():
+                    cfg = config.load()
+                    self._segments = playlists.resolved_segments(cfg.local_playlist)
+                    if not self._segments:
+                        raise RuntimeError(
+                            f"playlist {cfg.local_playlist!r} has no playable segments"
+                        )
+                    playlist = playlists.get(cfg.local_playlist)
+                    self._segment_loop = playlist.loop if playlist else True
+                    self._start_segment(cfg, 0)
+                    return
+            except Exception as exc:  # noqa: BLE001
+                self._status.last_error = str(exc)
+                self._status.running = False
+                log.error("failed to start playlist: %s", exc)
+                return
             try:
                 self._spawn(config.load(), mode, target)
             except Exception as exc:  # noqa: BLE001 - surfaced to the GUI
@@ -652,6 +777,11 @@ class Player:
             alive = proc is not None and proc.poll() is None
 
             if alive:
+                # A timed segment ends on the clock, not on process exit.
+                if self._segments and self._segment_deadline is not None:
+                    if time.monotonic() >= self._segment_deadline:
+                        self._start_segment(cfg, self._segment_idx + 1)
+                        return
                 if self._fallback:
                     # Standby is on screen. Check periodically whether the
                     # real source is back.
@@ -684,6 +814,20 @@ class Player:
                     self._status.last_error = str(exc)
                 return
 
+            # In playlist mode a process exiting means the segment finished.
+            if self._segments:
+                if proc is not None and proc.returncode not in (0, None):
+                    log.warning(
+                        "segment %d exited with %s; advancing anyway",
+                        self._segment_idx + 1, proc.returncode,
+                    )
+                try:
+                    self._start_segment(cfg, self._segment_idx + 1)
+                except Exception as exc:  # noqa: BLE001
+                    self._status.last_error = str(exc)
+                    log.error("could not advance the playlist: %s", exc)
+                return
+
             self._status.restarts += 1
 
             if self._fallback:
@@ -712,6 +856,20 @@ class Player:
             except Exception as exc:  # noqa: BLE001
                 self._status.last_error = str(exc)
                 log.error("restart failed: %s", exc)
+
+
+def cfg_playlist_needs_sequencer() -> bool:
+    """Does the configured playlist need segment-by-segment playback?
+
+    Kept as a helper so the decision — and the reason for it — lives in one
+    place: mpv can play a list of files smoothly, but it knows nothing about
+    NDI and cannot cut a still short per item.
+    """
+    cfg = config.load()
+    if not cfg.local_playlist:
+        return False
+    playlist = playlists.get(cfg.local_playlist)
+    return bool(playlist and playlist.needs_sequencer())
 
 
 # Module-level singleton the web layer talks to.

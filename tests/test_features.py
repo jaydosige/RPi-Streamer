@@ -44,7 +44,9 @@ def main() -> int:
     playlists.save(pl)
     check("saved and retrievable", playlists.get("Doors Open") is not None)
     check("items preserved in order",
-          playlists.get("Doors Open").items == ["one.mp4", "slide.png"])
+          [i["target"] for i in playlists.get("Doors Open").items]
+          == ["one.mp4", "slide.png"],
+          str(playlists.get("Doors Open").items))
     check("image duration preserved", playlists.get("Doors Open").image_duration == 15)
 
     try:
@@ -60,17 +62,72 @@ def main() -> int:
         check("bad name rejected", True)
 
     check("duration clamped to something sane",
-          playlists.save(playlists.Playlist(name="Clamp", items=[],
+          playlists.save(playlists.Playlist(name="Clamp", items=["two.mp4"],
                                             image_duration=99999)).image_duration == 3600)
 
     resolved = playlists.resolved_files("Doors Open")
-    check("resolves to absolute paths", len(resolved) == 2 and resolved[0].startswith("/"))
+    check("resolves to absolute paths", len(resolved) == 2 and resolved[0].startswith("/"),
+          str(resolved))
     (config.MEDIA_DIR / "one.mp4").unlink()
     check("a file deleted after saving is skipped at play time",
           len(playlists.resolved_files("Doors Open")) == 1)
     check("m3u written for mpv", playlists.write_m3u("Doors Open") is not None)
     check("delete works", playlists.delete("Doors Open"))
     check("delete twice is False", not playlists.delete("Doors Open"))
+
+    print("\nplaylist segments and NDI items")
+    mixed = playlists.Playlist(name="Mixed", items=[
+        {"type": "file", "target": "two.mp4", "duration": None},
+        {"type": "ndi", "target": "STUDIO-PC (OBS)", "duration": 30},
+        {"type": "file", "target": "slide.png", "duration": 5},
+    ], loop=True)
+    playlists.save(mixed)
+    got = playlists.get("Mixed")
+    check("mixed playlist saved", got is not None and len(got.items) == 3)
+    check("needs the sequencer (mpv cannot play NDI)", got.needs_sequencer())
+    check("all-file playlist with no durations uses the smooth path",
+          not playlists.Playlist(name="x", items=[
+              {"type": "file", "target": "two.mp4", "duration": None}]).needs_sequencer())
+
+    try:
+        playlists.save(playlists.Playlist(name="NoDur", items=[
+            {"type": "ndi", "target": "CAM 1", "duration": None}]))
+        check("NDI item without a duration rejected", False, "it was accepted")
+    except ValueError as exc:
+        check("NDI item without a duration rejected", "duration" in str(exc))
+
+    try:
+        playlists.save(playlists.Playlist(name="NoName", items=[
+            {"type": "ndi", "target": "", "duration": 10}]))
+        check("NDI item without a name rejected", False, "it was accepted")
+    except ValueError:
+        check("NDI item without a name rejected", True)
+
+    try:
+        playlists.save(playlists.Playlist(name="Empty", items=[]))
+        check("empty playlist rejected", False, "it was accepted")
+    except ValueError:
+        check("empty playlist rejected", True)
+
+    segs = playlists.resolved_segments("Mixed")
+    check("segments resolved in order", [s["type"] for s in segs] == ["file", "ndi", "file"],
+          str([s["type"] for s in segs]))
+    check("file segment carries an absolute path", segs[0]["path"].startswith("/"))
+    check("still image gets a duration", segs[2]["duration"] == 5)
+    check("image flagged as an image", segs[2]["image"] is True)
+    check("video with no duration plays to its end", segs[0]["duration"] is None)
+
+    # Legacy playlists stored plain strings.
+    import json as _json
+    raw = _json.loads(playlists.store_path().read_text())
+    raw["Legacy"] = {"items": ["two.mp4"], "loop": True, "shuffle": False,
+                     "image_duration": 10}
+    playlists.store_path().write_text(_json.dumps(raw))
+    legacy = playlists.get("Legacy")
+    check("legacy string items migrate to file segments",
+          legacy is not None and legacy.items == [
+              {"type": "file", "target": "two.mp4", "duration": None}],
+          str(legacy.items if legacy else None))
 
     print("\nschedule cue matching")
     # Monday 2026-08-17 was a Monday; weekday() == 0
