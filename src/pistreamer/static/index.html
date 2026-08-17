@@ -959,11 +959,17 @@ function renderStatus() {
   $("nowTarget").textContent = label;
 
   const err = $("playerError");
+  const banners = [];
   if (p.last_error) {
-    err.innerHTML = `<div class="banner">${p.last_error}${p.restarts ? ` · ${p.restarts} restart attempt(s)` : ""}</div>`;
-  } else {
-    err.innerHTML = "";
+    banners.push(`${p.last_error}${p.restarts ? ` · ${p.restarts} restart attempt(s)` : ""}`);
   }
+  // If this is ever non-zero, a player escaped teardown and was playing over
+  // the top of the next one. Say so — that symptom is otherwise baffling.
+  if (p.strays_cleaned) {
+    banners.push(`Cleaned up ${p.strays_cleaned} leftover player process(es) that `
+      + `would have played over the current item. Check the log if this keeps happening.`);
+  }
+  err.innerHTML = banners.map((b) => `<div class="banner">${b}</div>`).join("");
 
   renderStream(STATE.stream || {}, p);
 
@@ -2016,6 +2022,9 @@ async function loadAudioDevices() {
   $("audioCards").innerHTML = kvs([
     ["Sound cards", a.cards.length ? a.cards.map((c) => `${c.id} (${c.name})`).join(", ") : "none found"],
     ["Suggested for HDMI", a.suggested || "not detected"],
+    ["Audio path", a.sound_server
+      ? `${a.sound_server} is running — local playback still goes straight to ALSA`
+      : "straight to ALSA (no sound server)"],
     ["Discovery problem", a.error || null],
   ]);
   if (a.suggested && !cur) {

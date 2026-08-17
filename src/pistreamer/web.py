@@ -11,7 +11,7 @@ import subprocess
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from fastapi import Body, FastAPI, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
@@ -475,12 +475,26 @@ async def delete_media(name: str) -> Dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
+class PlaylistItemBody(BaseModel):
+    """One playlist segment: a media file or an NDI source."""
+
+    type: Literal["file", "ndi"] = "file"
+    target: str = Field(min_length=1, max_length=300)
+    duration: Optional[int] = Field(default=None, ge=1, le=86400)
+
+
 class PlaylistBody(BaseModel):
     name: str = Field(min_length=1, max_length=60)
-    items: List[str] = Field(default_factory=list)
+    # Segments, or bare filenames from a playlist written by an older version.
+    # This model went out of step with playlists.py once already: items became
+    # segments there while this still said List[str], so every save from the
+    # new editor came back as a 422 telling the user their item "should be a
+    # valid string". Accept both shapes and let playlists.normalise_items
+    # coerce them.
+    items: List[Union[PlaylistItemBody, str]] = Field(default_factory=list)
     loop: bool = True
     shuffle: bool = False
-    image_duration: int = 10
+    image_duration: int = Field(default=10, ge=1, le=3600)
 
 
 @app.get("/api/playlists")
@@ -490,10 +504,13 @@ async def get_playlists() -> Dict[str, Any]:
 
 @app.post("/api/playlists")
 async def post_playlist(body: PlaylistBody) -> Dict[str, Any]:
+    items: List[Any] = [
+        i if isinstance(i, str) else i.model_dump() for i in body.items
+    ]
     try:
         saved = playlists.save(
             playlists.Playlist(
-                name=body.name, items=body.items, loop=body.loop,
+                name=body.name, items=items, loop=body.loop,
                 shuffle=body.shuffle, image_duration=body.image_duration,
             )
         )

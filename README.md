@@ -234,6 +234,45 @@ performance table. Confirm with the CPU figure in the health panel: pegged at
 plugin path; the systemd unit sets `GST_PLUGIN_PATH`. Running `gst-launch-1.0`
 by hand needs `GST_PLUGIN_PATH=/opt/pistreamer/gst-plugins`.
 
+**No audio.** HDMI is a separate ALSA card on the Pi (`vc4hdmi0`/`vc4hdmi1`) and
+is almost never the default, so this is usually the device rather than the
+stream. The Audio card on the Display tab lists the real cards and devices,
+points out which one looks like HDMI, and plays a test tone — prove the output
+first, then look at the stream. NDI and local media have separate device
+settings because ALSA and mpv name devices differently.
+
+**Two things playing at once, or audio from the previous item.** Every player
+runs in its own process group and is torn down before the next one starts, with
+a sweep for anything left unsupervised — if that sweep finds something, the
+Stream tab says so and the log records it. A count above zero there means a
+player escaped teardown and is worth reporting. Local playback writes straight
+to ALSA (`--ao=alsa`) rather than through a sound server, because a server keeps
+its own buffer and would go on playing a stopped item underneath the next one.
+
+**Overclock control unavailable, mentioning sudo.** The installed units are
+older than the app. The service cannot escalate at all by design; overclocking
+is applied by a root path-activated unit. Run `install.sh` again to install
+`pistreamer-overclock.path`, then check `systemctl status
+pistreamer-overclock.path` shows it active.
+
+## Testing
+
+None of this needs a Pi:
+
+```bash
+python3 tests/test_smoke.py      # API contract, config, uploads, degradation
+python3 tests/test_features.py   # playlist segments, validation, schedule cues
+python3 tests/test_teardown.py   # nothing outlives its segment (real processes)
+python3 tests/test_diagnose.py   # network-vs-Pi verdicts
+
+python -m pistreamer.runner --self-test             # the real video chain
+python -m pistreamer.runner --self-test-compressed  # decoder selection
+python -m pistreamer.runner --list-decoders         # what this box can decode
+```
+
+The self-tests are the important ones: they make the pipeline testable off
+hardware, which is the layer where nearly every bug in this project has lived.
+
 ## Layout
 
 ```
@@ -245,22 +284,39 @@ scripts/
   20-gst-ndi-plugin.sh      builds teltek/gst-plugin-ndi
   30-app.sh                 user, venv, polkit, systemd
   40-tune-boot.sh           config.txt / cmdline.txt, journald, service trim
+  pistreamer-overclock      root helper: status | --from-request | <preset>
+  pistreamer-tuning         boot-time governor and scheduler tuning
 src/pistreamer/
   config.py                 atomic JSON config store
   display.py                DRM connector + mode discovery from sysfs
   sources.py                NDI discovery (GstDeviceMonitor, CLI fallback)
+  ndiconfig.py              ndi-config.v1.json: adapters, IPs, discovery server
   media.py                  local media library, path-traversal safe
-  player.py                 the state machine and supervisor
-  system.py                 telemetry and power actions
+  playlists.py              named playlists of file/NDI segments
+  schedule.py               time-of-day cues
+  player.py                 the state machine, supervisor and sequencer
+  runner.py                 the instrumented GStreamer pipeline
+  mpvipc.py                 mpv JSON IPC client for local playback stats
+  diagnose.py               network-vs-Pi verdict with evidence
+  telemetry.py              rolling 10-minute sampler, memory only
+  system.py                 telemetry, audio devices, overclock, power actions
   web.py                    FastAPI app
   static/index.html         the GUI, single file, no build step
-systemd/pistreamer.service
+systemd/
+  pistreamer.service            the app (NoNewPrivileges=yes)
+  pistreamer-overclock.path     watches for an overclock request
+  pistreamer-overclock.service  root oneshot that applies a preset
+  pistreamer-tuning.service     boot-time tuning
 ```
 
 ## Status
 
-v0.1 — code complete, **not yet run on hardware**. Everything from
-`install.sh` onward is unverified against a real Pi 4B and a real NDI sender.
+Working on a Pi 4B: NDI receive and display are confirmed against a real
+sender. Still unverified on hardware: the Advanced-SDK hardware decode path,
+the standby fallback, playlists and the scheduler, the overclock presets. NDI
+discovery on a dual-homed node (Wi-Fi with internet, Ethernet without) is a
+known open problem — transport works, discovery does not; use the manual
+address field there for now.
 
 ## Licence and trademarks
 

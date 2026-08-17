@@ -681,7 +681,35 @@ def audio_devices() -> Dict[str, object]:
     # never the ALSA default.
     hdmi = [d for d in out["alsa"] if "vc4hdmi" in d["device"].lower()]
     out["suggested"] = hdmi[0]["device"] if hdmi else ""
+    out["sound_server"] = sound_server()
     return out
+
+
+def sound_server() -> str:
+    """Name of a running sound server, or "" for direct ALSA.
+
+    Worth surfacing, because a server buffers audio on the player's behalf: when
+    a playlist item is stopped, its audio can keep coming out of the speakers
+    from the server's buffer, underneath the item that replaced it. We ask mpv
+    for ALSA directly (`--ao=alsa`) so that cannot happen; this is here to
+    confirm the situation rather than to change behaviour.
+    """
+    names = {"pipewire": "PipeWire", "pulseaudio": "PulseAudio", "jackd": "JACK"}
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return ""
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/comm", "r") as fh:
+                comm = fh.read().strip()
+        except OSError:
+            continue
+        if comm in names:
+            return names[comm]
+    return ""
 
 
 def test_tone(device: str = "", seconds: int = 2) -> Dict[str, object]:

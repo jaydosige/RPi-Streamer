@@ -45,6 +45,111 @@ _HEALTHY_AFTER = 30.0
 _LOG_LINES = 300
 # Prefix the runner uses to mark a machine-readable stats line on stdout.
 STATS_PREFIX = "@STATS "
+# Supervisor tick. Fast enough that a segment change is not visibly late —
+# at 1s a playlist transition could sit black for most of a second.
+_TICK = 0.25
+
+# Command-line fragments that identify a player process of ours. Used only to
+# clean up strays: a player that outlived its supervisor keeps its audio going
+# and mixes with the next one, which is heard as two tracks at once.
+_PLAYER_SIGNATURES = ("pistreamer.runner", "mpv --no-config", "gst-launch-1.0")
+
+
+def _stray_players(exclude_pid: Optional[int] = None) -> List[int]:
+    """PIDs of our own player processes that nothing is supervising.
+
+    Scoped deliberately narrowly: same uid, command line matching one of our
+    own spawn signatures, never the process we are currently tracking, and
+    never this process. Anything wider risks killing a user's own SSH session.
+    """
+    out: List[int] = []
+    me = os.getpid()
+    uid = os.getuid()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return out
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid in (me, exclude_pid):
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != uid:
+                continue
+            with open(f"/proc/{pid}/cmdline", "rb") as fh:
+                cmdline = fh.read().replace(b"\0", b" ").decode(errors="replace")
+        except (OSError, ValueError):
+            continue
+        if any(sig in cmdline for sig in _PLAYER_SIGNATURES):
+            out.append(pid)
+    return out
+
+
+def reap_strays(exclude_pid: Optional[int] = None) -> List[int]:
+    """Kill unsupervised player processes. Returns the PIDs it killed.
+
+    A stray can only exist if a previous supervisor lost track of a child —
+    an unclean service stop, a crash, or a player started by hand over SSH
+    during testing. Whatever the cause, the audible symptom is two soundtracks
+    at once and the visible one is a fight over DRM, so clean up rather than
+    leaving it to chance.
+    """
+    killed: List[int] = []
+    for pid in _stray_players(exclude_pid):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            killed.append(pid)
+        except OSError:
+            continue
+    if not killed:
+        return killed
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        if not any(_pid_alive(pid) for pid in killed):
+            break
+        time.sleep(0.05)
+    for pid in killed:
+        if _pid_alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    log.warning("cleaned up %d stray player process(es): %s", len(killed), killed)
+    return killed
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is this pid a process that could still be playing?
+
+    A zombie counts as dead: it has released the display and the sound card and
+    is only waiting to be reaped. Treating it as alive would make teardown
+    spin for its full timeout every time we kill one of our own children.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as fh:
+            fields = fh.read().rsplit(b") ", 1)[-1].split(b" ", 1)
+        return fields[0] != b"Z"
+    except (OSError, IndexError):
+        pass
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _group_alive(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 @dataclass
@@ -58,6 +163,8 @@ class PlayerStatus:
     last_error: str = ""
     # Standby is on screen because the wanted source went away.
     fallback: bool = False
+    # Unsupervised player processes cleaned up so far this run.
+    strays_cleaned: int = 0
 
     def to_dict(self) -> dict:
         uptime = time.time() - self.since if self.since else None
@@ -70,6 +177,7 @@ class PlayerStatus:
             "restarts": self.restarts,
             "last_error": self.last_error,
             "fallback": self.fallback,
+            "strays_cleaned": self.strays_cleaned,
         }
 
 
@@ -168,6 +276,10 @@ class Player:
         self._segment_idx = 0
         self._segment_deadline: Optional[float] = None
         self._segment_loop = True
+        # How many unsupervised player processes we have had to clean up. If
+        # this is not zero, something is escaping teardown and the user is
+        # hearing two soundtracks — worth surfacing rather than hiding.
+        self._stray_kills = 0
 
     # ------------------------------------------------------------------
     # Command construction
@@ -285,6 +397,20 @@ class Player:
         if not files:
             raise RuntimeError("no playable media files found")
 
+        cmd = self._mpv_base(cfg, playlist.image_duration if playlist else 10)
+        if (playlist.loop if playlist else cfg.loop):
+            cmd.append("--loop-playlist=inf")
+        cmd.append("--")
+        cmd += files
+        return cmd
+
+    def _mpv_base(self, cfg: config.Config, image_duration: int) -> List[str]:
+        """Flags shared by single-file, whole-playlist and per-segment mpv.
+
+        One builder on purpose: these two call sites drifted apart once
+        already, and a flag that only appears on one of them is a bug that
+        shows up in exactly one playback mode.
+        """
         conn = display.pick_connector(cfg.connector)
         cmd = [
             "mpv",
@@ -297,7 +423,11 @@ class Player:
             "--gpu-context=drm",
             "--hwdec=auto-safe",
             "--keep-open=no",
-            f"--image-display-duration={playlist.image_duration if playlist else 10}",
+            # A flat media folder means a stray .m4a or .srt beside a video
+            # gets auto-loaded as an extra track. Play only what we asked for.
+            "--audio-file-auto=no",
+            "--sub-auto=no",
+            f"--image-display-duration={image_duration}",
         ]
         if conn:
             cmd.append(f"--drm-connector={conn.name}")
@@ -307,22 +437,34 @@ class Player:
             cmd.append(f"--drm-mode={cfg.video_mode}")
         if cfg.rotation:
             cmd.append(f"--video-rotate={cfg.rotation}")
-        if (playlist.loop if playlist else cfg.loop):
-            cmd.append("--loop-playlist=inf")
-        if cfg.audio_enabled:
-            cmd.append(f"--volume={max(0, min(100, cfg.volume))}")
-            # mpv's device names are its own; if one has been chosen use it
-            # verbatim, otherwise derive an alsa/ name from the ALSA device.
-            if cfg.audio_device_mpv:
-                cmd.append(f"--audio-device={cfg.audio_device_mpv}")
-            elif cfg.audio_device:
-                cmd.append(f"--audio-device=alsa/{cfg.audio_device}")
-        else:
-            cmd.append("--no-audio")
-
-        cmd.append("--")
-        cmd += files
+        cmd += self._mpv_audio_args(cfg)
         return cmd
+
+    def _mpv_audio_args(self, cfg: config.Config) -> List[str]:
+        if not cfg.audio_enabled:
+            return ["--no-audio"]
+        return [
+            f"--volume={max(0, min(100, cfg.volume))}",
+            # Straight to ALSA. mpv's default is to probe for a sound server
+            # first, and a server holds its own playback buffer — so the audio
+            # of an item that has been killed keeps coming out of the speakers
+            # for as long as that buffer lasts, under the item that replaced
+            # it. Writing to the card directly means audio stops when the
+            # process does, which is what a playlist needs at every boundary.
+            "--ao=alsa",
+            # Bound the write-ahead for the same reason. The default is ~200ms
+            # plus whatever the device buffers; this keeps the tail short.
+            "--audio-buffer=0.1",
+        ] + self._mpv_audio_device(cfg)
+
+    def _mpv_audio_device(self, cfg: config.Config) -> List[str]:
+        # mpv's device names are its own; if one has been chosen use it
+        # verbatim, otherwise derive an alsa/ name from the ALSA device.
+        if cfg.audio_device_mpv:
+            return [f"--audio-device={cfg.audio_device_mpv}"]
+        if cfg.audio_device:
+            return [f"--audio-device=alsa/{cfg.audio_device}"]
+        return []
 
     def _runner_command(self, cfg: config.Config, source: str) -> List[str]:
         """Spawn the instrumented runner, which builds the pipeline itself."""
@@ -377,9 +519,14 @@ class Player:
             path = media.resolve(cfg.standby_file)
             if path is not None:
                 if path.suffix.lower() in media.VIDEO_EXTS:
-                    # A standby video is just local playback that happens to
-                    # be the fallback, so reuse the mpv path and loop it.
-                    return self._local_command(cfg, cfg.standby_file)
+                    # A standby video is local playback that happens to be the
+                    # fallback. Build it directly rather than going through
+                    # _local_command: that honours cfg.local_playlist over its
+                    # argument, so with a playlist selected the standby screen
+                    # would quietly play the whole playlist instead.
+                    return self._mpv_base(cfg, 10) + [
+                        "--loop-file=inf", "--", str(path),
+                    ]
                 image = str(path)
         elif cfg.idle_mode == "lastframe":
             snap = snapshot_path()
@@ -410,28 +557,7 @@ class Player:
         """The command for a single playlist segment."""
         if segment["type"] == "ndi":
             return self._runner_command(cfg, segment["target"])
-        conn = display.pick_connector(cfg.connector)
-        cmd = [
-            "mpv", "--no-config", "--no-terminal", "--msg-level=all=warn",
-            f"--input-ipc-server={mpv_socket()}",
-            "--fullscreen", "--vo=gpu", "--gpu-context=drm",
-            "--hwdec=auto-safe", "--keep-open=no",
-            f"--image-display-duration={segment['duration'] or 10}",
-        ]
-        if conn:
-            cmd.append(f"--drm-connector={conn.name}")
-        if cfg.video_mode:
-            cmd.append(f"--drm-mode={cfg.video_mode}")
-        if cfg.rotation:
-            cmd.append(f"--video-rotate={cfg.rotation}")
-        if cfg.audio_enabled:
-            cmd.append(f"--volume={max(0, min(100, cfg.volume))}")
-            if cfg.audio_device_mpv:
-                cmd.append(f"--audio-device={cfg.audio_device_mpv}")
-            elif cfg.audio_device:
-                cmd.append(f"--audio-device=alsa/{cfg.audio_device}")
-        else:
-            cmd.append("--no-audio")
+        cmd = self._mpv_base(cfg, segment["duration"] or 10)
         # A duration on a video means cut it short; images are handled by
         # --image-display-duration above.
         if segment["duration"] and not segment["image"]:
@@ -558,8 +684,26 @@ class Player:
         self._spawn_command(self._build_command(cfg, mode, target), mode)
 
     def _spawn_command(self, cmd: List[str], what: str) -> None:
+        # Never start a second player over a live one. Every caller is supposed
+        # to have torn the old one down already; if one ever forgets, the
+        # symptom is two soundtracks at once and a DRM fight, so make the
+        # invariant hold here rather than trusting call sites to remember.
+        if self._proc is not None and self._proc.poll() is None:
+            log.warning("spawn requested while pid %s is alive; terminating it first",
+                        self._proc.pid)
+            self._terminate()
+
         log.info("starting %s: %s", what, " ".join(shlex.quote(c) for c in cmd))
         self._logs.append(f"{time.strftime('%H:%M:%S')} $ {' '.join(shlex.quote(c) for c in cmd)}")
+
+        if cmd and cmd[0] == "mpv":
+            # Before the spawn, not after: mpv creates this socket at startup,
+            # so unlinking afterwards deletes the socket of the process we just
+            # started and the stats polling silently finds nothing.
+            try:
+                mpv_socket().unlink(missing_ok=True)
+            except OSError:
+                pass
 
         env = dict(os.environ)
         env.setdefault("GST_DEBUG", "1")
@@ -585,43 +729,62 @@ class Player:
         )
         self._stats_reader.start()
         if cmd and cmd[0] == "mpv":
-            # Stale socket from a previous run would make the first polls
-            # answer for a process that no longer exists.
-            try:
-                mpv_socket().unlink(missing_ok=True)
-            except OSError:
-                pass
             threading.Thread(
                 target=self._poll_mpv, args=(proc,), name="mpv-stats", daemon=True
             ).start()
 
     def _terminate(self, timeout: float = 5.0) -> None:
-        """Stop the current process and wait for it to release the display."""
+        """Stop the current process and wait for it to release display and audio.
+
+        Waiting on the direct child is not enough. `proc.wait()` returns as soon
+        as *our* child is reaped, but the child leads a process group, and
+        anything else in that group keeps its ALSA device open — which is heard
+        as the previous item still playing under the next one. So wait for the
+        whole group to disappear, then sweep for strays.
+        """
         proc = self._proc
-        if proc is None:
-            return
         self._proc = None
-        if proc.poll() is not None:
-            return
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
+        if proc is not None and proc.poll() is None:
+            pgid = proc.pid  # start_new_session=True, so pgid == pid
             try:
-                proc.terminate()
-            except OSError:
-                pass
-        try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            log.warning("player pid %s ignored SIGTERM; killing", proc.pid)
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
+                os.killpg(pgid, signal.SIGTERM)
             except (ProcessLookupError, PermissionError, OSError):
-                proc.kill()
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
             try:
-                proc.wait(timeout=3)
+                proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                log.error("player pid %s would not die", proc.pid)
+                log.warning("player pid %s ignored SIGTERM; killing", proc.pid)
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    proc.kill()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    log.error("player pid %s would not die", proc.pid)
+
+            # The child is reaped; make sure the rest of its group has gone.
+            deadline = time.monotonic() + 2.0
+            while _group_alive(pgid) and time.monotonic() < deadline:
+                time.sleep(0.02)
+            if _group_alive(pgid):
+                log.warning("process group %s outlived its leader; killing", pgid)
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+
+        # Belt and braces: anything of ours still playing is unsupervised.
+        strays = reap_strays()
+        if strays:
+            self._logs.append(
+                f"{time.strftime('%H:%M:%S')} ! stopped {len(strays)} stray "
+                f"player process(es) — these would have played over the next item"
+            )
+            self._stray_kills += len(strays)
         self._status.running = False
         self._status.pid = None
         self._status.since = None
@@ -634,6 +797,17 @@ class Player:
         """Start the supervisor thread. Safe to call once."""
         if self._supervisor and self._supervisor.is_alive():
             return
+        # An unclean stop (crash, SIGKILL, a player launched by hand over SSH
+        # while debugging) leaves a process still holding the display and the
+        # sound card. Nothing else will ever clean it up, and it would play
+        # underneath everything we start from here on.
+        strays = reap_strays()
+        if strays:
+            self._stray_kills += len(strays)
+            self._logs.append(
+                f"{time.strftime('%H:%M:%S')} ! cleaned up {len(strays)} "
+                f"player process(es) left over from a previous run"
+            )
         self._stop_event.clear()
         self._supervisor = threading.Thread(target=self._run, name="player", daemon=True)
         self._supervisor.start()
@@ -697,6 +871,7 @@ class Player:
             if proc is not None and proc.poll() is not None:
                 self._status.running = False
             self._status.fallback = self._fallback
+            self._status.strays_cleaned = self._stray_kills
             return self._status.to_dict()
 
     def logs(self) -> List[str]:
@@ -762,7 +937,7 @@ class Player:
 
     def _run(self) -> None:
         while not self._stop_event.is_set():
-            if self._stop_event.wait(1.0):
+            if self._stop_event.wait(_TICK):
                 break
             try:
                 self._supervise()

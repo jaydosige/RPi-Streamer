@@ -188,6 +188,48 @@ def main() -> int:
         r = client.get("/api/telemetry?points=5")
         check("telemetry honours points=5", r.status_code == 200 and len(r.json()["t"]) <= 5, r.text)
 
+        # Playlist segments over the API. The request model and playlists.py
+        # drifted apart once — items became segments in one and stayed
+        # List[str] in the other — so every save from the editor came back as
+        # a 422 saying the item "should be a valid string". Both shapes, and
+        # the real validation errors, are pinned here.
+        print("\nplaylist API")
+        r = client.post("/api/playlists", json={
+            "name": "Pre-show",
+            "items": [
+                {"type": "file", "target": "clip.mp4", "duration": None},
+                {"type": "ndi", "target": "STUDIO-PC (Test Patterns)", "duration": 20},
+            ],
+            "loop": True, "shuffle": False, "image_duration": 10,
+        })
+        check("POST a mixed file/NDI playlist -> 200", r.status_code == 200, r.text[:300])
+        if r.status_code == 200:
+            saved = r.json()
+            check("segment order preserved",
+                  [i["target"] for i in saved["items"]]
+                  == ["clip.mp4", "STUDIO-PC (Test Patterns)"], str(saved["items"]))
+            check("NDI segment keeps its type and duration",
+                  saved["items"][1]["type"] == "ndi" and saved["items"][1]["duration"] == 20,
+                  str(saved["items"][1]))
+
+        r = client.post("/api/playlists", json={"name": "Legacy", "items": ["clip.mp4"]})
+        check("legacy bare-string items still accepted -> 200", r.status_code == 200, r.text[:200])
+        if r.status_code == 200:
+            check("legacy item migrated to a file segment",
+                  r.json()["items"][0] == {"type": "file", "target": "clip.mp4",
+                                           "duration": None}, str(r.json()["items"]))
+
+        r = client.post("/api/playlists", json={
+            "name": "Endless", "items": [{"type": "ndi", "target": "STUDIO-PC (X)"}]})
+        check("NDI without a duration -> 400 with a useful message",
+              r.status_code == 400 and "duration" in r.text.lower(),
+              f"{r.status_code} {r.text[:200]}")
+        r = client.post("/api/playlists", json={
+            "name": "Nope", "items": [{"type": "hologram", "target": "x"}]})
+        check("unknown segment type -> 422", r.status_code == 422, str(r.status_code))
+        for name in ("Pre-show", "Legacy"):
+            client.delete(f"/api/playlists/{name}")
+
         print("\nmedia deletion")
         r = client.delete("/api/media/clip.mp4")
         check("delete -> 200", r.status_code == 200, r.text)
