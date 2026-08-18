@@ -9,11 +9,21 @@
     --bg: #0f1115;
     --panel: #171a21;
     --panel-2: #1e222b;
+    --panel-3: #262b36;
     --line: #2a2f3a;
+    --line-soft: #222732;
     --text: #e6e9ef;
     --muted: #8b93a4;
     --accent: #4c8dff;
-    --radius: 10px;
+    --accent-ink: #07101f;
+    --accent-wash: rgba(76, 141, 255, .14);
+    --radius: 12px;
+    --radius-sm: 8px;
+    /* One easing and two durations, so nothing in the interface moves in a
+       way that draws attention to the movement itself. */
+    --ease: cubic-bezier(.2, .8, .3, 1);
+    --fast: .12s;
+    --slow: .22s;
 
     /* Status palette — reserved for state, never reused as a series colour.
        Always shipped with an icon and a label, never colour alone. */
@@ -39,11 +49,15 @@
   }
   header {
     display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-    padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--line);
-    position: sticky; top: 0; z-index: 10;
+    padding: 13px 20px; background: var(--panel);
+    border-bottom: 1px solid var(--line-soft);
+    position: sticky; top: 0; z-index: 20;
   }
   header h1 { font-size: 17px; margin: 0; font-weight: 600; letter-spacing: .2px; }
   .host { color: var(--muted); font-size: 13px; font-family: ui-monospace, monospace; }
+  /* Explanatory prose. Same weight as .host, but in the body face, because a
+     paragraph set in monospace is measurably slower to read. */
+  .note { color: var(--muted); font-size: 13px; line-height: 1.55; max-width: 68ch; }
   .spacer { flex: 1; }
   .pill {
     display: inline-flex; align-items: center; gap: 7px;
@@ -51,57 +65,146 @@
     background: var(--panel-2); border: 1px solid var(--line);
   }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
-  .dot.on { background: var(--good); box-shadow: 0 0 0 3px rgba(53,193,127,.15); }
+  .dot.on {
+    background: var(--good); box-shadow: 0 0 0 3px rgba(12, 163, 12, .18);
+    animation: breathe 2.4s var(--ease) infinite;
+  }
+  @keyframes breathe {
+    0%, 100% { box-shadow: 0 0 0 3px rgba(12, 163, 12, .18); }
+    50%      { box-shadow: 0 0 0 5px rgba(12, 163, 12, .07); }
+  }
   .dot.err { background: var(--bad); box-shadow: 0 0 0 3px rgba(229,84,75,.15); }
 
-  nav { display: flex; gap: 2px; padding: 0 12px; background: var(--panel);
-        border-bottom: 1px solid var(--line); overflow-x: auto; }
-  nav button {
-    background: none; border: none; color: var(--muted); padding: 11px 14px;
-    font: inherit; font-size: 14px; cursor: pointer; border-bottom: 2px solid transparent;
-    white-space: nowrap;
+  nav {
+    display: flex; gap: 2px; padding: 0 12px; background: var(--panel);
+    border-bottom: 1px solid var(--line); overflow-x: auto;
+    position: sticky; top: 53px; z-index: 19;
+    scrollbar-width: none; -webkit-overflow-scrolling: touch;
+    /* Fades the last tab out at the edge instead of chopping it in half, so a
+       phone shows there is more to scroll to. */
+    -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 24px), transparent 100%);
+            mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 24px), transparent 100%);
   }
-  nav button:hover { color: var(--text); }
+  nav::-webkit-scrollbar { display: none; }
+  nav button {
+    background: none; border: none; color: var(--muted);
+    padding: 12px 14px; min-height: 44px;
+    font: inherit; font-size: 14px; cursor: pointer;
+    border-bottom: 2px solid transparent; white-space: nowrap;
+    transition: color var(--fast) var(--ease), background var(--fast) var(--ease);
+  }
+  nav button:hover { color: var(--text); background: var(--panel-2); }
+  nav button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   nav button.active { color: var(--text); border-bottom-color: var(--accent); }
 
-  main { max-width: 900px; margin: 0 auto; padding: 20px 16px 60px; }
+  main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 72px; }
   section { display: none; }
-  section.active { display: block; }
+  section.active { display: block; animation: rise var(--slow) var(--ease); }
+  @keyframes rise {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: none; }
+  }
+
+  /* Two columns where a tab is a set of independent cards, one where the card
+     is a form — a settings form stretched to 1100px is unreadable. */
+  .cols {
+    display: grid; gap: 14px; align-items: start;
+    grid-template-columns: repeat(auto-fit, minmax(380px, 1fr));
+  }
+  .cols > .wide { grid-column: 1 / -1; }
+  /* A settings form does not get wider than it is readable, however wide the
+     window is. Measurement cards can take the space; forms cannot use it. */
+  section.narrow-forms > .card { max-width: 760px; }
+  /* A settings page three screens long needs its save button where the hand
+     already is, not at the bottom. */
+  .savebar {
+    position: sticky; bottom: 0; z-index: 5;
+    /* Bleeds past main's padding so the fade covers the full width — a
+       backdrop only as wide as the button lets cards scroll past beside it,
+       which looks like the bar is floating loose. */
+    margin: 4px -16px 0; padding: 14px 16px 12px;
+    background: linear-gradient(to top, var(--bg) 55%, rgba(15, 17, 21, .92) 80%, transparent);
+  }
+  .savebar-inner {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    max-width: 1180px; margin: 0 auto;
+  }
+  /* Centred, not hugging the left edge: a 960px card in a 1180px window looks
+     like a mistake when it is flush left. */
+  section > .card { max-width: 960px; margin-left: auto; margin-right: auto; }
+  .cols > .card, .cols > .card.wide { max-width: none; }
+  .narrow { max-width: 760px; }
 
   .card {
     background: var(--panel); border: 1px solid var(--line);
     border-radius: var(--radius); padding: 16px; margin-bottom: 14px;
   }
-  .card h2 { margin: 0 0 12px; font-size: 14px; font-weight: 600;
+  .card h2 { margin: 0 0 12px; font-size: 13px; font-weight: 600;
              text-transform: uppercase; letter-spacing: .6px; color: var(--muted); }
 
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(176px, 1fr)); gap: 12px; }
-  .stat { background: var(--panel-2); border-radius: 8px; padding: 11px 13px; }
-  .stat .k { font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted); }
-  .stat .v { font-size: 19px; font-weight: 600; margin-top: 3px; font-variant-numeric: tabular-nums; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(152px, 1fr)); gap: 10px; }
+  .stat {
+    background: var(--panel-2); border-radius: var(--radius-sm); padding: 12px 14px;
+    border: 1px solid transparent; transition: border-color var(--slow) var(--ease);
+  }
+  .stat .k { font-size: 12px; color: var(--muted); letter-spacing: 0; }
+  .stat .v { font-size: 21px; font-weight: 600; margin-top: 2px; letter-spacing: -.2px; }
+  .stat.changed { animation: flash 1s var(--ease); }
+  @keyframes flash {
+    from { background: var(--accent-wash); }
+    to   { background: var(--panel-2); }
+  }
   .stat .v small { font-size: 12px; font-weight: 400; color: var(--muted); }
 
-  button.btn {
+  /* Three weights and no more: one primary action per card, plain for the
+     rest, and outline-red for anything that interrupts a show. A destructive
+     action never arrives pre-filled in red — that is for the confirmation. */
+  .btn, button.btn, a.btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
     background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
-    border-radius: 7px; padding: 8px 14px; font: inherit; font-size: 14px; cursor: pointer;
+    border-radius: var(--radius-sm); padding: 9px 15px; min-height: 38px;
+    font: inherit; font-size: 14px; line-height: 1; cursor: pointer;
+    text-decoration: none; white-space: nowrap;
+    transition: background var(--fast) var(--ease), border-color var(--fast) var(--ease),
+                color var(--fast) var(--ease), transform var(--fast) var(--ease);
   }
-  button.btn:hover:not(:disabled) { border-color: #3c4453; background: #252a34; }
-  button.btn:disabled { opacity: .45; cursor: not-allowed; }
-  button.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.btn.primary:hover:not(:disabled) { background: #3d7bec; }
-  button.btn.danger { color: var(--bad); border-color: #45272a; }
-  button.btn.danger:hover:not(:disabled) { background: #2a1b1d; }
+  .btn:hover:not(:disabled) { border-color: #3c4453; background: var(--panel-3); }
+  /* A press should be felt. 1px is enough; more reads as a toy. */
+  .btn:active:not(:disabled) { transform: translateY(1px); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+  .btn.primary:hover:not(:disabled) { background: #6ba0ff; border-color: #6ba0ff; }
+  .btn.danger { color: var(--bad); border-color: #45272a; background: transparent; }
+  .btn.danger:hover:not(:disabled) { background: rgba(208, 59, 59, .12); border-color: #6b3236; }
+  .btn.small { padding: 6px 11px; min-height: 32px; font-size: 13px; }
+  /* The row-level version of a primary action. Reads as the main thing in its
+     row without competing with the card's own primary button. */
+  .btn.accent { color: #9dc0ff; border-color: #2f4a78; background: transparent; }
+  .btn.accent:hover:not(:disabled) { background: var(--accent-wash); border-color: #3f6199; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  /* Pushes the last button of a row to the right — used for the one action in
+     a row that is not like the others. */
+  .row .push { margin-left: auto; }
 
   ul.list { list-style: none; margin: 0; padding: 0; }
   ul.list li {
     display: flex; align-items: center; gap: 12px; padding: 11px 12px;
-    background: var(--panel-2); border-radius: 8px; margin-bottom: 7px;
+    background: var(--panel-2); border-radius: var(--radius-sm); margin-bottom: 7px;
+    border: 1px solid transparent;
+    transition: border-color var(--fast) var(--ease), background var(--fast) var(--ease);
   }
+  ul.list li:hover { border-color: var(--line); background: var(--panel-3); }
   ul.list li .meta { flex: 1; min-width: 0; }
   ul.list li .name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   ul.list li .sub { font-size: 12px; color: var(--muted); }
-  ul.list li.playing { outline: 1px solid var(--accent); }
+  /* The row that is on air. A border rather than an outline so it does not
+     overlap its neighbour, plus a bar down the left edge that survives being
+     glanced at. */
+  ul.list li.playing {
+    border-color: var(--accent); background: var(--accent-wash);
+    box-shadow: inset 3px 0 0 var(--accent);
+  }
   /* Transfer progress. Used for browser->node uploads and node->node pushes;
      one set of styles so both read the same way. */
   .prog { margin: 8px 0 2px; }
@@ -139,14 +242,45 @@
   }
   .empty { color: var(--muted); font-size: 14px; padding: 14px 2px; }
 
+  /* The one thing this page is for. Not a "hero figure" in the stat sense —
+     it is an identity, not a magnitude — so it is sized to be read rather than
+     to be impressive. */
+  .card.hero { padding: 18px 18px 16px; }
+  .hero-head { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .hero-value {
+    font-size: clamp(22px, 3.2vw, 30px); font-weight: 600; line-height: 1.2;
+    letter-spacing: -.4px; overflow-wrap: anywhere;
+  }
+  .chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; font-weight: 600; letter-spacing: .6px; text-transform: uppercase;
+    padding: 3px 9px; border-radius: 999px;
+    background: var(--panel-3); color: var(--muted); border: 1px solid var(--line);
+  }
+  .chip.live { background: var(--accent-wash); color: #9dc0ff; border-color: transparent; }
+  .chip.standby { background: rgba(250, 178, 25, .12); color: #f0cf95; border-color: transparent; }
+
   label.field { display: block; margin-bottom: 13px; }
   label.field .lbl { display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }
-  input[type=text], input[type=number], select {
-    width: 100%; background: var(--panel-2); color: var(--text);
-    border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; font: inherit;
+  input[type=text]:focus, input[type=number]:focus, select:focus,
+  input[type=time]:focus {
+    outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-wash);
   }
-  input[type=range] { width: 100%; }
-  .checkline { display: flex; align-items: center; gap: 9px; margin-bottom: 13px; font-size: 14px; }
+  input[type=text], input[type=number], input[type=time], select {
+    width: 100%; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: var(--radius-sm);
+    padding: 10px 11px; min-height: 40px; font: inherit;
+    transition: border-color var(--fast) var(--ease), box-shadow var(--fast) var(--ease);
+  }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  input[type=checkbox] { width: 17px; height: 17px; accent-color: var(--accent); flex: none; }
+  /* The whole line is the target, not just the 17px box — this gets tapped on a
+     phone, in a dark room, in a hurry. */
+  .checkline {
+    display: flex; align-items: center; gap: 10px; margin-bottom: 12px; font-size: 14px;
+    min-height: 32px;
+  }
+  .checkline label { cursor: pointer; }
 
   pre.log {
     background: #0b0d11; border: 1px solid var(--line); border-radius: 8px;
@@ -160,13 +294,45 @@
   }
   .banner.warn { background: #2a2419; border-color: #4a3f24; color: #f0cf95; }
   #toast {
-    position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%) translateY(80px);
-    background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
-    padding: 10px 18px; border-radius: 999px; font-size: 14px; transition: transform .22s ease;
-    z-index: 50; max-width: 90vw;
+    position: fixed; left: 50%; bottom: 24px;
+    transform: translateX(-50%) translateY(80px); opacity: 0;
+    background: var(--panel-3); border: 1px solid var(--line); color: var(--text);
+    padding: 11px 18px; border-radius: 999px; font-size: 14px;
+    box-shadow: 0 8px 28px rgba(0, 0, 0, .45);
+    transition: transform var(--slow) var(--ease), opacity var(--slow) var(--ease);
+    z-index: 50; max-width: 90vw; pointer-events: none;
   }
-  #toast.show { transform: translateX(-50%) translateY(0); }
-  #toast.bad { border-color: #45272a; color: #ffb4ae; }
+  #toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+  #toast.bad { border-color: #6b3236; color: #ffb4ae; }
+
+  .banner { animation: rise var(--slow) var(--ease); }
+
+  /* Nothing here is worth motion sickness. One rule, applied last. */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: .001ms !important; animation-iteration-count: 1 !important;
+      transition-duration: .001ms !important; scroll-behavior: auto !important;
+    }
+  }
+
+  /* Phone. Two tiles across rather than one, and controls that stay tappable. */
+  @media (max-width: 560px) {
+    main { padding: 14px 12px 64px; }
+    .card { padding: 14px; }
+    .grid { grid-template-columns: repeat(auto-fit, minmax(132px, 1fr)); gap: 9px; }
+    .stat { padding: 10px 11px; }
+    .stat .v { font-size: 19px; }
+    .kvs { grid-template-columns: 1fr; }
+    /* Only buttons in an action row stretch. Applying this to every button
+       squeezed the name out of each list row — "holdin…" with the days of the
+       week stacked one per line beside it. */
+    .row > .btn { flex: 1 1 auto; }
+    .row .push { margin-left: 0; }
+    /* A list row becomes two rows: what it is, then what you can do to it. */
+    ul.list li { flex-wrap: wrap; row-gap: 10px; }
+    ul.list li .meta { flex: 1 1 100%; }
+    ul.list li .btn { flex: 1 1 auto; }
+  }
 
   /* --- stat tiles, meters, charts, tables --- */
   .stat .row2 { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px; }
@@ -185,7 +351,7 @@
   .chart-wrap { position: relative; }
   svg.chart { width: 100%; height: 132px; display: block; overflow: visible; }
   svg.chart .tick { fill: var(--muted); font-size: 10px; font-family: inherit; }
-  .chart-empty { color: var(--muted); font-size: 13px; padding: 40px 0; text-align: center; }
+  .chart-empty { color: var(--muted); font-size: 13px; padding: 18px 0; text-align: center; }
   .chart-tip {
     position: absolute; top: -6px; transform: translateX(-50%);
     background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px;
@@ -224,7 +390,10 @@
   .kv { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0;
         border-bottom: 1px solid var(--line); font-size: 13px; }
   .kv .k { color: var(--muted); }
-  .kv .v { text-align: right; word-break: break-all; }
+  /* break-all splits mid-word — "no sound s / erver" — which looks like a
+     rendering fault. Break at word boundaries, and only inside a long token
+     when there is no other choice. */
+  .kv .v { text-align: right; overflow-wrap: anywhere; word-break: normal; }
 
   .verdict .head { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
   .verdict .ico { font-size: 17px; font-weight: 700; }
@@ -254,13 +423,10 @@
 
 <nav>
   <button data-tab="now" class="active">Now playing</button>
-  <button data-tab="ndi">NDI sources</button>
-  <button data-tab="media">Local media</button>
-  <button data-tab="display">Display &amp; audio</button>
-  <button data-tab="schedule">Schedule</button>
-  <button data-tab="perf">Performance</button>
+  <button data-tab="ndi">NDI</button>
+  <button data-tab="media">Media</button>
   <button data-tab="nodes">Nodes</button>
-  <button data-tab="diag">Diagnostics</button>
+  <button data-tab="output">Output</button>
   <button data-tab="system">System</button>
 </nav>
 
@@ -272,33 +438,35 @@
       <h2>Diagnosis</h2>
       <div id="verdict"></div>
     </div>
-    <div class="card">
-      <h2>Output</h2>
-      <div class="stat" style="margin-bottom:12px">
-        <div class="k">Currently</div>
-        <div class="v" id="nowTarget">&mdash;</div>
+    <div class="card hero">
+      <div class="hero-head">
+        <span class="chip" id="nowMode">idle</span>
+        <span class="host" id="nowUptime"></span>
       </div>
-      <div class="row">
-        <button class="btn" id="btnRestart">Restart pipeline</button>
+      <div class="hero-value" id="nowTarget">&mdash;</div>
+      <div class="host" id="nowDetail"></div>
+      <div class="row" style="margin-top:14px">
+        <button class="btn primary" id="btnRestart">Restart pipeline</button>
         <button class="btn danger" id="btnStop">Stop output</button>
       </div>
     </div>
-    <div class="card">
-      <h2>Stream</h2>
-      <div class="grid" id="streamGrid"></div>
-      <div class="host" id="streamNote" style="margin-top:10px"></div>
-    </div>
-    <div class="card">
-      <h2>Health</h2>
-      <div class="grid" id="healthGrid"></div>
-    </div>
-    <div class="card">
-      <h2>Pipeline log</h2>
-      <pre class="log" id="logBox">No output yet.</pre>
+    <div class="cols">
+      <div class="card">
+        <h2>Stream</h2>
+        <div class="grid" id="streamGrid"></div>
+        <div class="host" id="streamNote" style="margin-top:10px"></div>
+      </div>
+      <div class="card">
+        <h2>Health</h2>
+        <div class="grid" id="healthGrid"></div>
+      </div>
+      <div class="card wide">
+        <h2>Pipeline log</h2>
+        <pre class="log" id="logBox">No output yet.</pre>
+      </div>
     </div>
   </section>
 
-  <!-- NDI -->
   <section id="tab-ndi">
     <div class="card">
       <h2>Discovered senders</h2>
@@ -319,7 +487,7 @@
 
     <div class="card">
       <h2>Connect by address</h2>
-      <div class="host" style="margin-bottom:12px">
+      <div class="note" style="margin-bottom:12px">
         Bypasses discovery entirely. If the Pi can route to the sender, this
         connects regardless of what mDNS is doing &mdash; which makes it the
         thing to try when a source refuses to appear, and the reliable option
@@ -337,7 +505,7 @@
 
     <div class="card">
       <h2>NDI networking</h2>
-      <div class="host" style="margin-bottom:12px">
+      <div class="note" style="margin-bottom:12px">
         For a node with two networks &mdash; Wi-Fi for management, Ethernet for
         media. These go into the NDI SDK's own config file, not the pipeline, and
         changing them restarts discovery.
@@ -366,7 +534,6 @@
     </div>
   </section>
 
-  <!-- MEDIA -->
   <section id="tab-media">
     <div class="card">
       <h2>Library</h2>
@@ -382,7 +549,7 @@
     </div>
     <div class="card">
       <h2>Playlists</h2>
-      <div class="host" style="margin-bottom:12px">
+      <div class="note" style="margin-bottom:12px">
         A playlist carries its own loop, shuffle and still-image dwell settings.
         Videos always play to their natural end.
       </div>
@@ -412,7 +579,7 @@
                style="width:90px">
         <button class="btn" id="btnAddItem">Add to playlist</button>
       </div>
-      <div class="host" style="margin:-8px 0 14px">
+      <div class="note" style="margin:-8px 0 14px">
         Leave the duration blank for a video to play it to its end. An NDI source
         has no natural end, so it needs one. Mixing NDI into a playlist means each
         item is a separate process, so expect a brief black frame between items.
@@ -433,98 +600,9 @@
       </div>
     </div>
 
-  </section>
-
-  <!-- DISPLAY -->
-  <section id="tab-display">
-    <div class="card">
-      <h2>Display</h2>
-      <label class="field">
-        <span class="lbl">Output connector</span>
-        <select id="cfgConnector"></select>
-      </label>
-      <label class="field">
-        <span class="lbl">Mode</span>
-        <select id="cfgMode"></select>
-      </label>
-      <label class="field">
-        <span class="lbl">Rotation</span>
-        <select id="cfgRotation">
-          <option value="0">Normal</option>
-          <option value="90">90&deg; clockwise</option>
-          <option value="180">180&deg;</option>
-          <option value="270">270&deg; clockwise</option>
-        </select>
-      </label>
-    </div>
-    <div class="card">
-      <h2>Audio</h2>
-      <div class="checkline">
-        <input type="checkbox" id="cfgAudioEnabled"><label for="cfgAudioEnabled">Audio enabled</label>
-      </div>
-      <label class="field">
-        <span class="lbl">Output device for NDI (ALSA) &mdash; HDMI is a separate card, and rarely the default</span>
-        <select id="cfgAudioDevice"></select>
-      </label>
-      <label class="field">
-        <span class="lbl">Output device for local media (mpv names these differently)</span>
-        <select id="cfgAudioDeviceMpv"></select>
-      </label>
-      <div class="row" style="margin-bottom:14px">
-        <button class="btn" id="btnTestTone">Play a test tone</button>
-        <span class="host" id="toneNote"></span>
-      </div>
-      <div class="checkline">
-        <input type="checkbox" id="cfgAudioSync">
-        <label for="cfgAudioSync">Pace audio on the pipeline clock (leave on)</label>
-      </div>
-      <div class="host" style="margin:-6px 0 14px">
-        Off writes to the sound card as fast as data arrives, which causes
-        crackle and drift. Only turn it off to test.
-      </div>
-      <div id="audioCards" class="kvs" style="margin-bottom:6px"></div>
-      <label class="field">
-        <span class="lbl">Volume &mdash; local playback only &mdash; <span id="volLabel">100</span>%</span>
-        <input type="range" id="cfgVolume" min="0" max="100">
-      </label>
-    </div>
-    <div class="card">
-      <h2>NDI receive</h2>
-      <label class="field">
-        <span class="lbl">Bandwidth</span>
-        <select id="cfgBandwidth">
-          <option value="highest">Full bandwidth (highest quality, heaviest CPU)</option>
-          <option value="lowest">Proxy stream (low bandwidth, safe on a Pi 4)</option>
-        </select>
-      </label>
-      <label class="field">
-        <span class="lbl">Receive buffer (ms) &mdash; raise if the picture stutters</span>
-        <input type="number" id="cfgLatency" min="0" max="2000" step="20">
-      </label>
-      <label class="field">
-        <span class="lbl">Timestamps &mdash; change only if the picture freezes on one frame</span>
-        <select id="cfgTimestampMode">
-          <option value="receive-time">Our own clock (safest)</option>
-          <option value="receive-time-vs-timecode">Sender timecode vs receive time</option>
-          <option value="receive-time-vs-timestamp">Sender timestamp vs receive time</option>
-          <option value="timecode">Sender timecode</option>
-          <option value="timestamp">Sender timestamp</option>
-        </select>
-      </label>
-      <div class="banner warn" style="margin-bottom:0">
-        A Pi 4 can comfortably decode NDI HX (H.264/HEVC). Full-bandwidth SpeedHQ at
-        1080p60 is likely beyond it &mdash; if playback stutters, switch the sender to HX
-        or select the proxy stream above.
-      </div>
-    </div>
-    <button class="btn primary" id="btnSaveDisplay">Save &amp; apply</button>
-  </section>
-
-  <!-- SCHEDULE -->
-  <section id="tab-schedule">
     <div class="card">
       <h2>Running order</h2>
-      <div class="host" style="margin-bottom:12px">
+      <div class="note" style="margin-bottom:12px">
         Each cue fires once at its time and the node stays where it was put, so
         you can always override by hand without fighting the schedule. Times are
         this node's local time.
@@ -576,178 +654,6 @@
     </div>
   </section>
 
-  <!-- PERFORMANCE -->
-  <section id="tab-perf">
-    <div class="banner warn" style="margin-bottom:14px">
-      These change the pipeline, so saving restarts the stream — expect a
-      one-second black frame. If something goes wrong, <em>Reset to defaults</em>
-      at the bottom puts everything back.
-    </div>
-
-    <div class="card">
-      <h2>Presets</h2>
-      <div class="host" style="margin-bottom:12px">
-        Each fills in the settings below without saving, so you can see what
-        changed before applying it.
-      </div>
-      <div class="row">
-        <button class="btn" data-preset="safe">Maximum compatibility</button>
-        <button class="btn" data-preset="balanced">Balanced</button>
-        <button class="btn primary" data-preset="fast">Lowest CPU</button>
-        <button class="btn" data-preset="hw">Hardware decode</button>
-      </div>
-      <div class="host" id="presetNote" style="margin-top:10px"></div>
-    </div>
-
-    <div class="card">
-      <h2>What this box can do</h2>
-      <div class="kvs" id="capsInfo"></div>
-      <div class="banner warn" id="capsNote" style="margin:12px 0 0;display:none"></div>
-    </div>
-
-    <div class="card">
-      <h2>Dropped frames</h2>
-      <div class="checkline">
-        <input type="checkbox" id="cfgSinkQos">
-        <label for="cfgSinkQos">Drop late frames to stay in time (QoS)</label>
-      </div>
-      <div class="host" style="margin:-6px 0 14px">
-        On by default. The sink discards frames that arrive late so the picture
-        stays in sync with the clock. If the Pi is only slightly too slow, this
-        is usually the thing turning "a bit behind" into visible dropped frames
-        — turning it off often fixes the symptom outright.
-      </div>
-      <div class="checkline">
-        <input type="checkbox" id="cfgSinkSync">
-        <label for="cfgSinkSync">Sync to the pipeline clock</label>
-      </div>
-      <div class="host" style="margin:-6px 0 14px">
-        Off means every frame is shown the moment it arrives. Motion can judder
-        very slightly, but nothing is thrown away. For signage and IMAG that is
-        usually the better trade.
-      </div>
-      <label class="field">
-        <span class="lbl">Drop frames later than (ms) &mdash; blank or -1 for no limit</span>
-        <input type="number" id="cfgMaxLateness" min="-1" max="5000" step="10">
-      </label>
-    </div>
-
-    <div class="card">
-      <h2>CPU cost</h2>
-      <label class="field">
-        <span class="lbl">Scaling quality &mdash; free when no scaling is needed</span>
-        <select id="cfgScaleMethod">
-          <option value="0">Nearest neighbour (cheapest)</option>
-          <option value="1">Bilinear (default)</option>
-          <option value="2">4-tap</option>
-          <option value="3">Lanczos (best, most expensive)</option>
-        </select>
-      </label>
-      <label class="field">
-        <span class="lbl">NDI colour format &mdash; what the receiver asks the SDK for</span>
-        <select id="cfgColorFormat">
-          <option value="uyvy-bgra">UYVY / BGRA (default)</option>
-          <option value="fastest">Fastest — least work for the SDK</option>
-          <option value="best">Best — most work for the SDK</option>
-          <option value="bgrx-bgra">BGRX / BGRA</option>
-          <option value="rgbx-rgba">RGBX / RGBA</option>
-          <option value="uyvy-rgba">UYVY / RGBA</option>
-        </select>
-      </label>
-      <label class="field">
-        <span class="lbl">Output pixel format &mdash; BGRx is the safe choice on a Pi</span>
-        <select id="cfgVideoFormat"></select>
-      </label>
-      <label class="field">
-        <span class="lbl">Colour conversion threads &mdash; 0 lets GStreamer decide</span>
-        <input type="number" id="cfgConvertThreads" min="0" max="8" step="1">
-      </label>
-      <div class="checkline">
-        <input type="checkbox" id="cfgMatchSource">
-        <label for="cfgMatchSource">Send the source's own resolution to the display (skips scaling)</label>
-      </div>
-      <div class="host" style="margin:-6px 0 0">
-        Cheapest possible, because videoscale becomes a passthrough. It only
-        works if your display advertises a mode matching the source exactly;
-        if it does not, the pipeline falls back to the pinned mode.
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>Buffering</h2>
-      <label class="field">
-        <span class="lbl">When the Pi falls behind</span>
-        <select id="cfgQueueLeaky">
-          <option value="downstream">Drop the oldest frames (keeps latency low)</option>
-          <option value="upstream">Drop the newest frames</option>
-          <option value="none">Drop nothing — let the queue block</option>
-        </select>
-      </label>
-      <label class="field">
-        <span class="lbl">Queue depth in frames &mdash; 0 for unlimited (time limit still applies)</span>
-        <input type="number" id="cfgQueueBuffers" min="0" max="120" step="1">
-      </label>
-      <label class="field">
-        <span class="lbl">NDI receiver queue length</span>
-        <input type="number" id="cfgNdiQueue" min="1" max="60" step="1">
-      </label>
-      <label class="field">
-        <span class="lbl">Connect timeout (ms)</span>
-        <input type="number" id="cfgConnectTimeout" min="1000" max="60000" step="500">
-      </label>
-      <label class="field">
-        <span class="lbl">Receive timeout (ms) &mdash; how long before a silent sender counts as gone</span>
-        <input type="number" id="cfgRecvTimeout" min="500" max="60000" step="500">
-      </label>
-    </div>
-
-    <div class="card">
-      <h2>Standby screen</h2>
-      <div class="host" style="margin-bottom:12px">
-        What the display shows when nothing is playing. The standby screen is a
-        live output, not the absence of one — that is what keeps the Linux
-        console off the screen.
-      </div>
-      <label class="field">
-        <span class="lbl">When idle, show</span>
-        <select id="cfgIdleMode">
-          <option value="black">Black</option>
-          <option value="lastframe">Hold the last NDI frame</option>
-          <option value="image">A chosen image or video</option>
-        </select>
-      </label>
-      <label class="field" id="standbyPick">
-        <span class="lbl">Standby file &mdash; upload it on the Local media tab first</span>
-        <select id="cfgStandbyFile"></select>
-      </label>
-      <div class="checkline">
-        <input type="checkbox" id="cfgSnapshot">
-        <label for="cfgSnapshot">Keep saving the latest frame (needed for "hold the last frame")</label>
-      </div>
-      <label class="field">
-        <span class="lbl">Save a frame every (seconds)</span>
-        <input type="number" id="cfgSnapshotInterval" min="1" max="60" step="1">
-      </label>
-      <div class="row">
-        <img id="snapPreview" alt="Most recent captured frame" style="display:none;
-             max-width:260px;border-radius:8px;border:1px solid var(--line)">
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>Advanced</h2>
-      <div class="checkline">
-        <input type="checkbox" id="cfgUseGstLaunch">
-        <label for="cfgUseGstLaunch">Use the old gst-launch path (loses all stream statistics)</label>
-      </div>
-      <div class="row">
-        <button class="btn primary" id="btnSavePerf">Save &amp; apply</button>
-        <button class="btn danger" id="btnResetPerf">Reset to defaults</button>
-      </div>
-    </div>
-  </section>
-
-  <!-- DIAGNOSTICS -->
   <section id="tab-nodes">
     <div class="card">
       <h2>This node</h2>
@@ -756,7 +662,7 @@
         <input type="checkbox" id="cfgIdentify" data-transient>
         <label for="cfgIdentify">Identify &mdash; show every node's name and address on screen</label>
       </div>
-      <div class="host">
+      <div class="note">
         Applies to the whole group, over whatever is playing, and to nodes that
         are not playing anything. It survives a reboot on purpose: if you flagged
         a node because you were looking for it, finding it should not depend on
@@ -766,7 +672,7 @@
 
     <div class="card">
       <h2>Group</h2>
-      <div class="host" style="margin-bottom:10px">
+      <div class="note" style="margin-bottom:10px">
         Nodes announce themselves every two seconds and disappear from this list
         twelve seconds after they stop. Only nodes in the same group, signed with
         the same key, are ever listed.
@@ -782,7 +688,7 @@
 
     <div class="card">
       <h2>Synchronised playback</h2>
-      <div class="host" style="margin-bottom:10px">
+      <div class="note" style="margin-bottom:10px">
         Send a playlist to every node, then play it in step. Each item is loaded
         and held paused on all nodes, released on an agreed instant, and then
         kept in line while it plays. Only files are synchronised &mdash; an NDI
@@ -824,7 +730,7 @@
         <input type="checkbox" id="cfgClusterDrift">
         <label for="cfgClusterDrift">Correct drift while an item plays</label>
       </div>
-      <div class="host">
+      <div class="note">
         With this off you still get a synchronised start for every item, just no
         correction afterwards &mdash; which is enough for short clips and avoids
         any chance of a visible correction mid-item.
@@ -833,7 +739,257 @@
     </div>
   </section>
 
-  <section id="tab-diag">
+  <section id="tab-output">
+    <div class="banner warn">
+      These change the pipeline, so saving restarts the stream — expect a
+      one-second black frame. If something goes wrong, <em>Reset to defaults</em>
+      at the bottom puts everything back.
+    </div>
+    <div class="cols">
+    <div class="card">
+      <h2>Display</h2>
+      <label class="field">
+        <span class="lbl">Output connector</span>
+        <select id="cfgConnector"></select>
+      </label>
+      <label class="field">
+        <span class="lbl">Mode</span>
+        <select id="cfgMode"></select>
+      </label>
+      <label class="field">
+        <span class="lbl">Rotation</span>
+        <select id="cfgRotation">
+          <option value="0">Normal</option>
+          <option value="90">90&deg; clockwise</option>
+          <option value="180">180&deg;</option>
+          <option value="270">270&deg; clockwise</option>
+        </select>
+      </label>
+    </div>
+    <div class="card">
+      <h2>Audio</h2>
+      <div class="checkline">
+        <input type="checkbox" id="cfgAudioEnabled"><label for="cfgAudioEnabled">Audio enabled</label>
+      </div>
+      <label class="field">
+        <span class="lbl">Output device for NDI (ALSA) &mdash; HDMI is a separate card, and rarely the default</span>
+        <select id="cfgAudioDevice"></select>
+      </label>
+      <label class="field">
+        <span class="lbl">Output device for local media (mpv names these differently)</span>
+        <select id="cfgAudioDeviceMpv"></select>
+      </label>
+      <div class="row" style="margin-bottom:14px">
+        <button class="btn" id="btnTestTone">Play a test tone</button>
+        <span class="host" id="toneNote"></span>
+      </div>
+      <div class="checkline">
+        <input type="checkbox" id="cfgAudioSync">
+        <label for="cfgAudioSync">Pace audio on the pipeline clock (leave on)</label>
+      </div>
+      <div class="note" style="margin:-6px 0 14px">
+        Off writes to the sound card as fast as data arrives, which causes
+        crackle and drift. Only turn it off to test.
+      </div>
+      <div id="audioCards" class="kvs" style="margin-bottom:6px"></div>
+      <label class="field">
+        <span class="lbl">Volume &mdash; local playback only &mdash; <span id="volLabel">100</span>%</span>
+        <input type="range" id="cfgVolume" min="0" max="100">
+      </label>
+    </div>
+    <div class="card">
+      <h2>NDI receive</h2>
+      <label class="field">
+        <span class="lbl">Bandwidth</span>
+        <select id="cfgBandwidth">
+          <option value="highest">Full bandwidth (highest quality, heaviest CPU)</option>
+          <option value="lowest">Proxy stream (low bandwidth, safe on a Pi 4)</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="lbl">Receive buffer (ms) &mdash; raise if the picture stutters</span>
+        <input type="number" id="cfgLatency" min="0" max="2000" step="20">
+      </label>
+      <label class="field">
+        <span class="lbl">Timestamps &mdash; change only if the picture freezes on one frame</span>
+        <select id="cfgTimestampMode">
+          <option value="receive-time">Our own clock (safest)</option>
+          <option value="receive-time-vs-timecode">Sender timecode vs receive time</option>
+          <option value="receive-time-vs-timestamp">Sender timestamp vs receive time</option>
+          <option value="timecode">Sender timecode</option>
+          <option value="timestamp">Sender timestamp</option>
+        </select>
+      </label>
+      <div class="banner warn" style="margin-bottom:0">
+        A Pi 4 can comfortably decode NDI HX (H.264/HEVC). Full-bandwidth SpeedHQ at
+        1080p60 is likely beyond it &mdash; if playback stutters, switch the sender to HX
+        or select the proxy stream above.
+      </div>
+    </div>
+    <div class="card">
+      <h2>Presets</h2>
+      <div class="note" style="margin-bottom:12px">
+        Each fills in the settings below without saving, so you can see what
+        changed before applying it.
+      </div>
+      <div class="row">
+        <button class="btn" data-preset="safe">Maximum compatibility</button>
+        <button class="btn" data-preset="balanced">Balanced</button>
+        <button class="btn primary" data-preset="fast">Lowest CPU</button>
+        <button class="btn" data-preset="hw">Hardware decode</button>
+      </div>
+      <div class="host" id="presetNote" style="margin-top:10px"></div>
+    </div>
+    <div class="card">
+      <h2>What this box can do</h2>
+      <div class="kvs" id="capsInfo"></div>
+      <div class="banner warn" id="capsNote" style="margin:12px 0 0;display:none"></div>
+    </div>
+    <div class="card">
+      <h2>Dropped frames</h2>
+      <div class="checkline">
+        <input type="checkbox" id="cfgSinkQos">
+        <label for="cfgSinkQos">Drop late frames to stay in time (QoS)</label>
+      </div>
+      <div class="note" style="margin:-6px 0 14px">
+        On by default. The sink discards frames that arrive late so the picture
+        stays in sync with the clock. If the Pi is only slightly too slow, this
+        is usually the thing turning "a bit behind" into visible dropped frames
+        — turning it off often fixes the symptom outright.
+      </div>
+      <div class="checkline">
+        <input type="checkbox" id="cfgSinkSync">
+        <label for="cfgSinkSync">Sync to the pipeline clock</label>
+      </div>
+      <div class="note" style="margin:-6px 0 14px">
+        Off means every frame is shown the moment it arrives. Motion can judder
+        very slightly, but nothing is thrown away. For signage and IMAG that is
+        usually the better trade.
+      </div>
+      <label class="field">
+        <span class="lbl">Drop frames later than (ms) &mdash; blank or -1 for no limit</span>
+        <input type="number" id="cfgMaxLateness" min="-1" max="5000" step="10">
+      </label>
+    </div>
+    <div class="card">
+      <h2>CPU cost</h2>
+      <label class="field">
+        <span class="lbl">Scaling quality &mdash; free when no scaling is needed</span>
+        <select id="cfgScaleMethod">
+          <option value="0">Nearest neighbour (cheapest)</option>
+          <option value="1">Bilinear (default)</option>
+          <option value="2">4-tap</option>
+          <option value="3">Lanczos (best, most expensive)</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="lbl">NDI colour format &mdash; what the receiver asks the SDK for</span>
+        <select id="cfgColorFormat">
+          <option value="uyvy-bgra">UYVY / BGRA (default)</option>
+          <option value="fastest">Fastest — least work for the SDK</option>
+          <option value="best">Best — most work for the SDK</option>
+          <option value="bgrx-bgra">BGRX / BGRA</option>
+          <option value="rgbx-rgba">RGBX / RGBA</option>
+          <option value="uyvy-rgba">UYVY / RGBA</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="lbl">Output pixel format &mdash; BGRx is the safe choice on a Pi</span>
+        <select id="cfgVideoFormat"></select>
+      </label>
+      <label class="field">
+        <span class="lbl">Colour conversion threads &mdash; 0 lets GStreamer decide</span>
+        <input type="number" id="cfgConvertThreads" min="0" max="8" step="1">
+      </label>
+      <div class="checkline">
+        <input type="checkbox" id="cfgMatchSource">
+        <label for="cfgMatchSource">Send the source's own resolution to the display (skips scaling)</label>
+      </div>
+      <div class="note" style="margin:-6px 0 0">
+        Cheapest possible, because videoscale becomes a passthrough. It only
+        works if your display advertises a mode matching the source exactly;
+        if it does not, the pipeline falls back to the pinned mode.
+      </div>
+    </div>
+    <div class="card">
+      <h2>Buffering</h2>
+      <label class="field">
+        <span class="lbl">When the Pi falls behind</span>
+        <select id="cfgQueueLeaky">
+          <option value="downstream">Drop the oldest frames (keeps latency low)</option>
+          <option value="upstream">Drop the newest frames</option>
+          <option value="none">Drop nothing — let the queue block</option>
+        </select>
+      </label>
+      <label class="field">
+        <span class="lbl">Queue depth in frames &mdash; 0 for unlimited (time limit still applies)</span>
+        <input type="number" id="cfgQueueBuffers" min="0" max="120" step="1">
+      </label>
+      <label class="field">
+        <span class="lbl">NDI receiver queue length</span>
+        <input type="number" id="cfgNdiQueue" min="1" max="60" step="1">
+      </label>
+      <label class="field">
+        <span class="lbl">Connect timeout (ms)</span>
+        <input type="number" id="cfgConnectTimeout" min="1000" max="60000" step="500">
+      </label>
+      <label class="field">
+        <span class="lbl">Receive timeout (ms) &mdash; how long before a silent sender counts as gone</span>
+        <input type="number" id="cfgRecvTimeout" min="500" max="60000" step="500">
+      </label>
+    </div>
+    <div class="card">
+      <h2>Standby screen</h2>
+      <div class="note" style="margin-bottom:12px">
+        What the display shows when nothing is playing. The standby screen is a
+        live output, not the absence of one — that is what keeps the Linux
+        console off the screen.
+      </div>
+      <label class="field">
+        <span class="lbl">When idle, show</span>
+        <select id="cfgIdleMode">
+          <option value="black">Black</option>
+          <option value="lastframe">Hold the last NDI frame</option>
+          <option value="image">A chosen image or video</option>
+        </select>
+      </label>
+      <label class="field" id="standbyPick">
+        <span class="lbl">Standby file &mdash; upload it on the Local media tab first</span>
+        <select id="cfgStandbyFile"></select>
+      </label>
+      <div class="checkline">
+        <input type="checkbox" id="cfgSnapshot">
+        <label for="cfgSnapshot">Keep saving the latest frame (needed for "hold the last frame")</label>
+      </div>
+      <label class="field">
+        <span class="lbl">Save a frame every (seconds)</span>
+        <input type="number" id="cfgSnapshotInterval" min="1" max="60" step="1">
+      </label>
+      <div class="row">
+        <img id="snapPreview" alt="Most recent captured frame" style="display:none;
+             max-width:260px;border-radius:8px;border:1px solid var(--line)">
+      </div>
+    </div>
+    <div class="card">
+      <h2>Advanced</h2>
+      <div class="checkline">
+        <input type="checkbox" id="cfgUseGstLaunch">
+        <label for="cfgUseGstLaunch">Use the old gst-launch path (loses all stream statistics)</label>
+      </div>
+      <div class="row">
+        <button class="btn danger" id="btnResetPerf">Reset to defaults</button>
+      </div>
+    </div>
+    </div>
+    <div class="savebar">
+      <div class="savebar-inner">
+        <button class="btn primary" id="btnSaveOutput">Save &amp; apply</button>
+        <span class="note" id="saveNote">Saving restarts the stream.</span>
+      </div>
+    </div>
+  </section>
+
+  <section id="tab-system">
     <div class="card">
       <h2>Last 10 minutes</h2>
       <div id="charts"></div>
@@ -843,47 +999,38 @@
       </div>
       <div id="tableWrap" class="scroller" style="display:none;margin-top:12px"></div>
     </div>
-
+    <div class="cols">
     <div class="card">
       <h2>Capacity</h2>
       <div id="meters"></div>
     </div>
-
     <div class="card" id="wifiCard" style="display:none">
       <h2>Wi-Fi</h2>
       <div class="grid" id="wifiGrid"></div>
       <div class="banner warn" id="wifiNote" style="margin:12px 0 0;display:none"></div>
     </div>
-
     <div class="card">
       <h2>Network interfaces</h2>
       <div class="scroller"><table class="data" id="netTable"></table></div>
       <div class="banner warn" id="netNote" style="margin:12px 0 0;display:none"></div>
     </div>
-
     <div class="card">
       <h2>Power &amp; thermal</h2>
       <div class="row" id="throttleRow"></div>
-      <div class="host" style="margin-top:10px">
+      <div class="note" style="margin-top:10px">
         Under-voltage is the most common cause of a Pi misbehaving under load, and it
         looks exactly like a decode problem. If anything below is flagged, replace the
         power supply before investigating anything else.
       </div>
     </div>
-
     <div class="card">
       <h2>Discovery</h2>
       <div class="kvs" id="discoveryInfo"></div>
     </div>
-
     <div class="card">
       <h2>Device &amp; versions</h2>
       <div class="kvs" id="versionInfo"></div>
     </div>
-  </section>
-
-  <!-- SYSTEM -->
-  <section id="tab-system">
     <div class="card">
       <h2>Identity</h2>
       <label class="field">
@@ -908,7 +1055,7 @@
       <h2>Overclocking</h2>
       <div class="banner warn">
         Overclocking needs a genuine 3A supply and at least a heatsink. Check the
-        Diagnostics tab first: if under-voltage or throttling is already flagged,
+        health figures above first: if under-voltage or throttling is already flagged,
         fix that before adding clock. Presets come from the official Raspberry Pi
         guidance; each takes effect on the next reboot.
       </div>
@@ -916,13 +1063,13 @@
       <div class="row" id="ocButtons"></div>
       <div class="host" id="ocNote" style="margin-top:10px"></div>
     </div>
-
     <div class="card">
       <h2>Power</h2>
       <div class="row">
         <button class="btn danger" id="btnReboot">Reboot</button>
         <button class="btn danger" id="btnPoweroff">Shut down</button>
       </div>
+    </div>
     </div>
   </section>
 </main>
@@ -939,7 +1086,6 @@ let HIST = { t: [], series: {}, peaks: {} };
 let SPARKS = {};
 let CONNECTORS = [];
 let pollTimer = null;
-let settingsDirty = false;
 
 // ---------- form fields the poll must not fight ----------
 //
@@ -1096,14 +1242,12 @@ document.querySelectorAll("nav button").forEach((btn) => {
     document.querySelectorAll("main section").forEach((s) => s.classList.remove("active"));
     btn.classList.add("active");
     $("tab-" + btn.dataset.tab).classList.add("active");
-    if (btn.dataset.tab === "media") { loadMedia(); loadPlaylists(); }
-    if (btn.dataset.tab === "display") { loadConnectors(); loadAudioDevices(); }
-    if (btn.dataset.tab === "diag") loadTelemetry();
-    if (btn.dataset.tab === "perf") loadPerf();
-    if (btn.dataset.tab === "ndi") loadNdiNetwork();
-    if (btn.dataset.tab === "schedule") loadSchedule();
-    if (btn.dataset.tab === "system") loadOverclock();
-    if (btn.dataset.tab === "nodes") loadNodes();
+    const tab = btn.dataset.tab;
+    if (tab === "media") { loadMedia(); loadPlaylists(); loadSchedule(); }
+    if (tab === "output") { loadConnectors(); loadAudioDevices(); loadPerf(); }
+    if (tab === "system") { loadTelemetry(); loadOverclock(); }
+    if (tab === "ndi") loadNdiNetwork();
+    if (tab === "nodes") loadNodes();
   };
 });
 
@@ -1131,10 +1275,10 @@ async function poll() {
   } catch (_) { /* logs are best-effort */ }
   try {
     // Just enough points for the tile sparklines; the full window is only
-    // fetched when the Diagnostics tab is actually open.
+    // fetched when the System tab is actually open.
     SPARKS = (await api("/api/telemetry?points=14")).series || {};
   } catch (_) { /* sparklines are decoration */ }
-  if (activeTab() === "diag") loadTelemetry();
+  if (activeTab() === "system") loadTelemetry();
   // Only while the tab is open: peers move on a two-second beacon, and there is
   // no point polling the group from a node nobody is looking at.
   if (activeTab() === "nodes") loadNodes();
@@ -1142,6 +1286,22 @@ async function poll() {
 }
 
 // ---------- stat tiles ----------
+
+const TILE_LAST = new Map();
+
+function flashChanged(container) {
+  container.querySelectorAll(".stat").forEach((el) => {
+    const key = (el.querySelector(".k") || {}).textContent || "";
+    const now = (el.querySelector(".v") || {}).textContent || "";
+    const before = TILE_LAST.get(key);
+    TILE_LAST.set(key, now);
+    if (before !== undefined && before !== now && now && now !== "—") {
+      el.classList.remove("changed");
+      void el.offsetWidth;  // restart the animation rather than ignore it
+      el.classList.add("changed");
+    }
+  });
+}
 
 function tile(label, value, opts) {
   const o = opts || {};
@@ -1180,11 +1340,31 @@ function renderStatus() {
     dot.className = "dot err"; txt.textContent = "stopped";
   }
 
+  // The lead line answers "what is on the screen", and the chip beside it
+  // answers "and is that on purpose" — standby and idle look identical from a
+  // distance otherwise.
   let label = "Nothing — output is idle";
-  if (p.fallback) label = `Standby — waiting for ${p.target || "the source"}`;
-  else if (p.mode === "ndi") label = p.target || "(no source selected)";
-  else if (p.mode === "local") label = p.target || "Whole media folder";
+  let mode = "idle", chip = "";
+  if (p.fallback) {
+    label = `Waiting for ${p.target || "the source"}`;
+    mode = "standby"; chip = "standby";
+  } else if (p.mode === "ndi") {
+    label = p.target || "(no source selected)";
+    mode = "NDI"; chip = p.running ? "live" : "";
+  } else if (p.mode === "local") {
+    label = p.target || "Whole media folder";
+    mode = c.local_playlist ? `playlist · ${c.local_playlist}` : "local media";
+    chip = p.running ? "live" : "";
+  }
   $("nowTarget").textContent = label;
+  $("nowMode").textContent = mode;
+  $("nowMode").className = "chip" + (chip ? " " + chip : "");
+  $("nowUptime").textContent = p.running && p.uptime
+    ? `up ${fmtDuration(p.uptime)}` : "";
+  const detail = [];
+  if (p.pid) detail.push(`pid ${p.pid}`);
+  if (p.restarts) detail.push(`${p.restarts} restart${p.restarts === 1 ? "" : "s"}`);
+  $("nowDetail").textContent = detail.join(" · ");
 
   const err = $("playerError");
   const banners = [];
@@ -1226,6 +1406,7 @@ function renderStatus() {
       { sub: (th.now && th.now.length) ? th.now[0] : ((th.since_boot && th.since_boot.length) ? "history flagged" : null) }],
   ];
   $("healthGrid").innerHTML = health.map(([k, v, o]) => tile(k, v, o)).join("");
+  flashChanged($("healthGrid"));
   paintSparks($("healthGrid"), {
     "h-cpu": { values: H.cpu_percent || [], color: "var(--series-cpu)" },
     "h-temp": { values: H.cpu_temp || [], color: "var(--series-temp)" },
@@ -1240,13 +1421,15 @@ function renderStatus() {
       </div></li>`).join("")
     : `<div class="empty">No network interfaces found.</div>`;
 
-  if (!settingsDirty) applyConfigToForm(c);
+  applyConfigToForm(c);
 }
 
 function renderStream(st, p) {
   const grid = $("streamGrid"), note = $("streamNote");
+  const card = grid.closest(".card");
+  if (card) card.style.display = p.mode === "idle" ? "none" : "";
   if (p.mode === "idle") {
-    grid.innerHTML = `<div class="empty">Output is idle — nothing to measure.</div>`;
+    grid.innerHTML = "";
     note.textContent = "";
     return;
   }
@@ -1346,9 +1529,9 @@ async function loadPlaylists() {
             p.items.some((i) => i.type === "ndi") ? " · includes NDI" : ""}${
             p.loop ? " · loop" : ""}${p.shuffle ? " · shuffle" : ""} · stills ${p.image_duration}s</div>
         </div>
-        <button class="btn primary" data-plplay="${encodeURIComponent(p.name)}">Play</button>
-        <button class="btn" data-pledit="${encodeURIComponent(p.name)}">Edit</button>
-        <button class="btn danger" data-pldel="${encodeURIComponent(p.name)}">Delete</button>
+        <button class="btn small accent" data-plplay="${encodeURIComponent(p.name)}">Play</button>
+        <button class="btn small" data-pledit="${encodeURIComponent(p.name)}">Edit</button>
+        <button class="btn small danger" data-pldel="${encodeURIComponent(p.name)}">Delete</button>
       </li>`).join("")
     : `<div class="empty">No playlists yet.</div>`;
 
@@ -1494,9 +1677,9 @@ async function loadSchedule() {
           <div class="sub">${c.days.map((d) => SCHEDULE.day_names[d]).join(" ")} · ${describeAction(c)}${
             c.enabled ? "" : " · disabled"}</div>
         </div>
-        <button class="btn" data-cuerun="${c.id}">Run now</button>
-        <button class="btn" data-cueedit="${c.id}">Edit</button>
-        <button class="btn danger" data-cuedel="${c.id}">Delete</button>
+        <button class="btn small accent" data-cuerun="${c.id}">Run now</button>
+        <button class="btn small" data-cueedit="${c.id}">Edit</button>
+        <button class="btn small danger" data-cuedel="${c.id}">Delete</button>
       </li>`).join("")
     : `<div class="empty">No cues yet. Add one to switch source automatically.</div>`;
 
@@ -1989,7 +2172,7 @@ function toggleStandbyPick() {
 }
 $("cfgIdleMode").onchange = toggleStandbyPick;
 
-$("btnSavePerf").onclick = async () => {
+function perfPatch() {
   const patch = {};
   for (const [id, [key, kind]] of Object.entries(PERF_FIELDS)) {
     const elm = $(id);
@@ -1998,11 +2181,18 @@ $("btnSavePerf").onclick = async () => {
     else patch[key] = elm.value;
   }
   if (patch.idle_mode !== "image") patch.standby_file = "";
+  return patch;
+}
+
+$("btnSaveOutput").onclick = async () => {
+  const btn = $("btnSaveOutput");
+  btn.disabled = true;
   try {
-    await post("/api/config", patch);
+    await post("/api/config", { ...displayPatch(), ...perfPatch() });
     toast("Saved — pipeline restarting");
     poll();
   } catch (err) { toast(err.message, true); }
+  btn.disabled = false;
 };
 
 $("btnResetPerf").onclick = async () => {
@@ -2275,13 +2465,21 @@ function renderDiscovery() {
   ]);
 }
 
+// "mpv 0.37.0 Copyright © 2000-2023 mpv/MPlayer/mplayer2 projects" is a banner,
+// not a version. Keep the part that identifies the build.
+function shortVersion(text) {
+  if (!text) return text;
+  const cut = String(text).split(/\s+copyright|\s+©/i)[0].trim();
+  return cut.length > 46 ? cut.slice(0, 45) + "…" : cut;
+}
+
 function renderVersions() {
   const v = (STATE && STATE.system.versions) || {};
   $("versionInfo").innerHTML = kvs([
     ["Model", v.model], ["Revision", v.revision], ["Serial", v.serial],
     ["OS", v.os], ["Kernel", v.kernel], ["Firmware", v.firmware],
     ["pi-streamer", v.pistreamer], ["GStreamer", v.gstreamer],
-    ["NDI SDK", v.ndi_sdk], ["mpv", v.mpv],
+    ["NDI SDK", shortVersion(v.ndi_sdk)], ["mpv", shortVersion(v.mpv)],
     ["Pipeline", STATE && STATE.config.use_gst_launch ? "gst-launch (fallback)" : "instrumented runner"],
   ]);
 }
@@ -2439,7 +2637,7 @@ async function loadMedia() {
           <div class="name">${f.name}</div>
           <div class="sub">${f.kind} · ${fmtBytes(f.size)}</div>
         </div>
-        <button class="btn primary" data-play="${encodeURIComponent(f.name)}">Play</button>
+        <button class="btn small accent" data-play="${encodeURIComponent(f.name)}">Play</button>
         <button class="btn danger" data-del="${encodeURIComponent(f.name)}">Delete</button>
       </li>`).join("");
 
@@ -2689,16 +2887,11 @@ function renderModes() {
     modes.map((m) => `<option value="${m}">${m}</option>`).join("");
   $("cfgMode").value = chosen;
 }
-$("cfgConnector").onchange = () => { settingsDirty = true; renderModes(); };
-
-document.querySelectorAll("#tab-display input, #tab-display select").forEach((el) => {
-  el.addEventListener("input", () => { settingsDirty = true; });
-});
+$("cfgConnector").onchange = renderModes;
 $("cfgVolume").oninput = () => { $("volLabel").textContent = $("cfgVolume").value; };
 
-$("btnSaveDisplay").onclick = async () => {
-  try {
-    await post("/api/config", {
+function displayPatch() {
+  return {
       connector: $("cfgConnector").value,
       video_mode: $("cfgMode").value,
       rotation: parseInt($("cfgRotation").value, 10),
@@ -2709,13 +2902,9 @@ $("btnSaveDisplay").onclick = async () => {
       volume: parseInt($("cfgVolume").value, 10),
       ndi_bandwidth: $("cfgBandwidth").value,
       ndi_latency_ms: parseInt($("cfgLatency").value, 10) || 0,
-      ndi_timestamp_mode: $("cfgTimestampMode").value,
-    });
-    settingsDirty = false;
-    toast("Saved — pipeline restarting");
-    poll();
-  } catch (err) { toast(err.message, true); }
-};
+    ndi_timestamp_mode: $("cfgTimestampMode").value,
+  };
+}
 
 // ---------- system ----------
 

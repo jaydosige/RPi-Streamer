@@ -86,7 +86,7 @@ async def main():
             await pg.goto("http://127.0.0.1:8131/", wait_until="networkidle")
 
             print("\ntyping is not overwritten by the poll")
-            await pg.click("text=Nodes")
+            await pg.click('nav button[data-tab="nodes"]')
             await pg.wait_for_timeout(1500)
             await pg.click("#cfgClusterKey")
             await pg.fill("#cfgClusterKey", "")
@@ -140,11 +140,23 @@ async def main():
                   await pg.input_value("#cfgClusterGroup"))
 
             print("\nupload progress")
-            await pg.click("text=Local media")
+            await pg.click('nav button[data-tab="media"]')
             await pg.wait_for_timeout(800)
+            # Throttle the upload. Over loopback an 18MB file lands in about
+            # 70ms, which is faster than a rate can be honestly measured — so
+            # the rate assertion passed or failed depending on scheduling. A
+            # capped upload speed makes every intermediate state real, and is
+            # closer to the Wi-Fi this actually runs over.
+            cdp = await pg.context.new_cdp_session(pg)
+            await cdp.send("Network.enable")
+            await cdp.send("Network.emulateNetworkConditions", {
+                "offline": False, "latency": 5,
+                "downloadThroughput": 50 * 1024 * 1024,
+                "uploadThroughput": 6 * 1024 * 1024,
+            })
             await pg.set_input_files("#fileInput", str(upload_src))
             seen_bar, seen_pct, seen_rate = False, False, False
-            deadline = time.time() + 60
+            deadline = time.time() + 120
             while time.time() < deadline:
                 html = await pg.eval_on_selector("#uploadProgress", "e => e.innerHTML")
                 if "bar" in html:
@@ -165,6 +177,10 @@ async def main():
             check("it showed a transfer rate", seen_rate)
             final = await pg.eval_on_selector("#uploadProgress", "e => e.innerText")
             check("it finished as done", "done" in final, final.replace("\n", " | "))
+            await cdp.send("Network.emulateNetworkConditions", {
+                "offline": False, "latency": 0,
+                "downloadThroughput": -1, "uploadThroughput": -1,
+            })
             listed = json.loads(urllib.request.urlopen(
                 "http://127.0.0.1:8131/api/media", timeout=5).read())["files"]
             check("the file is in the library",
@@ -177,7 +193,7 @@ async def main():
                 data=json.dumps({"name": "Wall", "items": [
                     {"type": "file", "target": "big-upload.mp4"}]}).encode(),
                 headers={"Content-Type": "application/json"}), timeout=10)
-            await pg.click("text=Nodes")
+            await pg.click('nav button[data-tab="nodes"]')
             await pg.wait_for_timeout(1200)
             await pg.select_option("#syncPlaylist", "Wall")
             await pg.click("#btnPushPlaylist")
@@ -249,6 +265,8 @@ async def main():
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:
+        for name in FAIL:
+            print(f"  FAILED: {name}")
         sys.exit(1)
 
 

@@ -17,8 +17,11 @@ Built for Live Wire Event Solutions. Reference platform: Pi 4B (4GB or 8GB),
 - Drives HDMI through DRM/KMS — no X, no Wayland, no desktop
 - Restores the last source on boot, and reconnects on its own when a sender
   drops and comes back
-- Web GUI at `http://<hostname>.local/` for source selection, media upload,
-  display and audio settings, health, logs, reboot
+- Web GUI at `http://<hostname>.local/` — six tabs: **Now playing** (what is on
+  screen and whether the node is healthy), **NDI**, **Media** (library,
+  playlists, running order), **Nodes** (the group), **Output** (display, audio,
+  performance) and **System** (telemetry, identity, power). Built for a phone in
+  a dark room as much as a laptop
 
 ## Architecture
 
