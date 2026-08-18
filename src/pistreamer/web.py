@@ -20,10 +20,11 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, Field
 
-from . import (cluster, config, diagnose, display, guest, media, ndiconfig,
-               playlists, pushjob, schedule as schedule_mod, sources, syncplay,
-               system, updates)
-from .player import MODE_IDLE, MODE_LOCAL, MODE_NDI, identify_text, player
+from . import (airplay, cluster, config, diagnose, display, guest, media,
+               ndiconfig, playlists, pushjob, schedule as schedule_mod, sources,
+               syncplay, system, updates)
+from .player import (MODE_AIRPLAY, MODE_IDLE, MODE_LOCAL, MODE_NDI,
+                     identify_text, player)
 from .telemetry import telemetry
 
 # The conductor is given callables rather than importing the player and the
@@ -155,7 +156,8 @@ async def lifespan(app: FastAPI):
     if cfg.schedule_enabled:
         schedule_mod.scheduler.start()
     if cfg.autostart and cfg.mode != MODE_IDLE:
-        target = cfg.ndi_source if cfg.mode == MODE_NDI else cfg.local_file
+        target = "" if cfg.mode == MODE_AIRPLAY else (
+            cfg.ndi_source if cfg.mode == MODE_NDI else cfg.local_file)
         log.info("autostarting mode=%s target=%s", cfg.mode, target)
         player.apply(cfg.mode, target)
     yield
@@ -229,7 +231,16 @@ def apply_cue_action(action: str, target: str) -> None:
     elif action == "folder":
         config.update(mode=MODE_LOCAL, local_playlist="", local_file="")
         player.apply(MODE_LOCAL, "")
-    elif action == "standby":
+    elif action == "airplay":
+        ok, reason = airplay.available()
+        if not ok:
+            raise ValueError(reason)
+        config.update(mode=MODE_AIRPLAY)
+        player.apply(MODE_AIRPLAY)
+    elif action in ("standby", "stop"):
+        # "stop" is the group vocabulary for the same thing the GUI's Stop
+        # button does. It used to fall through to the error below, so a group
+        # stop failed on every node at once — the one moment you least want it.
         config.update(mode=MODE_IDLE)
         player.apply(MODE_IDLE)
     else:
@@ -282,6 +293,7 @@ async def get_status() -> Dict[str, Any]:
                    "busy": updates.busy()},
         "config": config.load().to_dict(),
         "discovery": sources.status(),
+        "airplay": airplay.summary(),
     }
 
 
@@ -324,7 +336,7 @@ async def get_capabilities() -> Dict[str, Any]:
                         compressed_supported = False
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc), "decoders": [], "hardware_decoders": [],
-                "advanced_sdk": False}
+                "advanced_sdk": False, "airplay": airplay.capabilities()}
 
     hardware = [d for d in decoders if d["hardware"]]
     return {
@@ -335,6 +347,7 @@ async def get_capabilities() -> Dict[str, Any]:
         "ndi_config": ndiconfig.current(),
         "color_formats": list(COLOR_FORMATS),
         "video_formats": list(VIDEO_FORMATS),
+        "airplay": airplay.capabilities(),
     }
 
 
@@ -550,6 +563,41 @@ async def play_local(body: PlayLocal) -> Dict[str, Any]:
     if status["last_error"]:
         raise HTTPException(500, status["last_error"])
     return status
+
+
+@app.post("/api/play/airplay")
+async def play_airplay() -> Dict[str, Any]:
+    """Start receiving AirPlay.
+
+    Nothing appears on the screen until somebody actually mirrors to the node —
+    the receiver only takes the display when a session starts. That is a
+    deliberate consequence of the one-owner rule, not an oversight, and the GUI
+    says so rather than leaving an operator staring at black wondering.
+    """
+    ok, reason = airplay.available()
+    if not ok:
+        raise HTTPException(409, reason)
+    take_local_control("AirPlay receiving started")
+    config.update(mode=MODE_AIRPLAY)
+    player.apply(MODE_AIRPLAY)
+    status = player.status()
+    if status["last_error"]:
+        raise HTTPException(500, status["last_error"])
+    return {**status, "airplay": airplay.summary()}
+
+
+@app.get("/api/airplay")
+async def get_airplay() -> Dict[str, Any]:
+    cfg = config.load()
+    caps = airplay.capabilities()
+    return {
+        **caps,
+        "on": cfg.mode == MODE_AIRPLAY,
+        "name": airplay.receiver_name(cfg),
+        "session": airplay.summary(),
+        "ports": airplay.ports(cfg),
+        "command": airplay.build_command(cfg, video_sink="kmssink"),
+    }
 
 
 @app.post("/api/stop")
@@ -1232,7 +1280,7 @@ async def post_identify(body: IdentifyBody, request: Request) -> Dict[str, Any]:
 class CommandBody(BaseModel):
     # Same vocabulary the schedule cues use, so "do this everywhere" and "do
     # this here" cannot drift apart.
-    action: Literal["ndi", "playlist", "file", "standby", "stop", "reboot"]
+    action: Literal["ndi", "playlist", "file", "airplay", "standby", "stop", "reboot"]
     target: str = ""
     nodes: List[str] = Field(default_factory=list)
 

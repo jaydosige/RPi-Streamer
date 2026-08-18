@@ -13,15 +13,19 @@ Built for Live Wire Event Solutions. Reference platform: Pi 4B (4GB or 8GB),
 
 - Receives NDI from any sender on the LAN (OBS, vMix, a PTZ camera, NDI Tools)
 - Discovers senders automatically and lists them in the GUI
+- Receives AirPlay: an iPhone, iPad or Mac mirrors onto the node from the
+  ordinary picker, with an optional pairing code
 - Plays or loops local video files, uploadable through the browser
+- Takes a photo or video from anyone in the room, from a QR code the operator
+  can switch on and off
 - Drives HDMI through DRM/KMS — no X, no Wayland, no desktop
 - Restores the last source on boot, and reconnects on its own when a sender
   drops and comes back
 - Web GUI at `http://<hostname>.local/` — six tabs: **Now playing** (what is on
-  screen and whether the node is healthy), **NDI**, **Media** (library,
-  playlists, running order), **Nodes** (the group), **Output** (display, audio,
-  performance) and **System** (telemetry, identity, power). Built for a phone in
-  a dark room as much as a laptop
+  screen and whether the node is healthy), **Sources** (AirPlay and NDI),
+  **Media** (library, playlists, guest sharing, running order), **Nodes** (the
+  group), **Output** (display, audio, performance) and **System** (telemetry,
+  identity, power). Built for a phone in a dark room as much as a laptop
 
 ## Architecture
 
@@ -281,6 +285,64 @@ gst-device-monitor-1.0 Source/Network  # what senders can this Pi see?
 The GUI's pipeline log shows GStreamer/mpv stderr, which is where decode errors
 and NDI connection failures surface first.
 
+## AirPlay
+
+An iPhone, iPad or Mac mirrors onto the node from the ordinary AirPlay picker.
+Sources tab → **AirPlay** → *Start receiving*. The node appears under its own
+name, so on a multi-node rig you pick STAGE-LEFT or STAGE-RIGHT from the phone.
+
+Receiving is a **playback mode**, not a background service, and that is the
+whole design: an AirPlay session takes the display, and this project has one
+rule about the display — one process owns it at a time. Starting AirPlay stops
+whatever was playing, exactly as switching to NDI does. A schedule cue or a
+group command can switch to it like any other mode.
+
+**The screen is black until somebody connects.** The receiver only takes the
+display when a session actually starts, so between devices there is nothing to
+show. That is deliberate: the alternative is two processes contending for DRM
+master, and losing that race means the mirror fails in front of a room rather
+than merely starting late. If you want a holding slide up until the moment
+someone mirrors, leave the node on standby or a playlist and switch to AirPlay
+when they are ready — one click, or a cue.
+
+Notes from getting it working, all of which will bite again:
+
+* **The pairing code has nowhere to go.** With *Ask for a pairing code* on,
+  uxplay prints a four-digit code — to a terminal a headless node does not
+  have. The GUI is that terminal: the code appears on the card, and changes
+  each time the receiver restarts.
+* **Avahi must be running.** Without it uxplay prints one error and exits,
+  which a supervisor reads as a crash worth retrying all evening. It is checked
+  before starting instead, and the GUI says what to run.
+* **Hardware decode is checked, not assumed.** `v4l2h264dec` is the Pi's GPU
+  h264 decoder and is on by default, but uxplay *aborts* on an unknown element
+  in about 40 ms. If it is not there — the codec module has not loaded, or this
+  is not a Pi — the receiver quietly falls back to software rather than
+  crash-looping behind `exited with code -5`.
+* **Ports.** Left alone they are dynamic and advertised over mDNS. Pin them
+  with `airplay_port` if there is a firewall between the phones and the node:
+  with `-p n` the AirPlay service ends up on **n+2** (measured, not guessed),
+  and mDNS needs UDP 5353 either way.
+
+### Miracast: not built, and why
+
+Miracast (Android and Windows "cast to a wireless display") does not fit this
+box. The Linux sink implementation is MiracleCast, and it requires shutting
+down NetworkManager and taking exclusive control of wpa_supplicant on the
+radio — on this node that is the radio carrying the web GUI, so turning
+Miracast on disconnects the operator from the thing they would use to turn it
+off. It is also not packaged in Debian, and needs Wi-Fi Direct P2P running
+alongside the station connection, which the Pi's onboard Broadcom radio
+supports only in a limited combination.
+
+With a second, dedicated Wi-Fi adapter it becomes arguable — MiracleCast could
+own that one while NetworkManager keeps the built-in. That is untested here and
+would need the hardware in hand before it went near a job.
+
+For Windows and Android laptops, **NDI is the better answer and already
+works**: NDI Screen Capture is a free download for Windows, sends over the
+wired network, and appears in the Sources tab like any other sender.
+
 ## Guest sharing
 
 Somebody at the job has a video on their phone and wants it on the screen. Media
@@ -452,6 +514,7 @@ python3 tests/test_gui.py          # real browser: the poll must not overwrite
 python3 tests/test_update.py       # updates, against real git repositories
 python3 tests/test_guest.py        # guest sharing: what the room can and
                                    # cannot do, and the QR decodes
+python3 tests/test_airplay.py     # AirPlay, against a real uxplay process
 
 python -m pistreamer.runner --self-test             # the real video chain
 python -m pistreamer.runner --self-test-compressed  # decoder selection
@@ -488,6 +551,8 @@ src/pistreamer/
   diagnose.py               network-vs-Pi verdict with evidence
   telemetry.py              rolling 10-minute sampler, memory only
   system.py                 telemetry, audio devices, overclock, power actions
+  airplay.py                AirPlay receiving: uxplay's command line, and
+                            reading a session out of its output
   guest.py                  guest sharing sessions, tokens, QR
   updates.py                the app half of GUI-driven updates
   web.py                    FastAPI app

@@ -249,6 +249,21 @@
   }
   .empty { color: var(--muted); font-size: 14px; padding: 14px 2px; }
 
+  /* AirPlay. The pairing code is the whole card when it is showing: uxplay
+     prints it to a terminal this node does not have, so if the GUI does not
+     make it unmissable the feature does not exist. */
+  .ap-state { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .ap-state .who { font-size: 17px; font-weight: 600; overflow-wrap: anywhere; }
+  .ap-pin {
+    display: flex; align-items: baseline; gap: 12px; margin: 12px 0;
+    padding: 12px 16px; border-radius: 10px; background: var(--panel-2);
+    border: 1px solid var(--accent); animation: rise var(--slow) var(--ease);
+  }
+  .ap-pin b {
+    font-family: ui-monospace, monospace; font-size: clamp(26px, 5vw, 38px);
+    letter-spacing: 6px; line-height: 1;
+  }
+
   /* Guest sharing. The QR has to survive being photographed off a laptop
      screen at an angle from two feet away, so it gets a real white card and a
      quiet zone rather than being tinted to match the dark GUI. */
@@ -452,7 +467,7 @@
 
 <nav>
   <button data-tab="now" class="active">Now playing</button>
-  <button data-tab="ndi">NDI</button>
+  <button data-tab="ndi">Sources</button>
   <button data-tab="media">Media</button>
   <button data-tab="nodes">Nodes</button>
   <button data-tab="output">Output</button>
@@ -497,6 +512,17 @@
   </section>
 
   <section id="tab-ndi">
+    <div class="card" id="airplayCard">
+      <h2>AirPlay</h2>
+      <div class="note" style="margin-bottom:12px">
+        An iPhone, iPad or Mac mirrors onto this node from the AirPlay picker.
+        Receiving takes the screen, so it is a source like any other &mdash;
+        starting it stops whatever is playing, and the screen stays black until
+        somebody actually connects.
+      </div>
+      <div id="airplayBody"></div>
+    </div>
+
     <div class="card">
       <h2>Discovered senders</h2>
       <div class="row" style="margin-bottom:12px">
@@ -1298,7 +1324,7 @@ document.querySelectorAll("nav button").forEach((btn) => {
     if (tab === "media") { loadMedia(); loadPlaylists(); loadSchedule(); loadGuest(); }
     if (tab === "output") { loadConnectors(); loadAudioDevices(); loadPerf(); }
     if (tab === "system") { loadTelemetry(); loadOverclock(); loadUpdate(); }
-    if (tab === "ndi") loadNdiNetwork();
+    if (tab === "ndi") { loadNdiNetwork(); loadAirplay(); }
     if (tab === "nodes") loadNodes();
   };
 });
@@ -1392,7 +1418,13 @@ function renderStatus() {
     dot.className = "dot"; txt.textContent = "idle";
   } else if (p.running) {
     if (p.fallback) { dot.className = "dot err"; txt.textContent = "source lost — standby"; }
-    else { dot.className = "dot on"; txt.textContent = p.mode === "ndi" ? "receiving NDI" : "playing local"; }
+    else {
+      dot.className = "dot on";
+      txt.textContent = p.mode === "ndi" ? "receiving NDI"
+        : p.mode === "airplay"
+          ? ((STATE.airplay || {}).mirroring ? "AirPlay mirroring" : "AirPlay waiting")
+          : "playing local";
+    }
   } else {
     dot.className = "dot err"; txt.textContent = "stopped";
   }
@@ -1412,6 +1444,13 @@ function renderStatus() {
     label = p.target || "Whole media folder";
     mode = c.local_playlist ? `playlist · ${c.local_playlist}` : "local media";
     chip = p.running ? "live" : "";
+  } else if (p.mode === "airplay") {
+    const a = STATE.airplay || {};
+    label = a.mirroring
+      ? (a.client || "A device") + " is mirroring"
+      : "Waiting for a device \u2014 screen is black until one connects";
+    mode = "AirPlay";
+    chip = a.mirroring ? "live" : "";
   }
   $("nowTarget").textContent = label;
   $("nowMode").textContent = mode;
@@ -1435,6 +1474,8 @@ function renderStatus() {
       + `would have played over the current item. Check the log if this keeps happening.`);
   }
   err.innerHTML = banners.map((b) => `<div class="banner">${b}</div>`).join("");
+
+  renderAirplayLive();
 
   renderStream(STATE.stream || {}, p);
 
@@ -2878,6 +2919,120 @@ async function loadMedia() {
   } catch (err) {
     $("mediaList").innerHTML = `<div class="banner">${err.message}</div>`;
   }
+}
+
+// ---------- airplay ----------
+//
+// uxplay assumes somebody is watching a terminal: it prints the pairing code
+// there and nowhere else. On a headless node that makes the PIN unusable, so
+// this card is the terminal.
+//
+// The card is drawn in two pieces on purpose. The settings are rendered once,
+// when the tab is opened; only the state line is redrawn from the poll. Redraw
+// the whole card every two seconds and it takes the half-typed receiver name
+// with it — the same bug that made the group key impossible to edit.
+
+let AIRPLAY = null;
+
+function airplayLiveHtml(live, on) {
+  const state = !on ? ["", "Off"]
+    : live.mirroring ? ["on", `${live.client || "A device"} is mirroring`]
+    : ["", "Waiting for a device"];
+  return `
+    <div class="ap-state">
+      <span class="dot ${state[0]}"></span>
+      <span class="who">${state[1]}</span>
+      ${live.model ? `<span class="chip">${live.model}</span>` : ""}
+      ${live.connected_for ? `<span class="host">${fmtDuration(live.connected_for)}</span>` : ""}
+    </div>
+    ${live.pin ? `<div class="ap-pin">
+        <b>${live.pin}</b>
+        <span class="note">Enter this on the device when it asks for an AirPlay
+        password. It changes each time the receiver restarts.</span>
+      </div>` : ""}
+    ${live.last_error ? `<div class="banner">${live.last_error}</div>` : ""}`;
+}
+
+function renderAirplayLive() {
+  const box = $("airplayLive");
+  if (!box || !AIRPLAY) return;
+  const on = STATE && STATE.player ? STATE.player.mode === "airplay" : AIRPLAY.on;
+  box.innerHTML = airplayLiveHtml((STATE && STATE.airplay) || {}, on);
+  const start = $("btnAirplayStart"), stop = $("btnAirplayStop");
+  if (start) start.style.display = on ? "none" : "";
+  if (stop) stop.style.display = on ? "" : "none";
+}
+
+async function loadAirplay() {
+  let a;
+  try {
+    a = await api("/api/airplay");
+  } catch (err) {
+    $("airplayBody").innerHTML = `<div class="banner">${err.message}</div>`;
+    return;
+  }
+  AIRPLAY = a;
+  if (!a.available) {
+    AIRPLAY = null;
+    $("airplayBody").innerHTML =
+      `<div class="banner warn">${a.reason || "AirPlay is not available on this node."}</div>`;
+    return;
+  }
+  const c = (STATE && STATE.config) || {};
+  $("airplayBody").innerHTML = `
+    <div id="airplayLive"></div>
+    <label class="field">
+      <span class="lbl">Name shown in the AirPlay picker &mdash; blank uses the node name</span>
+      <input type="text" id="apName" placeholder="${a.name}">
+    </label>
+    <div class="checkline">
+      <input type="checkbox" id="apPin">
+      <label for="apPin">Ask for a pairing code before letting a device on</label>
+    </div>
+    <div class="checkline">
+      <input type="checkbox" id="apHold">
+      <label for="apHold">Hold the last frame when a device stops mirroring</label>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button class="btn primary" id="btnAirplayStart">Start receiving</button>
+      <button class="btn danger" id="btnAirplayStop" style="display:none">Stop receiving</button>
+      <span class="host">uxplay ${a.version || "?"}${
+        a.ports && a.ports.fixed ? ` \u00b7 TCP/UDP ${a.ports.tcp.join(", ")}` : ""}</span>
+    </div>`;
+
+  $("apName").value = c.airplay_name || "";
+  $("apPin").checked = !!c.airplay_pin;
+  $("apHold").checked = c.airplay_hold_last_frame !== false;
+
+  // Saved on change rather than through the save bar: this card is redrawn
+  // when the tab reopens, and a control that outlives its own value is worse
+  // than one extra request.
+  const save = async (key, value, note) => {
+    try {
+      await post("/api/config", { [key]: value });
+      if (note) toast(note);
+      if (AIRPLAY && AIRPLAY.on) toast("Restart receiving for this to take effect");
+    } catch (err) { toast(err.message, true); }
+  };
+  $("apName").onchange = () => save("airplay_name", $("apName").value.trim());
+  $("apPin").onchange = () => save("airplay_pin", $("apPin").checked);
+  $("apHold").onchange = () => save("airplay_hold_last_frame", $("apHold").checked);
+
+  $("btnAirplayStart").onclick = async () => {
+    try {
+      await post("/api/play/airplay");
+      toast("AirPlay is receiving \u2014 pick this node on your device");
+      poll(); loadAirplay();
+    } catch (err) { toast(err.message, true); }
+  };
+  $("btnAirplayStop").onclick = async () => {
+    try {
+      await post("/api/stop");
+      toast("Stopped receiving");
+      poll(); loadAirplay();
+    } catch (err) { toast(err.message, true); }
+  };
+  renderAirplayLive();
 }
 
 // ---------- guest sharing ----------

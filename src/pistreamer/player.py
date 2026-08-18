@@ -29,14 +29,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
-from . import config, display, media, mpvipc, playlists, sources, syncplay
+from . import airplay, config, display, media, mpvipc, playlists, sources, syncplay
 
 log = logging.getLogger(__name__)
 
 MODE_IDLE = "idle"
 MODE_NDI = "ndi"
 MODE_LOCAL = "local"
-VALID_MODES = {MODE_IDLE, MODE_NDI, MODE_LOCAL}
+# Receiving an AirPlay mirror. A mode, not a background service, because the
+# session takes the display and the display has exactly one owner.
+MODE_AIRPLAY = "airplay"
+VALID_MODES = {MODE_IDLE, MODE_NDI, MODE_LOCAL, MODE_AIRPLAY}
 
 # Backoff schedule for automatic restarts, in seconds.
 _BACKOFF = [1, 2, 5, 10, 15, 30]
@@ -45,6 +48,14 @@ _HEALTHY_AFTER = 30.0
 _LOG_LINES = 300
 # Prefix the runner uses to mark a machine-readable stats line on stdout.
 STATS_PREFIX = "@STATS "
+# How long the AirPlay receiver gets to start advertising itself before we
+# call it broken. It normally takes well under a second.
+_AIRPLAY_LISTEN_TIMEOUT = 10.0
+# uxplay validates its sink and decoder strings at startup and aborts on a bad
+# one in about 40 ms. Anything that dies this fast died of its configuration,
+# and restarting it will do exactly the same thing.
+_AIRPLAY_FAST_FAIL = 3.0
+_AIRPLAY_FAST_FAIL_LIMIT = 3
 # Supervisor tick. Fast enough that a segment change is not visibly late —
 # at 1s a playlist transition could sit black for most of a second.
 _TICK = 0.25
@@ -52,7 +63,8 @@ _TICK = 0.25
 # Command-line fragments that identify a player process of ours. Used only to
 # clean up strays: a player that outlived its supervisor keeps its audio going
 # and mixes with the next one, which is heard as two tracks at once.
-_PLAYER_SIGNATURES = ("pistreamer.runner", "mpv --no-config", "gst-launch-1.0")
+_PLAYER_SIGNATURES = ("pistreamer.runner", "mpv --no-config", "gst-launch-1.0",
+                      "uxplay")
 
 
 def _stray_players(exclude_pid: Optional[int] = None) -> List[int]:
@@ -329,6 +341,9 @@ class Player:
         # this is not zero, something is escaping teardown and the user is
         # hearing two soundtracks — worth surfacing rather than hiding.
         self._stray_kills = 0
+        # Consecutive AirPlay receivers that died before they could work.
+        self._airplay_fast_fails = 0
+        self._airplay_stuck = False
 
     # ------------------------------------------------------------------
     # Command construction
@@ -427,6 +442,37 @@ class Player:
             ] + audio_sink
 
         return cmd
+
+    def _airplay_command(self, cfg: config.Config) -> List[str]:
+        """Run uxplay against the same display the other backends use.
+
+        The video sink is built here rather than in `airplay.py` because it is
+        the *display* half of the problem, and everything known about driving
+        this display — the connector id, the DRM driver name, the fact that
+        kmssink will only set a mode it was handed exactly — already lives here.
+        """
+        conn = display.pick_connector(cfg.connector)
+        conn_name = conn.name if conn else ""
+        conn_id = _connector_id(conn_name)
+
+        sink = ["kmssink", "force-modesetting=true"]
+        if conn_id is not None:
+            sink.append(f"connector-id={conn_id}")
+        driver = display.drm_driver_for(conn_name) if conn_name else None
+        if driver:
+            sink.append(f"driver-name={driver}")
+        if cfg.airplay_video_sink.strip():
+            sink = [cfg.airplay_video_sink.strip()]
+
+        mode = display.target_mode(conn, cfg.video_mode)
+        refresh = getattr(mode, "refresh", None) if mode else None
+        return airplay.build_command(
+            cfg,
+            video_sink=" ".join(sink),
+            width=mode.width if mode else None,
+            height=mode.height if mode else None,
+            refresh=int(refresh) if refresh else None,
+        )
 
     def _local_command(self, cfg: config.Config, selection: str) -> List[str]:
         # A named playlist wins over a single file or the whole folder, and
@@ -668,11 +714,31 @@ class Player:
             if not shutil.which("mpv"):
                 raise RuntimeError("mpv not installed")
             return self._local_command(cfg, target)
+        if mode == MODE_AIRPLAY:
+            # Checked before spawning, not after: with no Avahi, uxplay prints
+            # one line and exits, and a supervisor reads that as a crash worth
+            # retrying every few seconds for the rest of the evening.
+            ok, reason = airplay.available()
+            if not ok:
+                raise RuntimeError(reason)
+            return self._airplay_command(cfg)
         raise RuntimeError(f"mode {mode!r} has no command")
 
     # ------------------------------------------------------------------
     # Process lifecycle
     # ------------------------------------------------------------------
+
+    def _note_line(self, line: str) -> None:
+        """One line of child output: into the log, and past the AirPlay reader.
+
+        uxplay writes its status to *stdout* and its errors to stderr, and the
+        two things an operator most needs — the pairing PIN and who just
+        connected — arrive on stdout. Both drains come through here so it does
+        not matter which stream a message chose.
+        """
+        self._logs.append(f"{time.strftime('%H:%M:%S')} {line}")
+        if self._status.mode == MODE_AIRPLAY:
+            airplay.observe(line)
 
     def _drain_output(self, proc: subprocess.Popen) -> None:
         """Pump the child's stderr into the ring buffer for the GUI log view."""
@@ -683,7 +749,7 @@ class Player:
             for raw in stream:
                 line = raw.rstrip("\n")
                 if line:
-                    self._logs.append(f"{time.strftime('%H:%M:%S')} {line}")
+                    self._note_line(line)
         except (OSError, ValueError):
             pass
 
@@ -704,7 +770,7 @@ class Player:
                     except json.JSONDecodeError:
                         pass
                 else:
-                    self._logs.append(f"{time.strftime('%H:%M:%S')} {line}")
+                    self._note_line(line)
         except (OSError, ValueError):
             pass
 
@@ -891,6 +957,12 @@ class Player:
             self._status.fallback = False
             self._segments = []
             self._segment_deadline = None
+            # A new mode means the old AirPlay session is over — including when
+            # the new mode is AirPlay again, since restarting the receiver
+            # drops whoever was mirroring.
+            airplay.reset()
+            self._airplay_fast_fails = 0
+            self._airplay_stuck = False
             # Any explicit mode change ends a synchronised session: the operator
             # has taken local control of this node. Remember *which* session, so
             # this node refuses the rest of it but still joins the next one.
@@ -1106,6 +1178,50 @@ class Player:
     # Supervisor
     # ------------------------------------------------------------------
 
+    def _airplay_exit_reason(self, proc: subprocess.Popen) -> str:
+        """Did this receiver die of its configuration rather than bad luck?
+
+        `player exited with code -5` is true and useless. uxplay puts the real
+        reason on its own output, which we have already read, so hand that to
+        the operator — and after a few of these, stop restarting. A typo does
+        not get better by being retried every second for the rest of the show.
+        """
+        ran_for = time.time() - (self._status.since or time.time())
+        if ran_for >= _AIRPLAY_FAST_FAIL:
+            self._airplay_fast_fails = 0
+            return ""
+        self._airplay_fast_fails += 1
+        if self._airplay_fast_fails < _AIRPLAY_FAST_FAIL_LIMIT:
+            return ""
+        self._airplay_stuck = True
+        detail = airplay.session().last_error
+        if not detail:
+            tail = [l for l in list(self._logs)[-8:] if "ERROR" in l or "no element" in l]
+            detail = tail[-1][-160:] if tail else f"it exited with {proc.returncode}"
+        return (f"the AirPlay receiver would not stay up ({detail}). "
+                "Fix that and press Start receiving again.")
+
+    def _check_airplay_startup(self) -> None:
+        """A receiver that is up but not listening is not working.
+
+        uxplay can start, print its banner, and then wedge while building its
+        video pipeline — which is what happens if the sink cannot reach a
+        display. The process is alive, so every liveness check says fine, and
+        the operator sees a green light and a black screen. Say so instead.
+        """
+        since = self._status.since
+        if not since or (time.time() - since) < _AIRPLAY_LISTEN_TIMEOUT:
+            return
+        if airplay.session().listening or self._status.last_error:
+            return
+        tail = " / ".join(list(self._logs)[-2:])
+        self._status.last_error = (
+            "the AirPlay receiver started but never began advertising itself "
+            f"after {int(_AIRPLAY_LISTEN_TIMEOUT)}s — it is usually the video "
+            f"output that is wrong. Last output: {tail[-200:]}"
+        )
+        log.error("%s", self._status.last_error)
+
     def _backoff_delay(self) -> int:
         delay = _BACKOFF[min(self._backoff_idx, len(_BACKOFF) - 1)]
         self._backoff_idx += 1
@@ -1193,6 +1309,8 @@ class Player:
                             self._next_attempt = time.monotonic() + self._backoff_delay()
                 elif self._status.since and (time.time() - self._status.since) > _HEALTHY_AFTER:
                     self._backoff_idx = 0  # been up a while; forget the backoff
+                if mode == MODE_AIRPLAY:
+                    self._check_airplay_startup()
                 return
 
             # Whatever was running has exited.
@@ -1202,8 +1320,18 @@ class Player:
                     if self._fallback
                     else f"player exited with code {proc.returncode}"
                 )
+                if mode == MODE_AIRPLAY and not self._fallback:
+                    reason = self._airplay_exit_reason(proc)
+                    if reason:
+                        self._status.last_error = reason
+                        self._status.running = False
+                        self._proc = None
+                        return
             self._status.running = False
             self._proc = None
+
+            if mode == MODE_AIRPLAY and self._airplay_stuck:
+                return
 
             if mode == MODE_IDLE:
                 # The standby screen is the point of idle; bring it back.

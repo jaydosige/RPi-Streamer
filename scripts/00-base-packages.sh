@@ -53,6 +53,18 @@ apt_install \
 
 ok "Base packages ready"
 
+# --- AirPlay receiving -----------------------------------------------------
+# uxplay is in Debian from Trixie (and Ubuntu from Noble). On anything older
+# it simply is not there, and that is not a reason to fail an install: the node
+# works perfectly well without AirPlay, and the GUI already says so with the
+# command to fix it. Hence the || rather than set -e taking the whole run down.
+if apt_install uxplay 2>/dev/null; then
+  ok "AirPlay receiving available (uxplay $(uxplay -v 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1))"
+else
+  warn "uxplay is not in this distribution's archive, so AirPlay receiving will be unavailable."
+  warn "Everything else works. On Raspberry Pi OS Bookworm or older, upgrade to Trixie or build UxPlay from source."
+fi
+
 # Advertise the node over mDNS so <hostname>.local resolves without DNS.
 if ! systemctl is-enabled --quiet avahi-daemon 2>/dev/null; then
   systemctl enable --now avahi-daemon

@@ -164,6 +164,41 @@ class Config:
     # A line shown on the guest page, e.g. the name of the event.
     guest_note: str = ""
 
+    # --- airplay ---
+    # Receiving an iPhone/iPad/Mac screen, via uxplay. This is a playback mode
+    # like NDI or local, not a background service: an AirPlay session takes the
+    # display, and only one process may own the display.
+    # Blank uses device_name, which is what makes STAGE-LEFT and STAGE-RIGHT
+    # tellable apart in the picker on a phone at the back of a room.
+    airplay_name: str = ""
+    # Ask for a pairing code. The code is shown in the GUI, because a headless
+    # node has no terminal for uxplay to print it to.
+    airplay_pin: bool = False
+    # GPU h264 decode (v4l2h264dec + v4l2convert). Off falls back to software,
+    # which a Pi 4 can just about manage at 720p and not at all at 1080p60.
+    airplay_hw_decode: bool = True
+    # A workaround for older Video4Linux2 plugins not recognising Apple's
+    # full-range colour. Needed on GStreamer < 1.22; harmless to leave off on
+    # Trixie, which ships newer.
+    airplay_bt709: bool = False
+    # Cap the frame rate the client streams at. 30 is uxplay's own default and
+    # is the difference between a Pi 4 keeping up and not.
+    airplay_fps: int = 30
+    # Seconds of client silence before the session is dropped. Stored in
+    # seconds; uxplay counts in threes.
+    airplay_timeout_s: int = 15
+    # Leave the last frame on screen when the phone stops mirroring, instead of
+    # dropping to black in front of a room.
+    airplay_hold_last_frame: bool = True
+    # Pin the ports, for networks with a firewall between the phones and the
+    # node. 0 lets uxplay choose and advertise them over mDNS.
+    airplay_port: int = 0
+    # Escape hatch: force a GStreamer videosink instead of the DRM one built
+    # for this display. Only needed off a Pi — on a desktop with X11, or on a
+    # host with no DRM device at all, where the kmssink we would build hangs
+    # before the receiver ever starts listening.
+    airplay_video_sink: str = ""
+
     # --- cluster ---
     # Announce this node on the LAN and accept commands from its group. Off
     # makes the node completely invisible and uncontrollable from other nodes.
