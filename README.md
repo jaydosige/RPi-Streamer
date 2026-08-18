@@ -88,6 +88,33 @@ password prompt reads from stdin, so the *next pasted line* gets eaten as the
 password and both commands fail. Authenticate first and nothing that follows can
 be swallowed.
 
+### Updating
+
+After the first install, updates happen **from the GUI**: System → Software →
+Check for updates. The node fetches from the git remote it was installed from,
+shows what the update contains, and applies it — stopping playback, reinstalling
+and restarting the service. Nodes → Update the group does the same across every
+node, itself last so you can watch the others finish before your own page drops.
+
+It uses the clone's own credentials, so a private repository needs no token
+stored in the app. If a check reports an authentication failure, store the
+credentials once on the node:
+
+```bash
+git -C ~/RPi-Streamer config credential.helper store
+git -C ~/RPi-Streamer pull        # enter them once
+```
+
+Every update records the commit it came from, so **Roll back** returns the node
+to the previous version if something is wrong. A node installed from a tarball
+has no remote to update from and says so.
+
+The mechanics are the same path-activated root job as overclocking, for the same
+reason — the service cannot escalate — plus one more: the service's unit sets
+`ProtectHome=yes`, so it cannot even see the working copy in a login user's
+home. It writes a request; a root job does the git work and writes back a status
+file, which survives the service restart the update itself causes.
+
 ### One command per node: `bootstrap.sh`
 
 `install.sh` turns a Pi into a node. `scripts/bootstrap.sh` does everything
@@ -385,6 +412,7 @@ python3 tests/test_cluster_live.py # two real nodes: discovery, auth, file push
 python3 tests/test_overlay.py      # the identify caption actually renders
 python3 tests/test_gui.py          # real browser: the poll must not overwrite
                                    # what you are typing, and progress bars move
+python3 tests/test_update.py       # updates, against real git repositories
 
 python -m pistreamer.runner --self-test             # the real video chain
 python -m pistreamer.runner --self-test-compressed  # decoder selection

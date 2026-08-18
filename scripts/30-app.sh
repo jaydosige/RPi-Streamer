@@ -77,6 +77,40 @@ ok "polkit rules installed"
 install -d "${PISTREAMER_HOME}/bin"
 install -m 0755 "${REPO_DIR}/scripts/pistreamer-tuning" "${PISTREAMER_HOME}/bin/pistreamer-tuning"
 install -m 0755 "${REPO_DIR}/scripts/pistreamer-overclock" "${PISTREAMER_HOME}/bin/pistreamer-overclock"
+install -m 0755 "${REPO_DIR}/scripts/pistreamer-update" "${PISTREAMER_HOME}/bin/pistreamer-update"
+
+# --- where this node was installed from ------------------------------------
+# The updater runs as root from a systemd unit with no idea where the working
+# copy is, and the service itself cannot look: its unit sets ProtectHome=yes.
+# So record it here, once, at the only moment both facts are known.
+REPO_OWNER="$(stat -c '%U' "${REPO_DIR}" 2>/dev/null || echo root)"
+cat > "${PISTREAMER_CONFIG_DIR}/install.conf" <<CONF
+# Written by install.sh. Read by pistreamer-update.
+REPO_DIR=${REPO_DIR}
+REPO_USER=${REPO_OWNER}
+DEFAULT_BRANCH=main
+CONF
+chmod 0644 "${PISTREAMER_CONFIG_DIR}/install.conf"
+
+# What is actually running, recorded at install time so the GUI can show it
+# without needing to reach the repository — which the service cannot do.
+if [[ -d "${REPO_DIR}/.git" ]] && command -v git >/dev/null 2>&1; then
+  sudo -u "${REPO_OWNER}" git -C "${REPO_DIR}" log -1 \
+      --format='%H%x1f%h%x1f%s%x1f%cI' 2>/dev/null \
+    | REPO="${REPO_DIR}" python3 -c '
+import json, os, sys
+raw = sys.stdin.read().strip()
+out = {"repo": os.environ["REPO"], "source": "git"}
+if raw:
+    sha, short, subject, date = raw.split("\x1f")
+    out.update({"sha": sha, "short": short, "subject": subject, "date": date})
+print(json.dumps(out, indent=2))
+' > "${PISTREAMER_CONFIG_DIR}/build.json" || true
+else
+  printf '{"source": "archive"}\n' > "${PISTREAMER_CONFIG_DIR}/build.json"
+fi
+chmod 0644 "${PISTREAMER_CONFIG_DIR}/build.json" 2>/dev/null || true
+ok "Recorded the installed version"
 
 # Overclocking edits config.txt, which needs root. The service cannot escalate
 # — its unit sets NoNewPrivileges=yes, which blocks sudo for the service and
@@ -87,7 +121,14 @@ install -m 0644 "${REPO_DIR}/systemd/pistreamer-overclock.service" \
   /etc/systemd/system/pistreamer-overclock.service
 install -m 0644 "${REPO_DIR}/systemd/pistreamer-overclock.path" \
   /etc/systemd/system/pistreamer-overclock.path
+install -m 0644 "${REPO_DIR}/systemd/pistreamer-update.service" \
+  /etc/systemd/system/pistreamer-update.service
+install -m 0644 "${REPO_DIR}/systemd/pistreamer-update.path" \
+  /etc/systemd/system/pistreamer-update.path
 systemctl daemon-reload
+systemctl enable --now pistreamer-update.path >/dev/null 2>&1 \
+  && ok "update helper armed (path-activated, no sudo)" \
+  || warn "could not enable pistreamer-update.path; updating from the GUI will be unavailable"
 systemctl enable --now pistreamer-overclock.path >/dev/null 2>&1 \
   && ok "overclock helper armed (path-activated, no sudo)" \
   || warn "could not enable pistreamer-overclock.path; overclocking will be unavailable"

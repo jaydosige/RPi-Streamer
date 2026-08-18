@@ -1,0 +1,13 @@
+[Unit]
+Description=Check for or apply a pi-streamer update
+Documentation=man:systemd.service(5)
+
+[Service]
+Type=oneshot
+# Runs as root and deliberately outside pistreamer.service's control group:
+# applying an update restarts pistreamer, and a job that is a child of the
+# service it restarts kills itself halfway through.
+ExecStart=/opt/pistreamer/bin/pistreamer-update --from-request
+# An update reinstalls the application, which on a cold cache includes
+# compiling the NDI plugin. Long, but not unbounded.
+TimeoutStartSec=3600

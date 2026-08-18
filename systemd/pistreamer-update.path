@@ -1,0 +1,16 @@
+[Unit]
+Description=Watch for a pi-streamer update request
+Documentation=man:systemd.path(5)
+
+[Path]
+# The web service writes this file; this unit notices and runs the root job.
+# Path activation rather than sudo for the same reason as the overclock helper:
+# pistreamer.service sets NoNewPrivileges=yes, so it cannot escalate at all.
+# It also cannot see the git working copy — the unit sets ProtectHome=yes and
+# the clone lives in a login user's home — so every git operation happens in
+# the root job, not in the app.
+PathExists=/var/lib/pistreamer/update.request
+Unit=pistreamer-update.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,359 @@
+#!/usr/bin/env bash
+#
+# Check for and apply updates from the git remote the node was installed from.
+#
+# Runs as ROOT, triggered by pistreamer-update.path when the web service drops a
+# request file. Three constraints shaped all of this:
+#
+#   * The service cannot escalate. pistreamer.service sets NoNewPrivileges=yes,
+#     so sudo is impossible for it and every child of it — the same wall the
+#     overclock feature hit. Path activation is the way across.
+#   * The service cannot even see the clone. The unit sets ProtectHome=yes and
+#     the working copy lives under a login user's home, so every git operation
+#     has to happen here rather than in the app.
+#   * The update restarts the service that asked for it. So this must not be a
+#     child of that service, and the answer cannot come back as an HTTP
+#     response — it goes into a status file the GUI polls, which survives the
+#     restart and is still there when the service comes back.
+#
+# Updating means `git fetch` in the existing clone, using whatever credentials
+# already work for it. That is deliberate: the repository is private, and this
+# way the node needs no token of its own and we store no secret.
+#
+#   pistreamer-update check           # fetch and report what is available
+#   pistreamer-update apply [ref]     # update and reinstall
+#   pistreamer-update rollback        # go back to the commit before the update
+#   pistreamer-update --from-request  # what the path unit calls
+#
+set -uo pipefail
+
+STATE_DIR="${PISTREAMER_STATE:-/var/lib/pistreamer}"
+CONFIG_DIR="${PISTREAMER_CONFIG_DIR:-/etc/pistreamer}"
+REQUEST="${STATE_DIR}/update.request"
+STATUS="${STATE_DIR}/update.status"
+INSTALL_CONF="${CONFIG_DIR}/install.conf"
+
+# Never let git stop and ask for a password: this runs with no terminal, so a
+# prompt would hang the update for ever with no way to answer it.
+export GIT_TERMINAL_PROMPT=0
+export GIT_ASKPASS=/bin/true
+export SSH_ASKPASS=/bin/true
+
+FETCH_TIMEOUT="${PISTREAMER_FETCH_TIMEOUT:-45}"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# --- status file ------------------------------------------------------------
+# Written with python rather than assembled in bash: commit subjects contain
+# quotes, backslashes and non-ASCII, and hand-rolled JSON would corrupt the file
+# the GUI is polling.
+status_set() {
+  STATUS_PATH="${STATUS}" python3 - "$@" <<'PY'
+import json, os, sys, time
+
+path = os.environ["STATUS_PATH"]
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    data = {}
+
+for pair in sys.argv[1:]:
+    key, _, raw = pair.partition("=")
+    if raw == "":
+        data[key] = ""
+        continue
+    try:
+        data[key] = json.loads(raw)
+    except ValueError:
+        data[key] = raw
+
+data["updated_at"] = time.time()
+tmp = path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(data, fh, indent=2, sort_keys=True)
+    fh.write("\n")
+os.replace(tmp, path)
+os.chmod(path, 0o644)
+PY
+}
+
+# Append a line to the running log the GUI shows, keeping the last 200.
+status_log() {
+  printf '%s\n' "$*"
+  STATUS_PATH="${STATUS}" LINE="$*" python3 - <<'PY'
+import json, os, time
+
+path = os.environ["STATUS_PATH"]
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    data = {}
+lines = data.get("log") or []
+lines.append(time.strftime("%H:%M:%S ") + os.environ["LINE"])
+data["log"] = lines[-200:]
+data["updated_at"] = time.time()
+tmp = path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(data, fh, indent=2, sort_keys=True)
+os.replace(tmp, path)
+os.chmod(path, 0o644)
+PY
+}
+
+fail() {
+  status_set phase='"failed"' ok=false message="$1" finished="$(date +%s)"
+  status_log "failed: $1"
+  exit 1
+}
+
+# --- where the working copy is ---------------------------------------------
+[[ -f "${INSTALL_CONF}" ]] || die "no ${INSTALL_CONF}; run install.sh once to record where this node was installed from"
+# shellcheck disable=SC1090
+source "${INSTALL_CONF}"
+REPO_DIR="${REPO_DIR:-}"
+REPO_USER="${REPO_USER:-root}"
+[[ -n "${REPO_DIR}" && -d "${REPO_DIR}/.git" ]] \
+  || die "no git working copy at '${REPO_DIR}'; this node was installed from a tarball, so updates have to be applied the same way"
+
+# Git runs as the user who owns the working copy. As root it would leave
+# root-owned objects behind and the owner's next pull would fail with
+# permission errors — a confusing way to find out an installer ran as root.
+git_as() { sudo -u "${REPO_USER}" git -C "${REPO_DIR}" "$@"; }
+
+commit_json() {
+  # One commit as a JSON object, via python so the subject cannot break it.
+  local ref="$1"
+  local raw
+  raw="$(git_as show -s --format='%H%x1f%h%x1f%s%x1f%cI' "${ref}" 2>/dev/null)" || return 1
+  RAW="${raw}" python3 -c '
+import json, os
+sha, short, subject, date = os.environ["RAW"].split("\x1f")
+print(json.dumps({"sha": sha, "short": short, "subject": subject, "date": date}))
+'
+}
+
+branch_name() {
+  local b
+  b="$(git_as rev-parse --abbrev-ref HEAD 2>/dev/null)"
+  [[ -z "${b}" || "${b}" == "HEAD" ]] && b="${DEFAULT_BRANCH:-main}"
+  printf '%s' "${b}"
+}
+
+remote_name() {
+  # Not assumed to be "origin": this repo's remote is named differently on
+  # different machines, which has already broken one deploy.
+  local r
+  r="$(git_as remote | head -n1)"
+  printf '%s' "${r:-origin}"
+}
+
+do_fetch() {
+  local remote branch
+  remote="$(remote_name)"; branch="$(branch_name)"
+  status_log "fetching ${remote}/${branch}"
+  local out
+  if ! out="$(timeout "${FETCH_TIMEOUT}" env GIT_TERMINAL_PROMPT=0 \
+        sudo -u "${REPO_USER}" git -C "${REPO_DIR}" fetch --quiet "${remote}" "${branch}" 2>&1)"; then
+    local hint="${out}"
+    [[ -z "${hint}" ]] && hint="fetch timed out after ${FETCH_TIMEOUT}s"
+    case "${hint}" in
+      *[Aa]uthentication*|*"could not read Username"*|*403*|*"Permission denied"*)
+        hint="${hint} — the node has no credentials for the private repository. Store them once with: git -C ${REPO_DIR} config credential.helper store, then pull by hand." ;;
+      *"Could not resolve host"*|*"unable to access"*)
+        hint="${hint} — no route to the remote. A show network with no internet cannot check for updates." ;;
+    esac
+    fail "${hint}"
+  fi
+}
+
+# What we are comparing against. Normally the remote-tracking ref, but that ref
+# does not exist if the clone was made while the remote was still empty — and
+# then every check would quietly report "up to date" for ever, which is a worse
+# failure than an error. FETCH_HEAD is what the last fetch actually brought
+# back, so it is the honest fallback.
+upstream_ref() {
+  local remote branch
+  remote="$(remote_name)"; branch="$(branch_name)"
+  if git_as rev-parse --verify --quiet "${remote}/${branch}" >/dev/null 2>&1; then
+    printf '%s/%s' "${remote}" "${branch}"
+  elif git_as rev-parse --verify --quiet FETCH_HEAD >/dev/null 2>&1; then
+    printf 'FETCH_HEAD'
+  else
+    printf '%s/%s' "${remote}" "${branch}"
+  fi
+}
+
+report_available() {
+  local remote branch behind upstream
+  remote="$(remote_name)"; branch="$(branch_name)"; upstream="$(upstream_ref)"
+  behind="$(git_as rev-list --count "HEAD..${upstream}" 2>/dev/null || echo 0)"
+  status_set branch="\"${branch}\"" remote="\"${remote}\"" repo="\"${REPO_DIR}\"" \
+             behind="${behind:-0}" \
+             current="$(commit_json HEAD || echo null)" \
+             available="$(commit_json "${upstream}" || echo null)" \
+             checked_at="$(date +%s)"
+  # The subjects of what is new, so the GUI can say what an update contains
+  # rather than just that one exists.
+  RANGE="HEAD..${upstream}" REPO="${REPO_DIR}" USERNAME="${REPO_USER}" \
+  STATUS_PATH="${STATUS}" python3 - <<'PY'
+import json, os, subprocess
+
+out = subprocess.run(
+    ["sudo", "-u", os.environ["USERNAME"], "git", "-C", os.environ["REPO"],
+     "log", "--format=%h\x1f%s\x1f%cI", os.environ["RANGE"]],
+    capture_output=True, text=True)
+commits = []
+for line in out.stdout.splitlines():
+    parts = line.split("\x1f")
+    if len(parts) == 3:
+        commits.append({"short": parts[0], "subject": parts[1], "date": parts[2]})
+
+path = os.environ["STATUS_PATH"]
+try:
+    with open(path) as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    data = {}
+data["commits"] = commits[:40]
+tmp = path + ".tmp"
+with open(tmp, "w") as fh:
+    json.dump(data, fh, indent=2, sort_keys=True)
+os.replace(tmp, path)
+os.chmod(path, 0o644)
+PY
+  printf '%s' "${behind:-0}"
+}
+
+run_install() {
+  status_set phase='"installing"'
+  status_log "running install.sh (this takes a few minutes)"
+  # Line-buffered into the log so the GUI shows movement rather than a spinner.
+  local rc=0
+  ( cd "${REPO_DIR}" && ./install.sh ) 2>&1 | while IFS= read -r line; do
+    case "${line}" in
+      *"==>"*|*"✓"*|*"!"*|*"✗"*) status_log "${line}" ;;
+    esac
+  done
+  rc="${PIPESTATUS[0]}"
+  return "${rc}"
+}
+
+action_check() {
+  status_set phase='"checking"' action='"check"' ok=null message='""' \
+             started="$(date +%s)" log='[]' finished=null
+  do_fetch
+  local behind
+  behind="$(report_available)"
+  if [[ "${behind}" -gt 0 ]]; then
+    status_set phase='"idle"' ok=true finished="$(date +%s)" \
+               message="\"${behind} update(s) available\""
+    status_log "${behind} update(s) available"
+  else
+    status_set phase='"idle"' ok=true finished="$(date +%s)" message='"up to date"'
+    status_log "already up to date"
+  fi
+}
+
+action_apply() {
+  local ref="${1:-}"
+  status_set phase='"updating"' action='"apply"' ok=null message='""' \
+             started="$(date +%s)" log='[]' finished=null
+  # Remember where we were before touching anything, so there is a way back
+  # that does not involve an SSH session at an event.
+  status_set previous="$(commit_json HEAD || echo null)"
+  do_fetch
+
+  local target branch
+  branch="$(branch_name)"
+  target="${ref:-$(upstream_ref)}"
+
+  # Local edits are parked, never discarded: someone hand-fixing a file on a
+  # node under time pressure should not lose it to an update.
+  if [[ -n "$(git_as status --porcelain)" ]]; then
+    status_log "local changes found; stashing them"
+    git_as stash push --include-untracked --message "pistreamer update $(date -Iseconds)" \
+      >/dev/null 2>&1 || status_log "could not stash local changes (continuing)"
+  fi
+
+  status_log "moving to ${target}"
+  git_as checkout --quiet "${branch}" 2>/dev/null || true
+  git_as reset --hard --quiet "${target}" || fail "could not move the working copy to ${target}"
+  # The executable bit has been lost in transit more than once, and the symptom
+  # is a "command not found" that sends you looking in the wrong place.
+  chmod +x "${REPO_DIR}/install.sh" "${REPO_DIR}"/scripts/* 2>/dev/null || true
+  status_set current="$(commit_json HEAD || echo null)"
+
+  if run_install; then
+    status_set phase='"done"' ok=true finished="$(date +%s)" \
+               message='"updated and reinstalled"' behind=0
+    status_log "update complete"
+    report_available >/dev/null
+  else
+    fail "install.sh failed — the node is on the new code but may not be running it. Roll back, or fix it over SSH."
+  fi
+}
+
+action_rollback() {
+  local sha
+  sha="$(STATUS_PATH="${STATUS}" python3 -c '
+import json, os
+try:
+    with open(os.environ["STATUS_PATH"]) as fh:
+        print((json.load(fh).get("previous") or {}).get("sha") or "")
+except Exception:
+    print("")
+')"
+  [[ -n "${sha}" ]] || die "no previous version recorded to roll back to"
+  status_set phase='"updating"' action='"rollback"' ok=null message='""' \
+             started="$(date +%s)" log='[]' finished=null
+  status_log "rolling back to ${sha:0:12}"
+  git_as reset --hard --quiet "${sha}" || fail "could not roll back to ${sha}"
+  chmod +x "${REPO_DIR}/install.sh" "${REPO_DIR}"/scripts/* 2>/dev/null || true
+  status_set current="$(commit_json HEAD || echo null)"
+  if run_install; then
+    status_set phase='"done"' ok=true finished="$(date +%s)" message='"rolled back"'
+    status_log "rollback complete"
+  else
+    fail "install.sh failed during rollback — fix this node over SSH"
+  fi
+}
+
+[[ $# -ge 1 ]] || die "usage: pistreamer-update check|apply [ref]|rollback|--from-request"
+
+case "$1" in
+  check)    action_check ;;
+  apply)    action_apply "${2:-}" ;;
+  rollback) action_rollback ;;
+  --from-request)
+    [[ -f "${REQUEST}" ]] || exit 0
+    REQ="$(cat "${REQUEST}")"
+    rm -f "${REQUEST}"
+    ACTION="$(REQ="${REQ}" python3 -c '
+import json, os
+try:
+    print(json.loads(os.environ["REQ"]).get("action", ""))
+except Exception:
+    print("")
+')"
+    REF="$(REQ="${REQ}" python3 -c '
+import json, os, re
+try:
+    ref = json.loads(os.environ["REQ"]).get("ref", "") or ""
+except Exception:
+    ref = ""
+# A ref goes on a git command line, so it is restricted to what a ref can
+# actually contain. The request is written by an unauthenticated web GUI on an
+# event network.
+print(ref if re.fullmatch(r"[A-Za-z0-9._/-]{0,80}", ref) else "")
+')"
+    case "${ACTION}" in
+      check)    action_check ;;
+      apply)    action_apply "${REF}" ;;
+      rollback) action_rollback ;;
+      *)        fail "unknown update action: ${ACTION}" ;;
+    esac
+    ;;
+  *) die "unknown action: $1" ;;
+esac

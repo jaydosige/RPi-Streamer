@@ -146,6 +146,11 @@ class Config:
     device_name: str = "pistreamer"
     web_port: int = 80
 
+    # How often to ask the remote whether there is a new version, in hours.
+    # 0 turns it off. A node on a show network with no internet simply fails
+    # the check quietly and carries on.
+    update_check_hours: int = 24
+
     # --- cluster ---
     # Announce this node on the LAN and accept commands from its group. Off
     # makes the node completely invisible and uncontrollable from other nodes.

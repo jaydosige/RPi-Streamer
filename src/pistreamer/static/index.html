@@ -96,6 +96,13 @@
   nav button:hover { color: var(--text); background: var(--panel-2); }
   nav button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
   nav button.active { color: var(--text); border-bottom-color: var(--accent); }
+  /* Something is waiting on this tab. A dot rather than a count: the number
+     of commits is not what you need to know from the nav. */
+  nav button.flag::after {
+    content: ""; display: inline-block; width: 6px; height: 6px;
+    border-radius: 50%; background: var(--accent); margin-left: 7px;
+    vertical-align: middle;
+  }
 
   main { max-width: 1180px; margin: 0 auto; padding: 20px 16px 72px; }
   section { display: none; }
@@ -682,6 +689,7 @@
       <div class="row" style="margin-top:10px">
         <button class="btn" id="btnNodesRefresh">Refresh</button>
         <button class="btn" id="btnStandbyAll">Standby everywhere</button>
+        <button class="btn" id="btnUpdateGroup">Update the group</button>
         <button class="btn danger" id="btnRebootAll">Reboot the group</button>
       </div>
     </div>
@@ -1000,6 +1008,17 @@
       <div id="tableWrap" class="scroller" style="display:none;margin-top:12px"></div>
     </div>
     <div class="cols">
+    <div class="card" id="updateCard">
+      <h2>Software</h2>
+      <ul class="list" id="updateNow" style="margin-bottom:10px"></ul>
+      <div id="updateBody"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn" id="btnUpdateCheck">Check for updates</button>
+        <button class="btn primary" id="btnUpdateApply" style="display:none">Update now</button>
+        <button class="btn danger" id="btnUpdateRollback" style="display:none">Roll back</button>
+      </div>
+      <div id="updateProgress" style="margin-top:10px"></div>
+    </div>
     <div class="card">
       <h2>Capacity</h2>
       <div id="meters"></div>
@@ -1245,7 +1264,7 @@ document.querySelectorAll("nav button").forEach((btn) => {
     const tab = btn.dataset.tab;
     if (tab === "media") { loadMedia(); loadPlaylists(); loadSchedule(); }
     if (tab === "output") { loadConnectors(); loadAudioDevices(); loadPerf(); }
-    if (tab === "system") { loadTelemetry(); loadOverclock(); }
+    if (tab === "system") { loadTelemetry(); loadOverclock(); loadUpdate(); }
     if (tab === "ndi") loadNdiNetwork();
     if (tab === "nodes") loadNodes();
   };
@@ -1279,6 +1298,11 @@ async function poll() {
     SPARKS = (await api("/api/telemetry?points=14")).series || {};
   } catch (_) { /* sparklines are decoration */ }
   if (activeTab() === "system") loadTelemetry();
+  // The update count rides along on the status poll, so the badge appears
+  // without anyone having to open the tab and look.
+  const upd = (STATE && STATE.update) || {};
+  const sysTab = document.querySelector('nav button[data-tab="system"]');
+  if (sysTab) sysTab.classList.toggle("flag", (upd.behind || 0) > 0);
   // Only while the tab is open: peers move on a two-second beacon, and there is
   // no point polling the group from a node nobody is looking at.
   if (activeTab() === "nodes") loadNodes();
@@ -2034,6 +2058,163 @@ $("btnSaveCluster").onclick = async () => {
     toast("Group settings saved — restart the service if you changed the group or key");
   } catch (e) { toast(e.message, true); }
   loadNodes();
+};
+
+// ---------- updates ----------
+//
+// The node updates itself from the git remote it was installed from. Applying
+// one restarts this service, so the browser cannot follow it over the request
+// that started it — it polls a status file the root job writes instead, which
+// survives the restart and is still there when the node comes back.
+
+let UPDATE = null;
+let UPDATE_TIMER = null;
+
+function fmtWhen(ts) {
+  if (!ts) return "never";
+  const mins = Math.round((Date.now() / 1000 - ts) / 60);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.round(mins / 60);
+  return hrs < 24 ? `${hrs}h ago` : `${Math.round(hrs / 24)}d ago`;
+}
+
+async function loadUpdate() {
+  try { UPDATE = await api("/api/update"); } catch (_) { return; }
+  const u = UPDATE;
+  const cur = u.current || {};
+
+  $("updateNow").innerHTML = `<li>
+    <div class="meta">
+      <div class="name">${cur.subject || "version unknown"}</div>
+      <div class="sub">${cur.short ? cur.short + " · " : ""}${
+        cur.date ? new Date(cur.date).toLocaleDateString() : ""}${
+        u.branch ? " · " + u.branch : ""} · checked ${fmtWhen(u.checked_at)}</div>
+    </div>
+  </li>`;
+
+  const body = $("updateBody");
+  const apply = $("btnUpdateApply"), roll = $("btnUpdateRollback"),
+        chk = $("btnUpdateCheck");
+
+  if (!u.updatable) {
+    body.innerHTML = `<div class="note">This node was installed from an archive
+      rather than a git clone, so it cannot update itself. Re-install it with
+      <code>bootstrap.sh</code> once and it will be able to from then on.</div>`;
+    apply.style.display = roll.style.display = "none";
+    chk.disabled = true;
+    return;
+  }
+  if (!u.helper) {
+    body.innerHTML = `<div class="banner warn">The update helper is not installed
+      on this node. Run <code>sudo ./scripts/bootstrap.sh</code> from the terminal
+      once to add it — after that, updates happen from here.</div>`;
+    apply.style.display = roll.style.display = "none";
+    chk.disabled = true;
+    return;
+  }
+  chk.disabled = !!u.busy;
+
+  if (u.behind > 0) {
+    const list = (u.commits || []).slice(0, 8)
+      .map((c) => `<li><div class="meta"><div class="name">${c.subject}</div>
+        <div class="sub">${c.short} · ${new Date(c.date).toLocaleDateString()}</div>
+      </div></li>`).join("");
+    const more = (u.commits || []).length > 8
+      ? `<div class="note">…and ${u.commits.length - 8} more.</div>` : "";
+    body.innerHTML = `<div class="note" style="margin-bottom:8px">
+        <strong>${u.behind} update${u.behind === 1 ? "" : "s"} available.</strong>
+        Updating stops playback, reinstalls the app and restarts the service —
+        about a minute unless the NDI plugin has to be rebuilt.
+      </div>
+      <ul class="list">${list}</ul>${more}`;
+    apply.style.display = "";
+  } else {
+    body.innerHTML = `<div class="note">Up to date${
+      u.checked_at ? "" : " — as far as this node knows; nothing has been checked yet"}.</div>`;
+    apply.style.display = "none";
+  }
+  roll.style.display = (u.previous && u.previous.sha) ? "" : "none";
+  renderUpdateProgress(u);
+}
+
+function renderUpdateProgress(u) {
+  const box = $("updateProgress");
+  const running = u.busy || ["checking", "updating", "installing"].includes(u.phase);
+  if (!running && u.phase !== "failed" && !(u.phase === "done" && u.action !== "check")) {
+    box.innerHTML = "";
+    return;
+  }
+  const lines = (u.log || []).slice(-6).join("\n");
+  const bad = u.phase === "failed";
+  box.innerHTML = `
+    <div class="prog">
+      <div class="row3">
+        <span class="who">${bad ? "Update failed" : u.phase === "done" ? "Finished" : u.phase}</span>
+        <span class="rate">${u.message || ""}</span>
+      </div>
+      <div class="bar ${bad ? "failed" : running ? "unknown" : "done"}"><i></i></div>
+    </div>
+    ${lines ? `<pre class="log" style="max-height:150px;margin-top:8px">${lines}</pre>` : ""}`;
+}
+
+function watchUpdate() {
+  if (UPDATE_TIMER) clearInterval(UPDATE_TIMER);
+  UPDATE_TIMER = setInterval(async () => {
+    try {
+      await loadUpdate();
+    } catch (_) {
+      // Expected: applying an update restarts the service under us. Keep
+      // polling — the status file outlives the restart.
+      return;
+    }
+    if (UPDATE && !UPDATE.busy && UPDATE.phase !== "installing") {
+      clearInterval(UPDATE_TIMER);
+      UPDATE_TIMER = null;
+      if (UPDATE.phase === "done") toast(UPDATE.message || "Update finished");
+      if (UPDATE.phase === "failed") toast(UPDATE.message || "Update failed", true);
+    }
+  }, 1500);
+}
+
+$("btnUpdateCheck").onclick = async () => {
+  $("btnUpdateCheck").disabled = true;
+  try { await post("/api/update/check", {}); toast("Checking…"); }
+  catch (e) { toast(e.message, true); }
+  watchUpdate();
+};
+
+$("btnUpdateApply").onclick = async () => {
+  const playing = STATE && STATE.player.running;
+  const warning = playing
+    ? `This node is playing ${STATE.player.target || "something"}. Updating stops it and restarts the service. Continue?`
+    : "Update this node now? It will stop playback and restart the service.";
+  if (!confirm(warning)) return;
+  try {
+    await post("/api/update/apply", { force: true });
+    toast("Updating — this page will drop out briefly");
+  } catch (e) { toast(e.message, true); }
+  watchUpdate();
+};
+
+$("btnUpdateRollback").onclick = async () => {
+  const prev = UPDATE && UPDATE.previous ? UPDATE.previous.short : "the previous version";
+  if (!confirm(`Roll this node back to ${prev}?`)) return;
+  try { await post("/api/update/rollback", {}); toast("Rolling back"); }
+  catch (e) { toast(e.message, true); }
+  watchUpdate();
+};
+
+$("btnUpdateGroup").onclick = async () => {
+  if (!confirm("Update every node in the group? Each one stops playback and "
+             + "restarts. This node goes last, so you can watch the others finish.")) return;
+  try {
+    const r = await post("/api/cluster/update", { action: "apply", force: true });
+    const bad = r.results.filter((x) => !x.ok);
+    toast(bad.length ? `${bad.length} node(s) refused: ${bad[0].error}`
+                     : `Updating ${r.results.length} node(s)`, bad.length > 0);
+  } catch (e) { toast(e.message, true); }
+  watchUpdate();
 };
 
 async function loadOverclock() {

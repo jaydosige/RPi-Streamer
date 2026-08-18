@@ -20,7 +20,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import (cluster, config, diagnose, display, media, ndiconfig, playlists,
-               pushjob, schedule as schedule_mod, sources, syncplay, system)
+               pushjob, schedule as schedule_mod, sources, syncplay, system,
+               updates)
 from .player import MODE_IDLE, MODE_LOCAL, MODE_NDI, identify_text, player
 from .telemetry import telemetry
 
@@ -148,6 +149,7 @@ async def lifespan(app: FastAPI):
         player.set_identify(True, identify_text(cfg, cluster.primary_ip()))
     telemetry.bind_player(player.stream_stats)
     telemetry.start()
+    _start_update_checks(cfg)
     schedule_mod.scheduler.bind(apply_cue_action)
     if cfg.schedule_enabled:
         schedule_mod.scheduler.start()
@@ -156,12 +158,50 @@ async def lifespan(app: FastAPI):
         log.info("autostarting mode=%s target=%s", cfg.mode, target)
         player.apply(cfg.mode, target)
     yield
+    if _update_check_stop is not None:
+        _update_check_stop.set()
     conductor.stop()
     cluster.beacon().stop()
     player.shutdown()
     sources.stop()
     telemetry.stop()
     schedule_mod.scheduler.stop()
+
+
+_update_check_stop = None
+
+
+def _start_update_checks(cfg) -> None:
+    """Ask the remote whether there is a new version, occasionally.
+
+    Without this the badge only appears if somebody thinks to press Check,
+    which rather defeats the point. It is a request into the same root job the
+    button uses — nothing here talks to the network directly.
+    """
+    global _update_check_stop
+    hours = max(0, int(getattr(cfg, "update_check_hours", 0) or 0))
+    if not hours or not updates.helper_installed():
+        return
+    import threading
+
+    stop = threading.Event()
+    _update_check_stop = stop
+
+    def loop() -> None:
+        # A first check shortly after boot, not immediately: the network may
+        # not be up yet, and nothing here is urgent.
+        if stop.wait(120):
+            return
+        while not stop.is_set():
+            try:
+                if not updates.busy():
+                    updates.request("check")
+            except Exception as exc:  # noqa: BLE001 - a failed check is not news
+                log.debug("scheduled update check skipped: %s", exc)
+            if stop.wait(hours * 3600):
+                return
+
+    threading.Thread(target=loop, name="update-check", daemon=True).start()
 
 
 def apply_cue_action(action: str, target: str) -> None:
@@ -237,6 +277,8 @@ async def get_status() -> Dict[str, Any]:
         "player": player.status(),
         "stream": player.stream_stats(),
         "system": system.summary(),
+        "update": {"behind": updates.status().get("behind", 0),
+                   "busy": updates.busy()},
         "config": config.load().to_dict(),
         "discovery": sources.status(),
     }
@@ -1205,6 +1247,126 @@ async def post_sync_play(body: SyncPlayBody) -> Dict[str, Any]:
 async def post_sync_stop() -> Dict[str, Any]:
     conductor.stop()
     return conductor.state()
+
+
+# ----------------------------------------------------------------------
+# Updates
+# ----------------------------------------------------------------------
+
+
+class UpdateBody(BaseModel):
+    # Updating restarts playback, so a node that is on air says no unless the
+    # operator has said they mean it.
+    force: bool = False
+    ref: str = ""
+
+
+@app.get("/api/update")
+async def get_update() -> Dict[str, Any]:
+    return updates.summary()
+
+
+@app.post("/api/update/check")
+async def post_update_check(request: Request) -> Dict[str, Any]:
+    if request.headers.get(cluster.AUTH_HEADER) is not None:
+        require_cluster_key(request)
+    if not updates.helper_installed():
+        raise HTTPException(
+            409, "the update helper is not installed on this node — run install.sh "
+                 "once from the terminal to add it, and it will not be needed again")
+    try:
+        updates.request("check")
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"checking": True}
+
+
+@app.post("/api/update/apply")
+async def post_update_apply(body: UpdateBody, request: Request) -> Dict[str, Any]:
+    if request.headers.get(cluster.AUTH_HEADER) is not None:
+        require_cluster_key(request)
+    summary = updates.summary()
+    if not summary["updatable"]:
+        raise HTTPException(
+            409, "this node was installed from an archive rather than a git clone, "
+                 "so it cannot update itself")
+    if not updates.helper_installed():
+        raise HTTPException(409, "the update helper is not installed on this node")
+    status = player.status()
+    if status.get("running") and not body.force:
+        raise HTTPException(
+            409, f"this node is playing {status.get('target') or 'something'} — "
+                 "updating restarts playback")
+    # Whatever was on screen is coming down either way; stop cleanly rather
+    # than have the service killed mid-frame by its own restart.
+    take_local_control("updating")
+    player.apply(MODE_IDLE)
+    try:
+        updates.request("apply", ref=body.ref)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"updating": True}
+
+
+@app.post("/api/update/rollback")
+async def post_update_rollback(request: Request) -> Dict[str, Any]:
+    if request.headers.get(cluster.AUTH_HEADER) is not None:
+        require_cluster_key(request)
+    if not (updates.status().get("previous") or {}).get("sha"):
+        raise HTTPException(404, "no previous version recorded to roll back to")
+    take_local_control("rolling back")
+    player.apply(MODE_IDLE)
+    try:
+        updates.request("rollback")
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"rolling_back": True}
+
+
+class ClusterUpdateBody(BaseModel):
+    nodes: List[str] = Field(default_factory=list)
+    action: Literal["check", "apply"] = "check"
+    force: bool = False
+
+
+@app.post("/api/cluster/update")
+async def post_cluster_update(body: ClusterUpdateBody) -> Dict[str, Any]:
+    """Check or update every node in the group.
+
+    This node goes last on purpose: applying an update restarts it, which takes
+    the GUI you are watching with it. Doing the others first means you can see
+    them finish before your own page drops.
+    """
+    cfg = config.load()
+    peers = [p for p in (_peers_by_id(body.nodes) if body.nodes
+                         else cluster.registry.all())
+             if p.id != cluster.node_id()]
+    path = "/api/update/check" if body.action == "check" else "/api/update/apply"
+    payload = None if body.action == "check" else {"force": body.force}
+    results = []
+    for peer in peers:
+        try:
+            cluster.call(peer, path, method="POST", body=payload,
+                         key=cfg.cluster_key, timeout=30)
+            results.append({"name": peer.name or peer.ip, "ok": True})
+        except Exception as exc:  # noqa: BLE001 - one node must not stop the rest
+            results.append({"name": peer.name or peer.ip, "ok": False, "error": str(exc)})
+
+    own = {"name": cfg.device_name or system.hostname(), "ok": True, "self": True}
+    try:
+        if body.action == "check":
+            updates.request("check")
+        else:
+            status = player.status()
+            if status.get("running") and not body.force:
+                raise RuntimeError("this node is playing; use force to update anyway")
+            take_local_control("updating")
+            player.apply(MODE_IDLE)
+            updates.request("apply")
+    except Exception as exc:  # noqa: BLE001
+        own = {**own, "ok": False, "error": str(exc)}
+    results.append(own)
+    return {"action": body.action, "results": results}
 
 
 # Serve the rest of the GUI assets. Mounted last so /api routes win.
