@@ -29,7 +29,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
-from . import airplay, config, display, media, mpvipc, playlists, sources, syncplay
+from . import (airplay, config, display, guest, media, mpvipc, playlists,
+               sources, syncplay)
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +51,12 @@ _LOG_LINES = 300
 STATS_PREFIX = "@STATS "
 # How long the AirPlay receiver gets to start advertising itself before we
 # call it broken. It normally takes well under a second.
+# The mpv overlay slot the guest panel occupies. Fixed, so replacing it is a
+# second overlay-add rather than a remove-then-add that flickers.
+GUEST_OVERLAY_ID = 7
+# Padding from the screen edge, shared with the GStreamer side so the
+# panel lands in the same place whichever backend is playing. TVs overscan.
+OVERLAY_PAD = 40
 _AIRPLAY_LISTEN_TIMEOUT = 10.0
 # uxplay validates its sink and decoder strings at startup and aborts on a bad
 # one in about 40 ms. Anything that dies this fast died of its configuration,
@@ -259,6 +266,37 @@ def write_overlay(text: str) -> None:
         log.warning("could not write the identify caption: %s", exc)
 
 
+def _mpv_ok(reply: Any) -> bool:
+    """Did mpv actually do it?
+
+    `mpvipc.command` returns the whole reply, and an unreachable player gives
+    {}. Both are dicts, and a reply carrying `"error": "property not found"` is
+    truthy — so testing the reply for truth, as this code used to, counts a
+    refusal as a success.
+    """
+    return isinstance(reply, dict) and reply.get("error") == "success"
+
+
+def _mpv_data(reply: Any) -> Any:
+    return reply.get("data") if _mpv_ok(reply) else None
+
+
+def read_overlay() -> str:
+    """The caption currently published, or "" if there is none.
+
+    Needed because mpv is not one long-lived process: it is replaced on every
+    file, every playlist segment and every standby switch, and each new one
+    starts with a blank OSD. Setting the caption over IPC once — which is all
+    that used to happen — meant identify survived exactly until the next item
+    began, which is when somebody hunting for a node is most likely to be
+    looking at it.
+    """
+    try:
+        return overlay_path().read_text().strip()
+    except OSError:
+        return ""
+
+
 def identify_text(cfg: config.Config, ip: str) -> str:
     """What an identified node shows: who it is and how to reach it.
 
@@ -344,6 +382,10 @@ class Player:
         # Consecutive AirPlay receivers that died before they could work.
         self._airplay_fast_fails = 0
         self._airplay_stuck = False
+        # What has actually been pushed into the running mpv, so the poller can
+        # tell a change from a repeat.
+        self._mpv_caption: Optional[str] = None
+        self._mpv_panel: Optional[str] = None
 
     # ------------------------------------------------------------------
     # Command construction
@@ -523,6 +565,15 @@ class Player:
             "--audio-file-auto=no",
             "--sub-auto=no",
             f"--image-display-duration={image_duration}",
+            # The identify caption, applied at birth rather than pushed in
+            # afterwards. The IPC push still happens (see _sync_overlay) so a
+            # caption switched on mid-item appears at once; this is what stops
+            # it vanishing at the next item.
+            "--osd-level=1",
+            f"--osd-msg1={read_overlay()}",
+            "--osd-font-size=40",
+            "--osd-align-x=left",
+            "--osd-align-y=top",
         ]
         if conn:
             cmd.append(f"--drm-connector={conn.name}")
@@ -601,6 +652,7 @@ class Player:
             "snapshot_path": str(snapshot_path()) if cfg.snapshot_enabled else None,
             "snapshot_interval_s": cfg.snapshot_interval_s,
             "overlay_file": str(overlay_path()),
+            "image_overlay_file": str(guest.overlay_png_path()),
         }
         return [sys.executable, "-m", "pistreamer.runner", json.dumps(spec)]
 
@@ -650,6 +702,7 @@ class Player:
             # that is not playing anything, which is exactly when you are
             # hunting for which box is which.
             "overlay_file": str(overlay_path()),
+            "image_overlay_file": str(guest.overlay_png_path()),
         }
         return [sys.executable, "-m", "pistreamer.runner", json.dumps(spec)]
 
@@ -774,6 +827,46 @@ class Player:
         except (OSError, ValueError):
             pass
 
+    def _sync_overlay(self, sock: str) -> None:
+        """Push the caption and the guest panel into a running mpv.
+
+        Both are files on disk that some other part of the system rewrites, so
+        this compares rather than assumes — an unconditional set every second
+        would re-render the OSD and re-upload the panel forever.
+        """
+        caption = read_overlay()
+        if caption != self._mpv_caption:
+            if _mpv_ok(mpvipc.command(sock, "set_property", "osd-msg1", caption)):
+                self._mpv_caption = caption
+
+        meta = guest.overlay_meta() if guest.overlay_png_path().exists() else None
+        want = meta.get("url") if meta else None
+        if want == self._mpv_panel:
+            return
+        if not meta:
+            mpvipc.command(sock, "overlay-remove", GUEST_OVERLAY_ID)
+            self._mpv_panel = None
+            return
+        if not Path(str(meta.get("bgra", ""))).exists():
+            return  # half-written; the next tick will find it
+        # mpv places an overlay by its top-left corner in screen pixels, so the
+        # bottom-right position the GStreamer side gets for free has to be
+        # worked out here — and it needs mpv's own idea of the screen, not the
+        # configured mode, because a connector can end up on a different one.
+        w = _mpv_data(mpvipc.command(sock, "get_property", "osd-width"))
+        h = _mpv_data(mpvipc.command(sock, "get_property", "osd-height"))
+        if not isinstance(w, int) or not isinstance(h, int) or w <= 0 or h <= 0:
+            return  # not laid out yet; try again on the next tick
+        pad = OVERLAY_PAD
+        x = max(0, w - int(meta["width"]) - pad)
+        y = max(0, h - int(meta["height"]) - pad)
+        if _mpv_ok(mpvipc.command(
+                sock, "overlay-add", GUEST_OVERLAY_ID, x, y, str(meta["bgra"]),
+                0, "bgra", int(meta["width"]), int(meta["height"]),
+                int(meta["stride"]))):
+            self._mpv_panel = want
+            log.info("guest QR panel placed on mpv at %d,%d", x, y)
+
     def _poll_mpv(self, proc: subprocess.Popen) -> None:
         """Fill stream stats from mpv while it runs.
 
@@ -782,7 +875,10 @@ class Player:
         goes away.
         """
         sock = str(mpv_socket())
+        self._mpv_caption = None
+        self._mpv_panel = None
         while proc.poll() is None and not self._stop_event.is_set():
+            self._sync_overlay(sock)
             stats = mpvipc.to_stats(mpvipc.query(sock))
             if stats:
                 stats["t"] = time.time()
@@ -1023,9 +1119,15 @@ class Player:
         """
         caption = text if on else ""
         write_overlay(caption)
+        # The file is the source of truth; both backends poll it, and mpv is
+        # also born with it. This push is only so a caption switched on during
+        # an item appears now rather than within the second.
+        self._mpv_caption = None
         applied = {"overlay_file": True, "mpv": False}
-        if mpvipc.command(str(mpv_socket()), "set_property", "osd-msg1", caption):
+        if _mpv_ok(mpvipc.command(str(mpv_socket()), "set_property",
+                                  "osd-msg1", caption)):
             applied["mpv"] = True
+            self._mpv_caption = caption
             # The default OSD font is sized for a desktop window; on a screen
             # being read from across a room the caption needs to be larger, and
             # top-left keeps it clear of lower-third graphics in the content.
@@ -1285,10 +1387,28 @@ class Player:
             except Exception:  # noqa: BLE001 - a supervisor must never die
                 log.exception("supervisor tick failed")
 
+    def _publish_guest_overlay(self, cfg: config.Config) -> None:
+        """Keep the on-screen QR panel in step with the guest session.
+
+        Done from the supervisor rather than from the API endpoints because the
+        session closes itself on a timer. If drawing and clearing the panel only
+        happened when somebody pressed something, an expired session would leave
+        a dead QR code on the screen for the rest of the evening — a code that
+        still looks like an invitation and no longer works.
+        """
+        try:
+            conn = display.pick_connector(cfg.connector)
+            mode_ = display.target_mode(conn, cfg.video_mode)
+            guest.publish_overlay(port=cfg.web_port,
+                                  screen_h=mode_.height if mode_ else 1080)
+        except Exception as exc:  # noqa: BLE001 - never take the supervisor down
+            log.debug("could not publish the guest overlay: %s", exc)
+
     def _supervise(self) -> None:
         with self._lock:
             mode, target = self._wanted_mode, self._wanted_target
             cfg = config.load()
+            self._publish_guest_overlay(cfg)
             proc = self._proc
             alive = proc is not None and proc.poll() is None
 
@@ -1310,6 +1430,23 @@ class Player:
                 elif self._status.since and (time.time() - self._status.since) > _HEALTHY_AFTER:
                     self._backoff_idx = 0  # been up a while; forget the backoff
                 if mode == MODE_AIRPLAY:
+                    if airplay.restart_wanted():
+                        # Something the receiver cannot recover from in place —
+                        # in practice, the GPU decoder failing on a live stream.
+                        # Restarted here rather than from the thread reading its
+                        # output, because that thread belongs to the process we
+                        # are about to kill.
+                        log.info("restarting the AirPlay receiver "
+                                 "(software decoding)")
+                        note = airplay.session().last_error
+                        self._terminate()
+                        airplay.reset(keep_degrade=True)
+                        try:
+                            self._spawn(cfg, mode, target)
+                            self._status.last_error = note
+                        except Exception as exc:  # noqa: BLE001
+                            self._status.last_error = str(exc)
+                        return
                     self._check_airplay_startup()
                 return
 

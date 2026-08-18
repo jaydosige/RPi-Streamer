@@ -163,6 +163,10 @@ class Config:
     guest_autoplay: bool = False
     # A line shown on the guest page, e.g. the name of the event.
     guest_note: str = ""
+    # Put the QR and the address over the output while sharing is open. The
+    # people who need to scan it are looking at the screen, not at the
+    # operator's browser. Off leaves the picture clean.
+    guest_overlay: bool = True
 
     # --- airplay ---
     # Receiving an iPhone/iPad/Mac screen, via uxplay. This is a playback mode
@@ -177,10 +181,13 @@ class Config:
     # GPU h264 decode (v4l2h264dec + v4l2convert). Off falls back to software,
     # which a Pi 4 can just about manage at 720p and not at all at 1080p60.
     airplay_hw_decode: bool = True
-    # A workaround for older Video4Linux2 plugins not recognising Apple's
-    # full-range colour. Needed on GStreamer < 1.22; harmless to leave off on
-    # Trixie, which ships newer.
-    airplay_bt709: bool = False
+    # Tell the decoder the mirror stream is bt709. Apple sends a full-range
+    # colour variant that the Pi's V4L2 h264 decoder refuses outright — the
+    # symptom is "Internal data stream error" the moment somebody connects,
+    # with the receiver otherwise perfectly healthy. On by default because the
+    # hardware this runs on is exactly the case that needs it; it only sets
+    # metadata on the h264 caps, so it costs nothing when it is not needed.
+    airplay_bt709: bool = True
     # Cap the frame rate the client streams at. 30 is uxplay's own default and
     # is the difference between a Pi 4 keeping up and not.
     airplay_fps: int = 30

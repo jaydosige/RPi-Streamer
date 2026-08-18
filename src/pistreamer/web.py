@@ -720,7 +720,12 @@ class GuestItemBody(BaseModel):
 
 def _guest_summary() -> Dict[str, Any]:
     cfg = config.load()
-    return guest.summary(ip=cluster.primary_ip(), port=cfg.web_port)
+    return {
+        **guest.summary(ip=cluster.primary_ip(), port=cfg.web_port),
+        # Whether the code is also on the screen the room is looking at. The
+        # operator's browser is not where the guests are.
+        "overlay": {**guest.overlay_status(), "enabled": cfg.guest_overlay},
+    }
 
 
 @app.get("/api/guest")

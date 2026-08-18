@@ -16,6 +16,12 @@ dependencies = [
     # the node: this runs on show networks with no route to the internet, where
     # a code rendered by a web service would simply not appear.
     "segno>=1.6",
+    # Pillow is deliberately NOT listed. It is needed to draw the guest QR
+    # panel for the *screen*, but pip builds it from source on a Pi; the
+    # installer takes python3-pil from apt instead, and the venv is created
+    # with --system-site-packages so it is visible. Guest sharing still works
+    # without it — the browser QR is drawn by segno — the code just does not
+    # appear on the output.
 ]
 
 [project.scripts]

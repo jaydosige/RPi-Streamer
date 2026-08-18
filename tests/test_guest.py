@@ -225,6 +225,52 @@ def main() -> int:
         check("the page still loads, to explain itself",
               client.get(f"/s/{token}").status_code == 200)
 
+        print("\nthe code goes on the output too")
+        r = client.post("/api/guest/open", json={"minutes": 30})
+        token = r.json()["token"]
+        ov = r.json()["overlay"]
+        check("the operator is told whether the output can carry it",
+              "supported" in ov and "enabled" in ov, str(ov))
+        check("it is on by default", ov["enabled"] is True)
+        if ov["supported"]:
+            meta = guest.publish_overlay(ip="10.0.0.9", port=80, screen_h=1080)
+            check("a panel is drawn", meta is not None and
+                  guest.overlay_png_path().exists(), str(meta))
+            check("...at a size that suits the screen",
+                  meta and 200 < meta["height"] < 500, str(meta))
+            check("...and mpv's copy is written too",
+                  guest.overlay_bgra_path().exists())
+            check("the raw copy is exactly width x height x 4",
+                  guest.overlay_bgra_path().stat().st_size
+                  == meta["width"] * meta["height"] * 4)
+            check("it carries the share URL, not the guest page",
+                  meta["url"].endswith("/s/" + token), meta["url"])
+            # Redrawing on every supervisor tick would rewrite a 300 KB file
+            # four times a second for the whole session.
+            before = guest.overlay_png_path().stat().st_mtime_ns
+            guest.publish_overlay(ip="10.0.0.9", port=80, screen_h=1080)
+            check("an unchanged session does not redraw it",
+                  guest.overlay_png_path().stat().st_mtime_ns == before)
+            guest.publish_overlay(ip="10.0.0.9", port=80, screen_h=720)
+            check("a different screen size does",
+                  guest.overlay_png_path().stat().st_mtime_ns != before)
+            config.update(guest_overlay=False)
+            guest.publish_overlay(ip="10.0.0.9", port=80)
+            check("turning it off takes the panel down",
+                  not guest.overlay_png_path().exists())
+            check("...and the raw copy with it",
+                  not guest.overlay_bgra_path().exists())
+            config.update(guest_overlay=True)
+            guest.publish_overlay(ip="10.0.0.9", port=80)
+            check("turning it back on puts it up", guest.overlay_png_path().exists())
+            client.post("/api/guest/close")
+            guest.publish_overlay(ip="10.0.0.9", port=80)
+            check("closing the session takes it down too",
+                  not guest.overlay_png_path().exists())
+        else:
+            print(f"  · panel checks skipped: {ov['reason']}")
+            client.post("/api/guest/close")
+
         print("\nexpiry closes the door on its own")
         g = guest.open_session(minutes=1)
         check("a session opens", guest.valid(g.token))

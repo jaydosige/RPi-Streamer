@@ -13,6 +13,8 @@ apt_install \
   `# gst-device-monitor-1.0 lives here, NOT in gstreamer1.0-tools. Without it` \
   `# the CLI discovery fallback and the NDI diagnostics endpoint cannot run.` \
   gstreamer1.0-plugins-base-apps \
+  `# gdkpixbufoverlay lives here too — it is what puts the guest QR code on` \
+  `# the output. Without it the code is only ever in the operator's browser.` \
   gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad \
   `# textoverlay lives here (in the pango plugin), NOT in gstreamer1.0-plugins-base` \
@@ -25,6 +27,13 @@ apt_install \
   libgstreamer-plugins-base1.0-0 \
   mpv \
   ffmpeg \
+  `# Pillow draws the guest QR panel — the code, and the address underneath it.` \
+  `# From apt rather than pip: pip builds Pillow from source on a Pi, which is` \
+  `# twenty minutes of compiling for a package the distribution already has.` \
+  python3-pil \
+  `# A font for it to draw the address with. Pango finds one for the caption` \
+  `# via fontconfig; Pillow is handed a file path and needs it to exist.` \
+  fonts-dejavu-core \
   alsa-utils \
   avahi-daemon \
   libdrm2 \

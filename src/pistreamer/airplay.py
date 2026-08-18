@@ -149,6 +149,7 @@ def capabilities() -> Dict[str, Any]:
         "binary": binary() or "",
         "version": version(),
         "dns_sd": dns_sd_available()[0],
+        "software_decode": software_forced(),
     }
 
 
@@ -191,13 +192,34 @@ class Session:
 
 _lock = threading.Lock()
 _session = Session()
+# Set when the GPU decoder has been proved not to work *on this stream*, which
+# only happens once a phone actually connects. Startup tells you nothing.
+_force_software = False
+_restart_wanted = False
 
 
-def reset() -> None:
+def reset(keep_degrade: bool = False) -> None:
     """Forget everything. Called when the receiver is (re)started or stopped."""
-    global _session
+    global _session, _force_software, _restart_wanted
     with _lock:
         _session = Session()
+        _restart_wanted = False
+        if not keep_degrade:
+            _force_software = False
+
+
+def software_forced() -> bool:
+    with _lock:
+        return _force_software
+
+
+def restart_wanted() -> bool:
+    """Has something happened that only a restart of the receiver can fix?"""
+    global _restart_wanted
+    with _lock:
+        wanted = _restart_wanted
+        _restart_wanted = False
+        return wanted
 
 
 def session() -> Session:
@@ -298,6 +320,26 @@ def _observe(line: str) -> Optional[str]:
             s.last_error = ("another device on this network is already using "
                             "this AirPlay name")
             return "name-conflict"
+        # The one that matters in the field. Everything is healthy until a
+        # phone connects; then the decoder rejects Apple's stream and the
+        # pipeline collapses at the first frame. uxplay prints its own advice
+        # about this, which is the tell.
+        if ("unable to construct a working video pipeline" in low
+                or "internal data stream error" in low):
+            global _force_software, _restart_wanted
+            if not _force_software:
+                _force_software = True
+                _restart_wanted = True
+                s.last_error = ("the GPU decoder could not play that stream, so "
+                                "the receiver has switched to software decoding "
+                                "and restarted. Ask the device to connect again.")
+                log.warning("AirPlay: hardware decoding failed on a live "
+                            "stream; falling back to software")
+                return "degrade-to-software"
+            s.last_error = ("the video pipeline failed even in software — see "
+                            "the log")
+            return "video-pipeline-failed"
+
         if "failed to initialize gstreamer video renderer" in low:
             # uxplay says this and then sits there, alive and useless. Catch it
             # here so the GUI has the reason immediately rather than waiting for
@@ -408,15 +450,22 @@ def build_command(cfg: Optional[config.Config] = None,
     else:
         cmd += ["-as", "0"]
 
-    if cfg.airplay_hw_decode and element_available("v4l2h264dec"):
-        # The GPU h264 decoder, and the matching converter: pairing
-        # v4l2h264dec with plain videoconvert copies every frame back through
-        # the CPU and gives back most of what the hardware decoder saved.
-        cmd += ["-vd", "v4l2h264dec"]
-        if element_available("v4l2convert"):
-            cmd += ["-vc", "v4l2convert"]
-    if cfg.airplay_bt709:
-        cmd += ["-bt709"]
+    hardware = (cfg.airplay_hw_decode and not software_forced()
+                and element_available("v4l2h264dec"))
+    if hardware:
+        # -v4l2 rather than picking the elements by hand: verified to build the
+        # identical pipeline (h264parse ! v4l2h264dec ! v4l2convert), but it is
+        # the option uxplay supports, so it stays right if that chain changes.
+        cmd += ["-v4l2"]
+        if cfg.airplay_bt709:
+            # Adds `capssetter caps="video/x-h264, colorimetry=bt709"` ahead of
+            # the decoder — checked by reading back the pipeline uxplay prints,
+            # not from the documentation.
+            cmd += ["-bt709"]
+    else:
+        # Software h264. A Pi 4 manages 720p30 and struggles above it, which is
+        # why this is a fallback and not the default.
+        cmd += ["-avdec"]
 
     cmd += _rotation_args(cfg.rotation)
 

@@ -32,7 +32,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import config, media
 
@@ -303,4 +303,228 @@ def public_status(cfg: Optional[config.Config] = None) -> Dict[str, Any]:
         "remaining_items": max(0, lim["max_items"] - len(s.items)),
         "limits": {"max_mb": lim["max_mb"], "max_items": lim["max_items"],
                    "autoplay": lim["autoplay"], "types": lim["types"]},
+    }
+
+
+# ----------------------------------------------------------------------
+# The on-screen panel
+#
+# The QR in the operator's browser is no use to the room: the people who need
+# to scan it are looking at the screen. So when sharing is open the same code
+# goes over the output, in the same way the identify caption does — as an
+# overlay both playback backends can carry, rather than as a mode that would
+# stop whatever is playing.
+#
+# One rendered panel serves both. GStreamer takes the PNG through
+# gdkpixbufoverlay; mpv takes the same pixels as pre-multiplied BGRA through
+# its `overlay-add` command. Rendering once and converting is what keeps them
+# identical — two renderers would drift, and nobody would notice until a job.
+# ----------------------------------------------------------------------
+
+# The panel as a fraction of screen height. Big enough to scan from the middle
+# of a room, small enough to sit in a corner of somebody's content.
+PANEL_HEIGHT_FRACTION = 0.30
+# Room for the address underneath the code.
+_QR_FRACTION = 0.62
+_FONTS = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+)
+
+
+def overlay_png_path() -> Path:
+    return config.STATE_DIR / "guest-overlay.png"
+
+
+def overlay_bgra_path() -> Path:
+    return config.STATE_DIR / "guest-overlay.bgra"
+
+
+def overlay_meta_path() -> Path:
+    return config.STATE_DIR / "guest-overlay.json"
+
+
+def overlay_available() -> Tuple[bool, str]:
+    """Can a panel be drawn at all?"""
+    try:
+        import PIL  # noqa: F401
+    except ImportError:
+        return False, ("the on-screen QR needs Pillow. Install it with: "
+                       "sudo apt install python3-pil")
+    return True, ""
+
+
+def _font(size: int, bold: bool = False):
+    from PIL import ImageFont
+
+    for path in (_FONTS if bold else _FONTS[::-1]):
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    # Better a small ugly caption than no panel: the QR is the part that has
+    # to work, and it is drawn by us rather than by the font stack.
+    return ImageFont.load_default()
+
+
+def _qr_matrix(url: str):
+    import segno
+
+    code = segno.make(url, error="m")
+    return [list(row) for row in code.matrix]
+
+
+def render_overlay(url: str, screen_h: int = 1080, note: str = ""):
+    """Draw the panel and write it in both forms. Returns its metadata."""
+    ok, reason = overlay_available()
+    if not ok:
+        log.warning("%s", reason)
+        return None
+    from PIL import Image, ImageChops, ImageDraw
+
+    panel = max(160, int(screen_h * PANEL_HEIGHT_FRACTION))
+    pad = max(8, panel // 20)
+    qr_side = int(panel * _QR_FRACTION)
+
+    matrix = _qr_matrix(url)
+    modules = len(matrix)
+    # Whole pixels per module, or the code develops a moiré when the rows land
+    # on fractional boundaries — which is exactly the kind of "it scans on my
+    # phone but not on theirs" problem nobody can debug in a dark room.
+    scale = max(1, qr_side // (modules + 4))
+    quiet = 2 * scale
+    qr_px = modules * scale + 2 * quiet
+
+    text = url.split("://", 1)[-1]
+    caption = (note or "Scan to share to this screen").strip()
+
+    body = _font(max(11, int(panel * 0.062)))
+    addr = _font(max(12, int(panel * 0.075)), bold=True)
+
+    width = max(qr_px + 2 * pad, 0)
+    # Measure the text first: a long address decides the panel width, not the
+    # code, and a panel narrower than its own caption looks broken.
+    probe = Image.new("RGBA", (10, 10))
+    d = ImageDraw.Draw(probe)
+    for fnt, s in ((body, caption), (addr, text)):
+        # Three pads, not two: an address that reaches the rounded corner reads
+        # as a rendering fault rather than as a deliberate panel.
+        width = max(width, int(d.textlength(s, font=fnt)) + 3 * pad)
+
+    line_h = int(panel * 0.075)
+    height = pad + qr_px + int(pad * 0.6) + line_h + int(line_h * 1.15) + pad
+
+    img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    radius = max(6, panel // 22)
+    draw.rounded_rectangle([0, 0, width - 1, height - 1], radius=radius,
+                           fill=(255, 255, 255, 255))
+
+    # The code, drawn module by module rather than scaled from a smaller
+    # bitmap: any resampling at all softens the edges, and a soft QR is a QR
+    # that needs three attempts.
+    ox = (width - qr_px) // 2 + quiet
+    oy = pad + quiet
+    for ry, row in enumerate(matrix):
+        y0 = oy + ry * scale
+        run = None
+        for rx, on in enumerate(row + [0]):
+            if on and run is None:
+                run = rx
+            elif not on and run is not None:
+                draw.rectangle([ox + run * scale, y0,
+                                ox + rx * scale - 1, y0 + scale - 1],
+                               fill=(0, 0, 0, 255))
+                run = None
+
+    ty = pad + qr_px + int(pad * 0.6)
+    draw.text((width / 2, ty), caption, font=body, fill=(90, 96, 110, 255),
+              anchor="ma")
+    draw.text((width / 2, ty + line_h), text, font=addr, fill=(12, 14, 20, 255),
+              anchor="ma")
+
+    png = overlay_png_path()
+    png.parent.mkdir(parents=True, exist_ok=True)
+    tmp_png = png.with_suffix(".png.tmp")
+    img.save(tmp_png, "PNG")
+
+    # mpv wants pre-multiplied BGRA. Only the rounded corners are translucent,
+    # but leaving them unmultiplied puts a white fringe around the panel on a
+    # dark picture, which is the one place it will be seen.
+    r, g, b, a = img.split()
+    flat = Image.merge("RGBA", (ImageChops.multiply(b, a), ImageChops.multiply(g, a),
+                                ImageChops.multiply(r, a), a))
+    tmp_raw = overlay_bgra_path().with_suffix(".bgra.tmp")
+    tmp_raw.write_bytes(flat.tobytes())
+
+    meta = {"url": url, "width": img.width, "height": img.height,
+            "stride": img.width * 4, "screen_h": int(screen_h),
+            "note": caption, "png": str(png), "bgra": str(overlay_bgra_path())}
+    tmp_meta = overlay_meta_path().with_suffix(".json.tmp")
+    tmp_meta.write_text(json.dumps(meta, indent=2) + "\n")
+
+    # Rename last and in this order: the runner polls the PNG and mpv mmaps the
+    # raw file, so both must be complete before anything points at them.
+    os.replace(tmp_raw, overlay_bgra_path())
+    os.replace(tmp_meta, overlay_meta_path())
+    os.replace(tmp_png, png)
+    log.info("drew the guest QR panel at %dx%d for a %dpx screen",
+             img.width, img.height, screen_h)
+    return meta
+
+
+def overlay_meta() -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(overlay_meta_path().read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def clear_overlay() -> None:
+    """Take the panel down. The PNG goes last, for the same reason."""
+    for path in (overlay_meta_path(), overlay_bgra_path(), overlay_png_path()):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def publish_overlay(ip: str = "", port: int = 0, screen_h: int = 1080) -> Optional[Dict]:
+    """Make the panel on disk match the session. Safe to call on every tick.
+
+    Called from the player's supervisor rather than from the API, because the
+    session closes itself: if the only thing that drew and cleared the panel
+    were the open and close endpoints, an expired session would leave its QR on
+    the screen until somebody happened to press something.
+    """
+    cfg = config.load()
+    s = _load()
+    if not (s.open() and cfg.guest_overlay):
+        if overlay_meta_path().exists() or overlay_png_path().exists():
+            clear_overlay()
+            log.info("took the guest QR panel down")
+        return None
+    if not ip:
+        from . import cluster
+
+        ip = cluster.primary_ip()
+    url = share_url(ip, port or cfg.web_port)
+    if not url:
+        return None
+    current = overlay_meta()
+    if (current and current.get("url") == url
+            and current.get("screen_h") == int(screen_h)
+            and overlay_png_path().exists() and overlay_bgra_path().exists()):
+        return current
+    return render_overlay(url, screen_h=screen_h, note=cfg.guest_note)
+
+
+def overlay_status() -> Dict[str, Any]:
+    ok, reason = overlay_available()
+    meta = overlay_meta()
+    return {
+        "supported": ok,
+        "reason": reason,
+        "showing": bool(meta) and overlay_png_path().exists(),
+        "size": [meta["width"], meta["height"]] if meta else None,
     }

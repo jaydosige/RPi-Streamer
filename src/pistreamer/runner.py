@@ -255,6 +255,17 @@ class Runner:
         # logs a state rather than trusting the element's build-time defaults.
         self._overlay_text: Optional[str] = None
 
+        # The guest-sharing panel: a QR code and the address, as a PNG this
+        # process polls for. Same idea as the caption and for the same reason —
+        # sharing is switched on and off during a show, and the display cannot
+        # be restarted to do it. An image rather than text because a QR is the
+        # whole point, and because the address underneath it belongs in the
+        # same panel as the code it goes with.
+        self._image_overlay = None
+        self._image_overlay_file: Optional[str] = spec.get("image_overlay_file") or None
+        # (mtime, size) of what is currently on screen. None means nothing is.
+        self._image_stamp: Optional[tuple] = None
+
     # -- construction ------------------------------------------------------
 
     def _build_video_chain(self, pipeline) -> tuple:
@@ -323,6 +334,29 @@ class Runner:
                 set_prop(overlay, "ypad", OVERLAY_PAD)
                 self._overlay = overlay
                 elements.insert(1, overlay)
+
+        # Immediately after the caption, so both are upstream of videoflip and
+        # the output caps for exactly the reasons above. Bottom right: the
+        # caption owns the top left, and between them they leave the middle of
+        # the picture — where the content actually is — alone.
+        if self._image_overlay_file:
+            image = make_optional("gdkpixbufoverlay", "guestqr")
+            if image is None:
+                log("WARNING: gdkpixbufoverlay is missing, so the guest QR "
+                    "cannot be shown on the output — install the "
+                    "gstreamer1.0-plugins-good package. Playback continues "
+                    "without it.")
+            else:
+                # Negative offsets are measured from the right and bottom edges
+                # in the default positioning mode, which is what makes one set
+                # of numbers correct at every resolution.
+                set_prop(image, "offset-x", -OVERLAY_PAD)
+                set_prop(image, "offset-y", -OVERLAY_PAD)
+                # Start invisible and with no image: a location pointing at a
+                # file that is not there logs an error on every frame.
+                set_prop(image, "alpha", 0.0)
+                self._image_overlay = image
+                elements.insert(2 if self._overlay is not None else 1, image)
 
         rotation = int(spec.get("rotation", 0) or 0)
         if rotation in FLIP_METHODS:
@@ -812,6 +846,7 @@ class Runner:
             # and this tells them apart without reading the journal on the node.
             "overlay_available": self._overlay is not None,
             "overlay": self._overlay_text or None,
+            "guest_overlay": self._image_stamp is not None,
             "decoder": self._decoder,
             "hardware_decode": bool(self._decoder and _is_hardware_decoder(self._decoder)),
             "rendered": stats["rendered"],
@@ -863,6 +898,40 @@ class Runner:
             f"{wanted.replace(chr(10), ' / ') if wanted else '(hidden)'}")
         return True  # keep the timeout installed
 
+    def _poll_image_overlay(self) -> bool:
+        """Show, refresh or hide the guest panel to match the file on disk.
+
+        Keyed on (mtime, size) rather than on the path: the file is replaced in
+        place when the session is reopened with a new token, and a path-only
+        check would leave the previous QR — which no longer works — on the
+        screen for the rest of the night.
+        """
+        if self._image_overlay is None:
+            return True
+        path = self._image_overlay_file
+        try:
+            st = os.stat(path)
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            stamp = None
+        if stamp == self._image_stamp:
+            return True
+        self._image_stamp = stamp
+        if stamp is None:
+            set_prop(self._image_overlay, "alpha", 0.0)
+            # Dropping the image as well frees the decoded pixbuf; leaving it
+            # loaded at alpha 0 keeps a full-size RGBA buffer alive for as long
+            # as the pipeline runs. Cleared through `pixbuf`, not by setting
+            # `location` to None or "" — both make gdk-pixbuf complain to
+            # stderr on a perfectly ordinary switch-off.
+            set_prop(self._image_overlay, "pixbuf", None)
+            log("guest QR overlay off")
+        else:
+            set_prop(self._image_overlay, "location", path)
+            set_prop(self._image_overlay, "alpha", 1.0)
+            log(f"guest QR overlay on: {path}")
+        return True
+
     # -- bus ---------------------------------------------------------------
 
     def _on_message(self, _bus, message) -> None:
@@ -904,6 +973,11 @@ class Runner:
             # that is already being identified when its pipeline restarts comes
             # up with the caption instead of half a second without it.
             self._poll_overlay()
+        if self._image_overlay is not None:
+            GLib.timeout_add(OVERLAY_POLL_MS, self._poll_image_overlay)
+            # Same for the guest panel: sharing that was open before a source
+            # changed should not blink off while the new pipeline settles.
+            self._poll_image_overlay()
 
         for sig in ("SIGTERM", "SIGINT"):
             GLib.unix_signal_add(

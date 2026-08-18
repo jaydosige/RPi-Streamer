@@ -319,6 +319,16 @@ Notes from getting it working, all of which will bite again:
   in about 40 ms. If it is not there — the codec module has not loaded, or this
   is not a Pi — the receiver quietly falls back to software rather than
   crash-looping behind `exited with code -5`.
+* **The colour workaround is on by default.** Apple sends a full-range variant
+  the Pi's V4L2 decoder refuses outright, and the symptom is the receiver
+  sitting there perfectly healthy until somebody connects and then
+  `Internal data stream error` at the first frame. `-bt709` puts the right
+  colorimetry on the h264 caps ahead of the decoder. It only sets metadata, so
+  it costs nothing where it is not needed.
+* **And if it still fails, it degrades itself.** If the GPU decoder dies on a
+  live stream anyway, the receiver restarts once with software decoding and
+  says so on the card, rather than leaving somebody in front of a room pressing
+  Start again. A Pi 4 manages about 720p that way.
 * **Ports.** Left alone they are dynamic and advertised over mDNS. Pin them
   with `airplay_port` if there is a firewall between the phones and the node:
   with `-p n` the AirPlay service ends up on **n+2** (measured, not guessed),
@@ -351,8 +361,17 @@ address underneath it; a guest scans it or types the address and gets a one-page
 site with one button. What they send lands in the queue under the card, and the
 operator presses **Show**.
 
+**The code goes on the output too.** The people who need to scan it are looking
+at the screen, not at the operator's browser — so while sharing is open the QR
+and the address sit in the bottom-right corner of whatever is playing, the same
+way the identify caption sits in the top-left. It survives a change of content,
+comes down by itself when the session expires, and can be switched off from the
+card if the picture needs to stay clean.
+
 The QR is generated on the node, not by a web service, because a show network
-usually has no route to the internet.
+usually has no route to the internet. The on-screen panel needs `python3-pil`,
+which the installer adds; without it guest sharing still works and the code just
+stays in the browser.
 
 It is built on the assumption that the audience is the threat model:
 
@@ -508,13 +527,17 @@ python3 tests/test_teardown.py     # nothing outlives its segment (real processe
 python3 tests/test_diagnose.py     # network-vs-Pi verdicts
 python3 tests/test_cluster.py      # beacons, group auth, sync maths, push progress
 python3 tests/test_cluster_live.py # two real nodes: discovery, auth, file push
-python3 tests/test_overlay.py      # the identify caption actually renders
+python3 tests/test_overlay.py      # the identify caption and the guest QR
+                                   # actually render — needs working python3-gi
 python3 tests/test_gui.py          # real browser: the poll must not overwrite
                                    # what you are typing, and progress bars move
 python3 tests/test_update.py       # updates, against real git repositories
 python3 tests/test_guest.py        # guest sharing: what the room can and
                                    # cannot do, and the QR decodes
 python3 tests/test_airplay.py     # AirPlay, against a real uxplay process
+python3 tests/test_mpvoverlay.py  # the caption and the guest QR on the mpv
+                                  # side, by screenshotting a real mpv under
+                                  # Xvfb and decoding the code out of it
 
 python -m pistreamer.runner --self-test             # the real video chain
 python -m pistreamer.runner --self-test-compressed  # decoder selection

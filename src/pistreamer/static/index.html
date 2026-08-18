@@ -3066,11 +3066,13 @@ function guestClosedView(g) {
              value="${(g.note || "").replace(/"/g, "&quot;")}" style="flex:1 1 240px">
       <button class="btn primary" id="btnGuestOpen">Open sharing</button>
     </div>
-    <div class="note">Closed. Nothing is reachable at the guest address.</div>`;
+    <div class="note">Closed. Nothing is reachable at the guest address, and
+      there is nothing on the output.</div>`;
 }
 
 function guestOpenView(g) {
   const mins = g.remaining ? Math.ceil(g.remaining / 60) : 0;
+  const ov = g.overlay || {};
   return `
     <div class="share">
       <div class="qr">${g.qr || ""}</div>
@@ -3078,6 +3080,12 @@ function guestOpenView(g) {
         <div class="url">${(g.url || "").replace(/^https?:\/\//, "")}</div>
         <div class="closes">${g.remaining
           ? `Closes in ${mins} min` : "Open until you close it"}</div>
+        <div class="checkline">
+          <input type="checkbox" id="guestOverlay" ${ov.enabled ? "checked" : ""}>
+          <label for="guestOverlay">Show the code on the output as well${
+            ov.enabled && ov.showing ? " &mdash; it is up now"
+              : ov.enabled && !ov.supported ? " &mdash; " + ov.reason : ""}</label>
+        </div>
         <div class="checkline" style="margin-bottom:12px">
           <input type="checkbox" id="guestAutoplay" ${g.limits.autoplay ? "checked" : ""}>
           <label for="guestAutoplay">Guests may put their own upload on the screen</label>
@@ -3120,6 +3128,17 @@ function wireGuest(g) {
     ext.onclick = async () => {
       try { await post("/api/guest/extend", { minutes: 30 }); loadGuest(); }
       catch (err) { toast(err.message, true); }
+    };
+  }
+  const over = $("guestOverlay");
+  if (over) {
+    over.onchange = async () => {
+      try {
+        await post("/api/config", { guest_overlay: over.checked });
+        toast(over.checked ? "The code will appear on the output"
+                           : "The output stays clean");
+        setTimeout(loadGuest, 800);
+      } catch (err) { toast(err.message, true); over.checked = !over.checked; }
     };
   }
   const auto = $("guestAutoplay");

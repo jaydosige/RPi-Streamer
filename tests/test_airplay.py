@@ -123,11 +123,14 @@ def main() -> int:  # noqa: C901 - a test script, read top to bottom
     check("audio goes to the configured ALSA device",
           "alsasink device=hw:CARD=vc4hdmi0,DEV=0" in cmd, joined)
     if airplay.element_available("v4l2h264dec"):
-        check("hardware decode asks for the matching converter",
-              "v4l2h264dec" in cmd and "v4l2convert" in cmd, joined)
+        check("hardware decode is asked for with uxplay's own option",
+              "-v4l2" in cmd, joined)
+        # Verified against a real Pi 4B: without this the decoder rejects
+        # Apple's stream and the pipeline dies the moment somebody connects.
+        check("...with the colour workaround the Pi needs", "-bt709" in cmd, joined)
     else:
-        check("hardware decode is skipped when the GPU decoder is absent",
-              "v4l2h264dec" not in cmd, joined)
+        check("software decoding when the GPU decoder is absent",
+              "-avdec" in cmd and "-v4l2" not in cmd, joined)
     check("the frame rate is capped", "-fps" in cmd)
     check("the last frame is held by default", "-nc" in cmd)
     check("no PIN unless asked", "-pin" not in cmd)
@@ -138,8 +141,8 @@ def main() -> int:  # noqa: C901 - a test script, read top to bottom
     check("audio can be switched off", cmd[cmd.index("-as") + 1] == "0", " ".join(cmd))
     check("90 degrees maps to uxplay's own vocabulary",
           "-r" in cmd and cmd[cmd.index("-r") + 1] == "R", " ".join(cmd))
-    check("software decode drops the v4l2 elements",
-          "v4l2h264dec" not in cmd and "v4l2convert" not in cmd)
+    check("software decode is explicit, not a default",
+          "-avdec" in cmd and "-v4l2" not in cmd, " ".join(cmd))
     check("the PIN is requested with a bare -pin", "-pin" in cmd)
     check("...and with no fixed code, which uxplay 1.68 rejects",
           not any(re.fullmatch(r"-pin\d+", c) for c in cmd), " ".join(cmd))
@@ -215,6 +218,35 @@ def main() -> int:  # noqa: C901 - a test script, read top to bottom
     airplay.observe("Client Authentication Failure (client proof not validated)")
     check("a wrong PIN is explained", "pin" in airplay.session().last_error.lower(),
           airplay.session().last_error)
+    print("\nthe decoder failing on a live stream")
+    # Reported from a real Pi 4B: the receiver is healthy, a phone connects,
+    # and the pipeline collapses at the first frame because the Pi's V4L2
+    # decoder will not take Apple's full-range colour. uxplay prints its own
+    # advice about it, which is what makes it recognisable.
+    airplay.reset()
+    check("hardware decoding is on to begin with", not airplay.software_forced())
+    airplay.observe("Begin streaming to GStreamer video pipeline")
+    airplay.observe("GStreamer error: video_source Internal data stream error.")
+    check("the failure is recognised", airplay.software_forced())
+    check("it asks to be restarted", airplay.restart_wanted())
+    check("...only once", not airplay.restart_wanted())
+    check("the operator is told in words, not in an exit code",
+          "software decoding" in airplay.session().last_error,
+          airplay.session().last_error)
+    cmd_sw = airplay.build_command(config.load(), video_sink="fakesink")
+    check("the next receiver decodes in software",
+          "-avdec" in cmd_sw and "-v4l2" not in cmd_sw, " ".join(cmd_sw))
+    airplay.observe("*** was unable to construct a working video pipeline.")
+    check("a second failure is not another restart loop",
+          not airplay.restart_wanted())
+    check("...and says so plainly",
+          "even in software" in airplay.session().last_error,
+          airplay.session().last_error)
+    airplay.reset(keep_degrade=True)
+    check("a restart keeps the decision", airplay.software_forced())
+    airplay.reset()
+    check("changing mode forgets it", not airplay.software_forced())
+
     airplay.reset()
     check("a line it does not know is harmless",
           airplay.observe("some future message") is None)

@@ -256,6 +256,145 @@ check("video plays without the overlay plugin",
 check("the overlay is simply absent",
       degraded.pipeline.get_by_name("identify") is None)
 
+# --- the guest QR panel ----------------------------------------------------
+# The bug this is here for: the QR appeared in the operator's browser and
+# nowhere the room could see it. Counting bright pixels proves *something* is
+# drawn; decoding the code out of the frame proves the thing drawn is still a
+# working QR after the pipeline has scaled and converted it, which is the only
+# claim worth making about a code somebody has to scan from a chair.
+print("\nguest QR panel")
+
+if Gst.ElementFactory.find("gdkpixbufoverlay") is None:
+    print("  · skipped: gdkpixbufoverlay is missing "
+          "(install gstreamer1.0-plugins-good)")
+else:
+    import os as _os
+
+    _os.environ.setdefault("PISTREAMER_STATE", str(TMP))
+    _os.environ.setdefault("PISTREAMER_CONFIG", str(TMP / "config.json"))
+    _os.environ.setdefault("PISTREAMER_MEDIA", str(TMP / "media"))
+    from pistreamer import guest  # noqa: E402
+
+    URL = "http://10.42.7.13:8080/s/Kd93hsQ2"
+    panel_ok, panel_why = guest.overlay_available()
+    if not panel_ok:
+        print(f"  · skipped: {panel_why}")
+    else:
+        class Grabber(Counter):
+            """Counter, plus a copy of the most recent frame."""
+
+            def __init__(self, spec):
+                super().__init__(spec)
+                self.last_frame = None
+
+            def _count(self, pad, info):
+                buf = info.get_buffer()
+                ok, mapped = buf.map(Gst.MapFlags.READ)
+                if ok:
+                    try:
+                        self.last_frame = bytes(mapped.data)
+                    finally:
+                        buf.unmap(mapped)
+                return super()._count(pad, info)
+
+        png = guest.overlay_png_path()
+        guest.clear_overlay()
+
+        # 1080p, because the panel is sized as a fraction of screen height and
+        # the question is whether it scans at the size it will really be.
+        spec = spec_for(None, 11.0)
+        spec.update({"width": 1920, "height": 1080,
+                     "image_overlay_file": str(png)})
+        qr = Grabber(spec)
+        qr.window("before", 0.5, 1.8)
+        qr.at(2.0, lambda: guest.render_overlay(URL, screen_h=1080))
+        qr.window("showing", 3.2, 4.6)
+        qr.at(5.0, lambda: setattr(qr, "grab", qr.last_frame))
+        qr.at(5.4, guest.clear_overlay)
+        qr.window("after", 6.5, 7.8)
+        code5 = qr.run()
+
+        check("the pipeline ran", code5 == 0 and qr._frames > 0,
+              f"exit {code5}, {qr._frames} frames")
+        check("nothing is drawn before sharing opens", qr.worst("before") == 0,
+              str(qr.worst("before")))
+        check("the panel appears when sharing opens", qr.worst("showing") > 5000,
+              str(qr.worst("showing")))
+        check("it goes again when sharing closes", qr.worst("after") == 0,
+              str(qr.worst("after")))
+
+        frame = getattr(qr, "grab", None)
+        if frame is None:
+            check("a frame was captured to decode", False, "no frame")
+        else:
+            try:
+                import cv2  # noqa: PLC0415
+                import numpy as np  # noqa: PLC0415
+            except ImportError:
+                print("  · QR decode skipped (opencv/numpy not installed)")
+            else:
+                img = np.frombuffer(frame[:1920 * 1080], np.uint8).reshape(1080, 1920)
+                text, _, _ = cv2.QRCodeDetector().detectAndDecode(img)
+                check("the code still scans off the finished picture",
+                      text == URL, f"{text!r} != {URL!r}")
+                # Bottom right, where it stays clear of the identify caption.
+                where = np.argwhere(img > 200)
+                if len(where):
+                    check("the panel sits in the bottom-right corner",
+                          where[:, 0].mean() > 540 and where[:, 1].mean() > 960,
+                          f"centre of mass {where[:, 0].mean():.0f},"
+                          f"{where[:, 1].mean():.0f}")
+
+        # A new session replaces the file in place. A path-only check would
+        # leave a dead code on screen for the rest of the night.
+        print("\na reopened session replaces the code")
+        guest.render_overlay(URL, screen_h=1080)
+        spec2 = spec_for(None, 8.0)
+        spec2.update({"width": 1920, "height": 1080,
+                      "image_overlay_file": str(png)})
+        again = Grabber(spec2)
+        again.window("first", 1.0, 2.2)
+        again.at(2.6, lambda: guest.render_overlay(
+            "http://10.42.7.13:8080/s/DIFFERENT9", screen_h=1080))
+        again.at(4.4, lambda: setattr(again, "grab", again.last_frame))
+        again.window("second", 3.6, 4.8)
+        code6 = again.run()
+        check("it kept showing a code throughout",
+              code6 == 0 and again.worst("first") > 5000 and again.worst("second") > 5000,
+              f"{again.worst('first')} then {again.worst('second')}")
+        frame2 = getattr(again, "grab", None)
+        if frame2 is not None:
+            try:
+                import cv2  # noqa: PLC0415
+                import numpy as np  # noqa: PLC0415
+            except ImportError:
+                pass
+            else:
+                img2 = np.frombuffer(frame2[:1920 * 1080], np.uint8).reshape(1080, 1920)
+                text2, _, _ = cv2.QRCodeDetector().detectAndDecode(img2)
+                check("the new code is the one on screen, not the old one",
+                      text2.endswith("DIFFERENT9"), repr(text2))
+        guest.clear_overlay()
+
+    print("\ngdkpixbufoverlay not installed")
+    real_make_optional2 = R.make_optional
+    R.make_optional = lambda factory, name=None: (
+        None if factory == "gdkpixbufoverlay" else real_make_optional2(factory, name)
+    )
+    try:
+        spec3 = spec_for(None, 2.5)
+        spec3["image_overlay_file"] = str(TMP / "nothing.png")
+        degraded2 = Counter(spec3)
+        degraded2.window("nopanel", 0.5, 2.3)
+        code7 = degraded2.run()
+    finally:
+        R.make_optional = real_make_optional2
+    check("video plays without the image overlay plugin",
+          code7 == 0 and degraded2._frames > 0,
+          f"exit {code7}, {degraded2._frames} frames")
+    check("the panel is simply absent",
+          degraded2.pipeline.get_by_name("guestqr") is None)
+
 print()
 print(f"{len(PASS)} passed, {len(FAIL)} failed")
 if FAIL:
