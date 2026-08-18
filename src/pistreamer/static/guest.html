@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Share to the screen</title>
+<style>
+  /* Deliberately not the operator GUI with things hidden. This is one page,
+     one job, held in one hand, probably in a dark room, by somebody who has
+     never seen it before and will never see it again. */
+  :root {
+    --bg: #0f1115; --panel: #171a21; --panel-2: #1e222b; --line: #2a2f3a;
+    --text: #e6e9ef; --muted: #8b93a4; --accent: #4c8dff; --accent-ink: #07101f;
+    --good: #0ca30c; --bad: #d03b3b;
+    --ease: cubic-bezier(.2,.8,.3,1);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: max(20px, env(safe-area-inset-top)) 18px calc(28px + env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; align-items: center;
+  }
+  main { width: 100%; max-width: 460px; }
+  h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -.3px; }
+  .sub { color: var(--muted); font-size: 15px; margin-bottom: 22px; }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 18px; margin-bottom: 14px;
+  }
+  /* One target, thumb-sized, unmissable. */
+  .pick {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 8px; width: 100%; min-height: 132px; padding: 20px;
+    background: var(--accent); color: var(--accent-ink);
+    border: none; border-radius: 14px; font: inherit; font-size: 18px; font-weight: 600;
+    cursor: pointer; transition: transform .12s var(--ease), background .12s var(--ease);
+  }
+  .pick:active { transform: scale(.985); }
+  .pick:disabled { background: var(--panel-2); color: var(--muted); }
+  .pick .hint { font-size: 13px; font-weight: 400; opacity: .8; }
+  label.name { display: block; margin-top: 14px; }
+  label.name span { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  input[type=text] {
+    width: 100%; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+    font: inherit; min-height: 46px;
+  }
+  input[type=text]:focus {
+    outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(76,141,255,.14);
+  }
+  .item { display: flex; align-items: center; gap: 12px; padding: 12px 0; border-top: 1px solid var(--line); }
+  .item:first-child { border-top: none; }
+  .item .meta { flex: 1; min-width: 0; }
+  .item .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .item .st { font-size: 13px; color: var(--muted); }
+  .tick { color: var(--good); font-weight: 700; }
+  .bar { height: 8px; border-radius: 4px; background: var(--panel-2); overflow: hidden; margin-top: 10px; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .18s linear; }
+  .bar.done > i { background: var(--good); }
+  .bar.failed > i { background: var(--bad); width: 100% !important; }
+  .note { color: var(--muted); font-size: 13px; }
+  .banner {
+    padding: 12px 14px; border-radius: 10px; font-size: 14px;
+    background: #2a1b1d; border: 1px solid #45272a; color: #ffb4ae; margin-bottom: 14px;
+  }
+  .banner.ok { background: rgba(12,163,12,.10); border-color: #1d5a1d; color: #b6e8b6; }
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center;
+    background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 10px; padding: 10px 14px; min-height: 42px; font: inherit;
+    font-size: 15px; cursor: pointer;
+  }
+  .btn.play { color: #9dc0ff; border-color: #2f4a78; }
+  .foot { color: var(--muted); font-size: 12px; text-align: center; margin-top: 18px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">Share to the screen</h1>
+  <div class="sub" id="subtitle">Pick a photo or video from your phone.</div>
+
+  <div id="closed" class="banner" style="display:none">
+    Sharing is closed. Ask the person running the screens to open it again.
+  </div>
+
+  <div class="card" id="picker">
+    <input type="file" id="file" accept="video/*,image/*" hidden multiple>
+    <button class="pick" id="btnPick">
+      Choose a photo or video
+      <span class="hint" id="limits"></span>
+    </button>
+    <label class="name">
+      <span>Your name (optional — shown to the operator)</span>
+      <input type="text" id="from" maxlength="40" autocomplete="name" placeholder="e.g. Sam">
+    </label>
+  </div>
+
+  <div class="card" id="queue" style="display:none"></div>
+
+  <div class="foot" id="foot"></div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const TOKEN = location.pathname.split("/").filter(Boolean)[1] || "";
+let LIMITS = { max_mb: 512, max_items: 20, autoplay: false };
+let SENT = [];
+
+function fmtBytes(n) {
+  const u = ["B", "KB", "MB", "GB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i === 0 ? 0 : 1) + " " + u[i];
+}
+
+async function refresh() {
+  let s;
+  try {
+    const res = await fetch(`/s/${TOKEN}/status`);
+    if (!res.ok) throw new Error("closed");
+    s = await res.json();
+  } catch (_) {
+    $("closed").style.display = "";
+    $("picker").style.display = "none";
+    return;
+  }
+  LIMITS = s.limits;
+  $("closed").style.display = "none";
+  $("picker").style.display = "";
+  if (s.note) { $("subtitle").textContent = s.note; }
+  $("limits").textContent =
+    `up to ${LIMITS.max_mb} MB each · ${s.remaining_items} more allowed`;
+  $("btnPick").disabled = s.remaining_items <= 0;
+  if (s.remaining_items <= 0) {
+    $("limits").textContent = "this session is full — ask the operator";
+  }
+  $("foot").textContent = s.closes_in
+    ? `Sharing closes in ${Math.ceil(s.closes_in / 60)} min`
+    : "";
+}
+
+function render() {
+  const box = $("queue");
+  if (!SENT.length) { box.style.display = "none"; return; }
+  box.style.display = "";
+  box.innerHTML = SENT.map((it, i) => `
+    <div class="item">
+      <div class="meta">
+        <div class="nm">${it.name}</div>
+        <div class="st" id="st-${i}">${it.status}</div>
+        <div class="bar ${it.state}" id="bar-${i}"><i style="width:${it.pct}%"></i></div>
+      </div>
+      ${it.state === "done" && LIMITS.autoplay
+        ? `<button class="btn play" data-play="${i}">Show it</button>`
+        : it.state === "done" ? `<span class="tick">✓</span>` : ""}
+    </div>`).join("");
+  box.querySelectorAll("[data-play]").forEach((b) => {
+    b.onclick = async () => {
+      const it = SENT[+b.dataset.play];
+      b.disabled = true;
+      try {
+        const r = await fetch(`/s/${TOKEN}/play`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name: it.stored }),
+        });
+        if (!r.ok) throw new Error((await r.json()).detail || "could not show it");
+        it.status = "on the screen now";
+      } catch (e) {
+        it.status = e.message;
+      }
+      b.disabled = false;
+      render();
+    };
+  });
+}
+
+function upload(file) {
+  const entry = { name: file.name, status: "waiting…", pct: 0, state: "", stored: "" };
+  SENT.push(entry);
+  const index = SENT.length - 1;
+  render();
+
+  return new Promise((resolve) => {
+    if (file.size > LIMITS.max_mb * 1024 * 1024) {
+      entry.status = `too big — the limit is ${LIMITS.max_mb} MB`;
+      entry.state = "failed";
+      render();
+      resolve();
+      return;
+    }
+    const form = new FormData();
+    form.append("file", file);
+    form.append("from", $("from").value || "");
+    const xhr = new XMLHttpRequest();
+    let marks = [[Date.now(), 0]];
+    xhr.upload.onprogress = (e) => {
+      const now = Date.now();
+      marks.push([now, e.loaded]);
+      while (marks.length > 2 && now - marks[0][0] > 4000) marks.shift();
+      const span = (now - marks[0][0]) / 1000;
+      const rate = span > 0.2 ? (e.loaded - marks[0][1]) / span : 0;
+      entry.pct = e.lengthComputable ? (e.loaded / e.total) * 100 : 0;
+      entry.status = `${fmtBytes(e.loaded)} of ${fmtBytes(e.total)}`
+        + (rate ? ` · ${fmtBytes(rate)}/s` : "");
+      render();
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        let body = {};
+        try { body = JSON.parse(xhr.responseText); } catch (_) {}
+        entry.stored = body.name || "";
+        entry.pct = 100;
+        entry.state = "done";
+        entry.status = LIMITS.autoplay
+          ? "sent — you can show it now"
+          : "sent — the operator will put it up";
+      } else {
+        let detail = "could not send it";
+        try { detail = JSON.parse(xhr.responseText).detail || detail; } catch (_) {}
+        entry.state = "failed";
+        entry.status = detail;
+      }
+      render();
+      refresh();
+      resolve();
+    };
+    xhr.onerror = () => {
+      entry.state = "failed";
+      entry.status = "the connection dropped — try again";
+      render();
+      resolve();
+    };
+    xhr.open("POST", `/s/${TOKEN}/upload`);
+    xhr.send(form);
+  });
+}
+
+$("btnPick").onclick = () => $("file").click();
+$("file").onchange = async () => {
+  const files = Array.from($("file").files || []);
+  $("file").value = "";
+  for (const f of files) await upload(f);
+};
+
+refresh();
+setInterval(refresh, 15000);
+</script>
+</body>
+</html>

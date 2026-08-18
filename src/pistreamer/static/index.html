@@ -249,6 +249,28 @@
   }
   .empty { color: var(--muted); font-size: 14px; padding: 14px 2px; }
 
+  /* Guest sharing. The QR has to survive being photographed off a laptop
+     screen at an angle from two feet away, so it gets a real white card and a
+     quiet zone rather than being tinted to match the dark GUI. */
+  .share { display: flex; gap: 18px; align-items: flex-start; flex-wrap: wrap; }
+  .share .qr {
+    background: #fff; padding: 10px; border-radius: 10px; line-height: 0;
+    flex: 0 0 auto; animation: rise var(--slow) var(--ease);
+  }
+  /* crispEdges keeps the modules hard-edged when the vector is drawn
+     large, which is what a phone camera needs. */
+  .share .qr svg {
+    width: 168px; height: 168px; display: block; shape-rendering: crispEdges;
+  }
+  .share .qr-side { flex: 1 1 240px; min-width: 220px; }
+  .share .url {
+    font-family: ui-monospace, monospace; font-size: clamp(15px, 2.4vw, 19px);
+    font-weight: 600; overflow-wrap: anywhere; margin-bottom: 6px;
+  }
+  .share .closes { color: var(--muted); font-size: 13px; margin-bottom: 12px; }
+  li.queued .name { overflow-wrap: anywhere; }
+  li.queued .sub .who { color: var(--fg); }
+
   /* The one thing this page is for. Not a "hero figure" in the stat sense —
      it is an identity, not a magnitude — so it is sized to be read rather than
      to be impressive. */
@@ -554,6 +576,17 @@
       <div id="uploadProgress"></div>
       <ul class="list" id="mediaList"></ul>
     </div>
+    <div class="card" id="guestCard">
+      <h2>Guest sharing</h2>
+      <div class="note" style="margin-bottom:12px">
+        Opens a one-page upload site for the room. Anyone who scans the code can
+        send a photo or a video from their phone &mdash; nothing else on the node
+        is reachable from it. It closes itself when the time runs out.
+      </div>
+      <div id="guestBody"></div>
+      <ul class="list" id="guestQueue" style="margin-top:12px"></ul>
+    </div>
+
     <div class="card">
       <h2>Playlists</h2>
       <div class="note" style="margin-bottom:12px">
@@ -1262,7 +1295,7 @@ document.querySelectorAll("nav button").forEach((btn) => {
     btn.classList.add("active");
     $("tab-" + btn.dataset.tab).classList.add("active");
     const tab = btn.dataset.tab;
-    if (tab === "media") { loadMedia(); loadPlaylists(); loadSchedule(); }
+    if (tab === "media") { loadMedia(); loadPlaylists(); loadSchedule(); loadGuest(); }
     if (tab === "output") { loadConnectors(); loadAudioDevices(); loadPerf(); }
     if (tab === "system") { loadTelemetry(); loadOverclock(); loadUpdate(); }
     if (tab === "ndi") loadNdiNetwork();
@@ -2847,6 +2880,144 @@ async function loadMedia() {
   }
 }
 
+// ---------- guest sharing ----------
+//
+// The QR arrives as an SVG string built on the node, not from a QR web service:
+// show networks routinely have no route to the internet, and a code that needs
+// one is a code that fails on the day it is needed.
+
+let GUEST = null;
+
+async function loadGuest() {
+  let g;
+  try {
+    g = await api("/api/guest");
+  } catch (err) {
+    $("guestBody").innerHTML = `<div class="banner">${err.message}</div>`;
+    return;
+  }
+  GUEST = g;
+  $("guestBody").innerHTML = g.open ? guestOpenView(g) : guestClosedView(g);
+  wireGuest(g);
+  renderGuestQueue(g);
+}
+
+function guestClosedView(g) {
+  return `
+    <div class="row" style="margin-bottom:10px">
+      <input type="number" id="guestMins" min="5" max="1440" value="${g.default_minutes}"
+             style="width:110px" title="minutes">
+      <input type="text" id="guestNote" placeholder="Shown to guests, e.g. Rowan &amp; Sam's wedding"
+             value="${(g.note || "").replace(/"/g, "&quot;")}" style="flex:1 1 240px">
+      <button class="btn primary" id="btnGuestOpen">Open sharing</button>
+    </div>
+    <div class="note">Closed. Nothing is reachable at the guest address.</div>`;
+}
+
+function guestOpenView(g) {
+  const mins = g.remaining ? Math.ceil(g.remaining / 60) : 0;
+  return `
+    <div class="share">
+      <div class="qr">${g.qr || ""}</div>
+      <div class="qr-side">
+        <div class="url">${(g.url || "").replace(/^https?:\/\//, "")}</div>
+        <div class="closes">${g.remaining
+          ? `Closes in ${mins} min` : "Open until you close it"}</div>
+        <div class="checkline" style="margin-bottom:12px">
+          <input type="checkbox" id="guestAutoplay" ${g.limits.autoplay ? "checked" : ""}>
+          <label for="guestAutoplay">Guests may put their own upload on the screen</label>
+        </div>
+        <div class="row">
+          <button class="btn" id="btnGuestExtend">+30 min</button>
+          <button class="btn danger" id="btnGuestClose">Close sharing</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function wireGuest(g) {
+  const open = $("btnGuestOpen");
+  if (open) {
+    open.onclick = async () => {
+      try {
+        await post("/api/guest/open", {
+          minutes: +$("guestMins").value || undefined,
+          note: $("guestNote").value,
+        });
+        toast("Guest sharing is open");
+        loadGuest();
+      } catch (err) { toast(err.message, true); }
+    };
+  }
+  const close = $("btnGuestClose");
+  if (close) {
+    close.onclick = async () => {
+      if (!confirm("Close guest sharing? The code stops working straight away.")) return;
+      try {
+        await post("/api/guest/close");
+        toast("Guest sharing closed");
+        loadGuest();
+      } catch (err) { toast(err.message, true); }
+    };
+  }
+  const ext = $("btnGuestExtend");
+  if (ext) {
+    ext.onclick = async () => {
+      try { await post("/api/guest/extend", { minutes: 30 }); loadGuest(); }
+      catch (err) { toast(err.message, true); }
+    };
+  }
+  const auto = $("guestAutoplay");
+  if (auto) {
+    auto.onchange = async () => {
+      try {
+        await post("/api/config", { guest_autoplay: auto.checked });
+        toast(auto.checked ? "Guests can show their own uploads"
+                           : "Uploads now wait for you");
+      } catch (err) { toast(err.message, true); auto.checked = !auto.checked; }
+    };
+  }
+}
+
+function renderGuestQueue(g) {
+  const box = $("guestQueue");
+  if (!g.items.length) {
+    box.innerHTML = g.open
+      ? `<div class="empty">Nothing sent yet.</div>` : "";
+    return;
+  }
+  const current = STATE && STATE.player.mode === "local" ? STATE.player.target : null;
+  box.innerHTML = g.items.map((it) => `
+    <li class="queued ${it.name === current ? "playing" : ""}">
+      <div class="meta">
+        <div class="name">${it.name.replace(/^guest-[0-9a-f]{6}-/, "")}</div>
+        <div class="sub">${it.from ? `<span class="who">${it.from}</span> · ` : ""}${
+          fmtBytes(it.size)}${it.played ? " · shown" : ""}</div>
+      </div>
+      <button class="btn small accent" data-gplay="${encodeURIComponent(it.name)}">Show</button>
+      <button class="btn danger" data-gdel="${encodeURIComponent(it.name)}">Discard</button>
+    </li>`).join("");
+  box.querySelectorAll("button[data-gplay]").forEach((b) => {
+    b.onclick = async () => {
+      try {
+        await post("/api/guest/play", { name: decodeURIComponent(b.dataset.gplay) });
+        toast("On the screen");
+        poll(); loadGuest();
+      } catch (err) { toast(err.message, true); }
+    };
+  });
+  box.querySelectorAll("button[data-gdel]").forEach((b) => {
+    b.onclick = async () => {
+      const name = decodeURIComponent(b.dataset.gdel);
+      if (!confirm("Discard this? The file is deleted from the node.")) return;
+      try {
+        await api("/api/guest/item/" + encodeURIComponent(name), { method: "DELETE" });
+        loadGuest(); loadMedia();
+      } catch (err) { toast(err.message, true); }
+    };
+  });
+}
+
 // ---------- uploads ----------
 //
 // XMLHttpRequest rather than fetch, for one reason: fetch cannot report upload
@@ -3128,6 +3299,12 @@ $("btnManualNdi").onclick = () => {
   const name = $("manualNdi").value.trim();
   if (name) playNdi(name);
 };
+
+// Only while the card is on screen and the door is actually open: re-rendering
+// the closed view would wipe the half-typed event name out of its box.
+setInterval(() => {
+  if (activeTab() === "media" && GUEST && GUEST.open) loadGuest();
+}, 15000);
 
 // ---------- boot ----------
 

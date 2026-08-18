@@ -151,6 +151,19 @@ class Config:
     # the check quietly and carries on.
     update_check_hours: int = 24
 
+    # --- guest sharing ---
+    # A QR code a guest scans to put a photo or video on the screen. Off by
+    # default and it closes itself: an upload page left open on an event
+    # network is a door nobody remembers to shut.
+    guest_minutes: int = 60
+    guest_max_mb: int = 512
+    guest_max_items: int = 20
+    # Whether a guest may put their own upload on the screen. Off means it
+    # queues and the operator decides, which is the right default at a job.
+    guest_autoplay: bool = False
+    # A line shown on the guest page, e.g. the name of the event.
+    guest_note: str = ""
+
     # --- cluster ---
     # Announce this node on the LAN and accept commands from its group. Off
     # makes the node completely invisible and uncontrollable from other nodes.

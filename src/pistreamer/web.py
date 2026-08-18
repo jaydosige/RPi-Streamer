@@ -17,11 +17,12 @@ from typing import Any, Dict, List, Literal, Optional, Union
 from fastapi import Body, FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, Field
 
-from . import (cluster, config, diagnose, display, media, ndiconfig, playlists,
-               pushjob, schedule as schedule_mod, sources, syncplay, system,
-               updates)
+from . import (cluster, config, diagnose, display, guest, media, ndiconfig,
+               playlists, pushjob, schedule as schedule_mod, sources, syncplay,
+               system, updates)
 from .player import MODE_IDLE, MODE_LOCAL, MODE_NDI, identify_text, player
 from .telemetry import telemetry
 
@@ -648,6 +649,200 @@ async def delete_media(name: str) -> Dict[str, Any]:
     if not media.delete(name):
         raise HTTPException(404, f"no such media file: {name}")
     return {"deleted": name}
+
+
+# ----------------------------------------------------------------------
+# Guest sharing
+#
+# Two audiences, two sets of routes. Everything under /api/guest is the
+# operator's; everything under /s/{token} is the room's. They are kept apart on
+# purpose — the guest routes never consult the operator session, never accept a
+# cluster key, and can only do the three things a guest needs.
+# ----------------------------------------------------------------------
+
+
+class GuestOpenBody(BaseModel):
+    minutes: Optional[int] = None
+    note: Optional[str] = None
+
+
+class GuestItemBody(BaseModel):
+    name: str = Field(min_length=1)
+
+
+def _guest_summary() -> Dict[str, Any]:
+    cfg = config.load()
+    return guest.summary(ip=cluster.primary_ip(), port=cfg.web_port)
+
+
+@app.get("/api/guest")
+async def get_guest() -> Dict[str, Any]:
+    return _guest_summary()
+
+
+@app.post("/api/guest/open")
+async def open_guest(body: GuestOpenBody) -> Dict[str, Any]:
+    cfg = config.load()
+    minutes = cfg.guest_minutes if body.minutes is None else body.minutes
+    note = cfg.guest_note if body.note is None else body.note
+    guest.open_session(minutes=minutes, note=note)
+    return _guest_summary()
+
+
+@app.post("/api/guest/close")
+async def close_guest() -> Dict[str, Any]:
+    guest.close_session()
+    return _guest_summary()
+
+
+@app.post("/api/guest/extend")
+async def extend_guest(body: GuestOpenBody) -> Dict[str, Any]:
+    guest.extend(body.minutes or config.load().guest_minutes)
+    return _guest_summary()
+
+
+@app.post("/api/guest/play")
+async def play_guest_item(body: GuestItemBody) -> Dict[str, Any]:
+    """Operator puts a queued guest upload on the screen."""
+    if media.resolve(body.name) is None:
+        raise HTTPException(404, f"no such media file: {body.name}")
+    take_local_control("playing a guest upload")
+    config.update(mode=MODE_LOCAL, local_file=body.name)
+    player.apply(MODE_LOCAL, body.name)
+    guest.mark_played(body.name)
+    status = player.status()
+    if status["last_error"]:
+        raise HTTPException(500, status["last_error"])
+    return status
+
+
+@app.delete("/api/guest/item/{name}")
+async def delete_guest_item(name: str) -> Dict[str, Any]:
+    """Drop a guest upload: off the queue and off the disk.
+
+    An operator rejecting something from the room means it should be gone, not
+    hidden. Forgetting it from the queue but leaving the file in the library is
+    the failure mode that puts it on the screen an hour later.
+    """
+    cfg = config.load()
+    if cfg.mode == MODE_LOCAL and cfg.local_file == name:
+        raise HTTPException(409, "that is on the screen now; stop playback first")
+    known = guest.forget(name)
+    deleted = media.delete(name)
+    if not known and not deleted:
+        raise HTTPException(404, f"no such guest item: {name}")
+    return {"deleted": name}
+
+
+# --- the room's half -------------------------------------------------
+
+
+def _guest_gate(token: str) -> None:
+    """A wrong or expired token is a 404, not a 403.
+
+    404 leaks nothing: someone probing /s/ cannot tell an expired session from
+    a session that never existed from a node that has the feature switched off.
+    """
+    if not guest.valid(token):
+        raise HTTPException(404, "sharing is closed")
+
+
+@app.get("/s/{token}", include_in_schema=False)
+async def guest_page(token: str) -> FileResponse:
+    # The page itself is served even when the token is stale, because it knows
+    # how to say "sharing has finished" far more kindly than a 404 page does.
+    return FileResponse(STATIC_DIR / "guest.html")
+
+
+@app.get("/s/{token}/status")
+async def guest_status(token: str) -> Dict[str, Any]:
+    _guest_gate(token)
+    return guest.public_status()
+
+
+@app.post("/s/{token}/upload")
+async def guest_upload(token: str, request: Request) -> Dict[str, Any]:
+    _guest_gate(token)
+    cfg = config.load()
+    refusal = guest.can_accept(cfg)
+    if refusal:
+        raise HTTPException(409, refusal)
+
+    limit = guest.limits(cfg)["max_mb"] * 1024 * 1024
+    # A cheap early refusal before the body is read at all. It is only a hint —
+    # the header is whatever the client felt like sending — but it saves
+    # spooling a 4 GB phone video onto the SD card just to reject it.
+    try:
+        declared = int(request.headers.get("content-length") or 0)
+    except ValueError:
+        declared = 0
+    if declared > limit + (1 << 20):
+        raise HTTPException(
+            413, f"that file is bigger than the {limit // (1024 * 1024)} MB limit")
+
+    form = await request.form()
+    upload = form.get("file")
+    # Starlette's UploadFile, not FastAPI's: a multipart part parsed out of a
+    # raw Request is the starlette class, and FastAPI's subclass fails the
+    # isinstance check, which turned every guest upload into "no file".
+    if not isinstance(upload, StarletteUploadFile) or not upload.filename:
+        raise HTTPException(400, "no file was attached")
+    if not media.is_allowed(upload.filename):
+        raise HTTPException(
+            400, f"that kind of file cannot be shown here"
+                 f" ({Path(upload.filename).suffix or 'no extension'})")
+
+    name = guest.guest_filename(upload.filename)
+    config.MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+    dest = config.MEDIA_DIR / name
+    tmp = config.MEDIA_DIR / f".{name}.part"
+    written = 0
+    try:
+        with tmp.open("wb") as fh:
+            while chunk := await upload.read(UPLOAD_CHUNK):
+                written += len(chunk)
+                # Checked while writing, not from Content-Length: the header is
+                # whatever the client felt like sending.
+                if written > limit:
+                    raise HTTPException(
+                        413, f"that file is bigger than the {limit // (1024 * 1024)} MB limit")
+                fh.write(chunk)
+        tmp.replace(dest)
+    except HTTPException:
+        tmp.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(500, f"the node could not save it: {exc}") from exc
+    finally:
+        await upload.close()
+
+    sender = str(form.get("from") or "")
+    guest.record(name, written, sender=sender)
+    log.info("guest upload: %s (%d bytes)%s", name, written,
+             f" from {sender}" if sender else "")
+    return {"name": name, "size": written}
+
+
+@app.post("/s/{token}/play")
+async def guest_play(token: str, body: GuestItemBody) -> Dict[str, Any]:
+    """A guest showing their own upload. Only if the operator allowed it."""
+    _guest_gate(token)
+    cfg = config.load()
+    if not cfg.guest_autoplay:
+        raise HTTPException(403, "the operator decides what goes on the screen")
+    # Only files this session actually received: without this check the
+    # endpoint is "play anything in the library by name" for the whole room.
+    s = guest.session()
+    if not any(i["name"] == body.name for i in s.items):
+        raise HTTPException(404, "that is not one of this session's uploads")
+    if media.resolve(body.name) is None:
+        raise HTTPException(404, "that file is no longer on the node")
+    take_local_control("a guest put their upload on the screen")
+    config.update(mode=MODE_LOCAL, local_file=body.name)
+    player.apply(MODE_LOCAL, body.name)
+    guest.mark_played(body.name)
+    return {"playing": body.name}
 
 
 # ----------------------------------------------------------------------

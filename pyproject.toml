@@ -12,6 +12,10 @@ dependencies = [
     "uvicorn[standard]>=0.27",
     "python-multipart>=0.0.9",
     "pydantic>=2.6",
+    # Pure Python, no dependencies of its own. The QR code has to be drawn on
+    # the node: this runs on show networks with no route to the internet, where
+    # a code rendered by a web service would simply not appear.
+    "segno>=1.6",
 ]
 
 [project.scripts]

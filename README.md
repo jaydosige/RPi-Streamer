@@ -281,6 +281,43 @@ gst-device-monitor-1.0 Source/Network  # what senders can this Pi see?
 The GUI's pipeline log shows GStreamer/mpv stderr, which is where decode errors
 and NDI connection failures surface first.
 
+## Guest sharing
+
+Somebody at the job has a video on their phone and wants it on the screen. Media
+tab → **Guest sharing** → *Open sharing*. The node draws a QR code and shows the
+address underneath it; a guest scans it or types the address and gets a one-page
+site with one button. What they send lands in the queue under the card, and the
+operator presses **Show**.
+
+The QR is generated on the node, not by a web service, because a show network
+usually has no route to the internet.
+
+It is built on the assumption that the audience is the threat model:
+
+* **Off by default, and it closes itself.** A session runs for an hour unless
+  you say otherwise. Nobody remembers to shut the door at the end of a job.
+* **The QR is the credential.** Every time you open sharing a new token is
+  minted, so last month's photo of the code is worthless.
+* **Guests cannot take the screen.** Uploads queue and you decide. Tick *Guests
+  may put their own upload on the screen* if you would rather they didn't have
+  to find you — they can then only show files they themselves sent this session.
+* **Caps on size, count and type** (`guest_max_mb`, `guest_max_items`), because
+  the upload page is reachable by everybody in the room.
+* **Discard deletes.** Rejecting something from the queue removes the file from
+  the node, not just from the list.
+
+Guest files are stored as `guest-<id>-<their filename>`, so an `IMG_0001.mp4`
+from the floor can never overwrite one of yours and you can tell at a glance in
+the library where a file came from.
+
+**Screen sharing is not offered, deliberately.** A browser can only share a
+screen through `getDisplayMedia`, and that API does not exist on any browser on
+iOS, is unreliable on Android, and needs HTTPS — which means a certificate, on a
+box whose address changes with the DHCP lease. Building it would produce a
+button that fails for most of the room. If you need a phone or laptop screen on
+the wall, the right answer is AirPlay/Miracast receiving, which belongs as
+another playback mode next to NDI and local rather than as a web page.
+
 ## Troubleshooting
 
 **No NDI sources listed.** Check `gst-inspect-1.0 ndisrc` loads. If it does,
@@ -413,6 +450,8 @@ python3 tests/test_overlay.py      # the identify caption actually renders
 python3 tests/test_gui.py          # real browser: the poll must not overwrite
                                    # what you are typing, and progress bars move
 python3 tests/test_update.py       # updates, against real git repositories
+python3 tests/test_guest.py        # guest sharing: what the room can and
+                                   # cannot do, and the QR decodes
 
 python -m pistreamer.runner --self-test             # the real video chain
 python -m pistreamer.runner --self-test-compressed  # decoder selection
@@ -449,8 +488,11 @@ src/pistreamer/
   diagnose.py               network-vs-Pi verdict with evidence
   telemetry.py              rolling 10-minute sampler, memory only
   system.py                 telemetry, audio devices, overclock, power actions
+  guest.py                  guest sharing sessions, tokens, QR
+  updates.py                the app half of GUI-driven updates
   web.py                    FastAPI app
   static/index.html         the GUI, single file, no build step
+  static/guest.html         the guest upload page, separate on purpose
 systemd/
   pistreamer.service            the app (NoNewPrivileges=yes)
   pistreamer-overclock.path     watches for an overclock request
