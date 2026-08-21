@@ -577,9 +577,9 @@ async def play_airplay() -> Dict[str, Any]:
     ok, reason = airplay.available()
     if not ok:
         raise HTTPException(409, reason)
-    take_local_control("AirPlay receiving started")
-    config.update(mode=MODE_AIRPLAY)
-    player.apply(MODE_AIRPLAY)
+    take_local_control("AirPlay ready for use")
+    # Set a flag that AirPlay is ready, but keep current playback
+    config.update(mode=MODE_LOCAL, airplay_enabled=True)
     status = player.status()
     if status["last_error"]:
         raise HTTPException(500, status["last_error"])
@@ -593,6 +593,7 @@ async def get_airplay() -> Dict[str, Any]:
     return {
         **caps,
         "on": cfg.mode == MODE_AIRPLAY,
+        "ready": cfg.airplay_enabled,
         "name": airplay.receiver_name(cfg),
         "session": airplay.summary(),
         "ports": airplay.ports(cfg),
@@ -603,7 +604,7 @@ async def get_airplay() -> Dict[str, Any]:
 @app.post("/api/stop")
 async def stop() -> Dict[str, Any]:
     take_local_control("stopped from the GUI")
-    config.update(mode=MODE_IDLE)
+    config.update(mode=MODE_IDLE, airplay_enabled=False)
     player.apply(MODE_IDLE)
     return player.status()
 
@@ -1049,7 +1050,57 @@ async def get_overclock() -> Dict[str, Any]:
         try:
             data["last_result"] = json.loads(result_path.read_text())
         except (OSError, ValueError):
-            pass
+        @app.post("/api/play/airplay")
+async def play_airplay() -> Dict[str, Any]:
+    """Start receiving AirPlay.
+
+    The UI should not stop the current content when AirPlay is enabled.
+    Instead we simply set a flag that the node is ready to accept AirPlay
+    streams, and show a message in the GUI. The actual AirPlay receiver
+    will only be started when the operator explicitly switches to AirPlay
+    mode via the UI, keeping the current playback uninterrupted.
+    """
+    ok, reason = airplay.available()
+    if not ok:
+        raise HTTPException(409, reason)
+    take_local_control("AirPlay ready for use")
+    # Set a flag in the config so the UI can show a ready message.
+    config.update(mode=MODE_LOCAL, airplay_enabled=True)
+    # Do not spawn the AirPlay receiver yet; keep current playback.
+    status = player.status()
+    if status["last_error"]:
+        raise HTTPException(500, status["last_error"])
+    return {**status, "airplay": airplay.summary()}
+
+
+@app.get("/api/airplay")
+async def get_airplay() -> Dict[str, Any]:
+    cfg = config.load()
+    caps = airplay.capabilities()
+    return {
+        **caps,
+        "on": cfg.mode == MODE_AIRPLAY,
+        "ready": cfg.airplay_enabled,
+        "name": airplay.receiver_name(cfg),
+        "session": airplay.summary(),
+        "ports": airplay.ports(cfg),
+        "command": airplay.build_command(cfg, video_sink="kmssink"),
+    }
+
+
+@app.post("/api/stop")
+async def stop() -> Dict[str, Any]:
+    take_local_control("stopped from the GUI")
+    config.update(mode=MODE_IDLE, airplay_enabled=False)
+    player.apply(MODE_IDLE)
+    return player.status()
+
+
+@app.post("/api/restart")
+async def restart_player() -> Dict[str, Any]:
+    player.restart()
+    return player.status()
+
     unit = Path("/etc/systemd/system/pistreamer-overclock.path")
     data["writable"] = unit.exists()
     if not data["writable"]:

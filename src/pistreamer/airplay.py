@@ -431,6 +431,13 @@ def build_command(cfg: Optional[config.Config] = None,
     cmd += ["-key", str(key_path()), "-reg", str(register_path())]
 
     if video_sink:
+        # Wrap kmssink with scaling to preserve aspect ratio
+        if video_sink.split()[0] == "kmssink":
+            rest = " ".join(video_sink.split()[1:])
+            if rest:
+                video_sink = f"videoscale add-borders=true ! videoconvert ! kmssink {rest}"
+            else:
+                video_sink = "videoscale add-borders=true ! videoconvert ! kmssink"
         cmd += ["-vs", video_sink]
     if width and height:
         # kmssink only sets a mode that matches the frame exactly, so the

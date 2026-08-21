@@ -205,6 +205,7 @@ class Config:
     # host with no DRM device at all, where the kmssink we would build hangs
     # before the receiver ever starts listening.
     airplay_video_sink: str = ""
+    airplay_enabled: bool = False
 
     # --- cluster ---
     # Announce this node on the LAN and accept commands from its group. Off
