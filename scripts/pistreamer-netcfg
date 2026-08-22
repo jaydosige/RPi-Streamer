@@ -92,6 +92,10 @@ def active_connections():
     return rows
 
 
+def hotspot_active() -> bool:
+    return any(c["name"] == HOTSPOT_CON for c in active_connections())
+
+
 def current_wifi_connection():
     """The non-hotspot wifi connection currently up, if any."""
     for row in active_connections():
@@ -172,6 +176,20 @@ def act_join(req):
     device = wifi_device()
     previous = current_wifi_connection()
 
+    # There is one radio. While the hotspot is up the device is in AP mode,
+    # where it cannot scan — so `nmcli dev wifi connect` never finds the SSID
+    # and the join silently does nothing while the hotspot stays on. Take the
+    # AP down first, and put it back if the join fails, or a wrong passphrase
+    # leaves the node with no network and no way back onto it.
+    hotspot_was_up = hotspot_active()
+    if hotspot_was_up:
+        run(["systemctl", "stop", REVERT_UNIT + ".timer"], timeout=20)
+        run(["nmcli", "con", "down", HOTSPOT_CON], timeout=45)
+        # Leaving AP mode and having a scan list again is not instant.
+        time.sleep(2)
+        run(["nmcli", "dev", "wifi", "rescan"], timeout=30)
+        time.sleep(3)
+
     args = ["nmcli", "dev", "wifi", "connect", ssid, "ifname", device]
     if psk:
         args += ["password", psk]
@@ -183,16 +201,25 @@ def act_join(req):
         for _ in range(15):
             if has_address(device):
                 save_previous(ssid)
+                if hotspot_was_up:
+                    run(["nmcli", "con", "delete", HOTSPOT_CON], timeout=20)
                 return True, {"ssid": ssid, "addresses": addresses()}, \
                     f"joined {ssid}"
             time.sleep(1)
         err = "connected but no address was issued"
 
     # Put back whatever was working before, so a failed attempt is not also a
-    # disconnection.
-    if previous:
+    # disconnection. The hotspot counts: it is how the operator is reaching
+    # the node, and stranding them there is the worst outcome available.
+    restored = ""
+    if hotspot_was_up:
+        if run(["nmcli", "con", "up", HOTSPOT_CON], timeout=90)[0] == 0:
+            restored = HOTSPOT_CON
+            schedule_revert(DEFAULT_HOTSPOT_MINUTES)
+    elif previous:
         run(["nmcli", "con", "up", previous], timeout=60)
-    return False, {"ssid": ssid, "reverted_to": previous}, \
+        restored = previous
+    return False, {"ssid": ssid, "reverted_to": restored}, \
         f"could not join {ssid}: {err or 'unknown error'}"
 
 
