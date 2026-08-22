@@ -78,6 +78,7 @@ install -d "${PISTREAMER_HOME}/bin"
 install -m 0755 "${REPO_DIR}/scripts/pistreamer-tuning" "${PISTREAMER_HOME}/bin/pistreamer-tuning"
 install -m 0755 "${REPO_DIR}/scripts/pistreamer-overclock" "${PISTREAMER_HOME}/bin/pistreamer-overclock"
 install -m 0755 "${REPO_DIR}/scripts/pistreamer-update" "${PISTREAMER_HOME}/bin/pistreamer-update"
+install -m 0755 "${REPO_DIR}/scripts/pistreamer-netcfg" "${PISTREAMER_HOME}/bin/pistreamer-netcfg"
 
 # --- where this node was installed from ------------------------------------
 # The updater runs as root from a systemd unit with no idea where the working
@@ -132,6 +133,14 @@ systemctl enable --now pistreamer-update.path >/dev/null 2>&1 \
 systemctl enable --now pistreamer-overclock.path >/dev/null 2>&1 \
   && ok "overclock helper armed (path-activated, no sudo)" \
   || warn "could not enable pistreamer-overclock.path; overclocking will be unavailable"
+install -m 0644 "${REPO_DIR}/systemd/pistreamer-netcfg.service" \
+  /etc/systemd/system/pistreamer-netcfg.service
+install -m 0644 "${REPO_DIR}/systemd/pistreamer-netcfg.path" \
+  /etc/systemd/system/pistreamer-netcfg.path
+systemctl daemon-reload
+systemctl enable --now pistreamer-netcfg.path >/dev/null 2>&1 \
+  && ok "network helper armed (hostname, Wi-Fi, hotspot)" \
+  || warn "could not enable pistreamer-netcfg.path; hostname and Wi-Fi setup will be unavailable"
 
 if [[ ! -f "${PISTREAMER_CONFIG_DIR}/tuning.conf" ]]; then
   cat > "${PISTREAMER_CONFIG_DIR}/tuning.conf" <<'EOF'

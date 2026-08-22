@@ -23,7 +23,7 @@ STATE_DIR = Path(os.environ.get("PISTREAMER_STATE", "/var/lib/pistreamer"))
 @dataclass
 class Config:
     # --- what to play ---
-    # mode: "idle" | "ndi" | "local" | "web"
+    # mode: "idle" | "ndi" | "local" | "web" | "stream"
     mode: str = "idle"
     # NDI source name exactly as advertised on the network,
     # e.g. "STUDIO-PC (OBS)"
@@ -32,6 +32,16 @@ class Config:
     local_file: str = ""
     # URL to display in web mode (e.g. "http://example.com")
     web_url: str = ""
+    # Live stream to play in stream mode: HLS/DASH over http(s), or a
+    # udp://, rtp://, rtsp://, srt:// address.
+    stream_url: str = ""
+    # Seconds of stream mpv reads ahead. Bigger rides out a lumpy network at
+    # the cost of latency; 0 is as immediate as it gets and stutters if
+    # anything hiccups.
+    stream_cache_s: int = 3
+    # mpv's low-latency profile. Right for IMAG where the screen is compared
+    # against the real stage; wrong for a dashboard, where smoothness wins.
+    stream_low_latency: bool = False
     loop: bool = True
     # Restore the above on boot rather than starting idle
     autostart: bool = True
@@ -208,6 +218,21 @@ class Config:
     # before the receiver ever starts listening.
     airplay_video_sink: str = ""
     airplay_enabled: bool = False
+
+    # --- operator login ---
+    # Require a username and password for the GUI and its API. Guest sharing
+    # (/s/{token}) is never behind this: the QR code is the guest credential,
+    # and a stranger being asked for a password is the feature not working.
+    # Node-to-node traffic authenticates with cluster_key instead, so a group
+    # keeps working when this is on.
+    auth_enabled: bool = False
+    # How long a login lasts without use, in hours. Long by default because an
+    # operator logged out mid-show by a routine update will simply turn the
+    # login off for good.
+    auth_session_hours: int = 720
+    # Whether first-boot setup has been completed. Until it has, the GUI opens
+    # on the wizard instead of the console.
+    setup_complete: bool = False
 
     # --- cluster ---
     # Announce this node on the LAN and accept commands from its group. Off

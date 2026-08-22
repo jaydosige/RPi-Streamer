@@ -34,7 +34,8 @@ TICK_SECONDS = 20.0
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
-ACTIONS = ("ndi", "playlist", "file", "folder", "web", "airplay", "standby")
+ACTIONS = ("ndi", "playlist", "file", "folder", "web", "stream", "favourite",
+           "airplay", "standby")
 
 
 @dataclass

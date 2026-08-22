@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""Apply network and hostname changes for pi-streamer. Runs as ROOT.
+
+Triggered by pistreamer-netcfg.path when the unprivileged service drops a
+request file. It is deliberately not invoked through sudo: pistreamer.service
+sets NoNewPrivileges=yes, which blocks sudo for the service and every child of
+it, so escalation could never work. The service writes a file it already owns
+and this root oneshot picks it up — the same shape as the overclock helper.
+
+Written in Python rather than shell on purpose. The inputs are an SSID and a
+passphrase typed into a web form on an event network, and every one of them
+reaches a command line. Passing an argv list means there is no shell to quote
+for and no way for an SSID called `; rm -rf /` to be anything but an SSID.
+
+Two things here can cut off the hand that feeds them, so both self-heal:
+
+  * **Joining a network** is verified before it is kept. If the new connection
+    does not come up with an address, the previous one is brought back.
+  * **The hotspot expires.** Turning it on takes the wireless interface into AP
+    mode, which drops any browser reaching the node over Wi-Fi. If setup is not
+    finished within the timeout, the node puts its old connection back. A
+    mistake costs a wait rather than a keyboard and monitor.
+
+    pistreamer-netcfg status          # read-only
+    pistreamer-netcfg --from-request  # what the path unit calls
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE_DIR = Path(os.environ.get("PISTREAMER_STATE", "/var/lib/pistreamer"))
+REQUEST = STATE_DIR / "network.request"
+RESULT = STATE_DIR / "network.result"
+STATE = STATE_DIR / "network.state"
+
+HOTSPOT_CON = "pistreamer-hotspot"
+# The transient unit that puts the old network back if setup is abandoned.
+REVERT_UNIT = "pistreamer-hotspot-revert"
+HELPER_BIN = Path("/opt/pistreamer/bin/pistreamer-netcfg")
+# The connection that was active before we took the interface, so it can be put
+# back. Kept on disk because the revert may happen in a different process.
+PREVIOUS = STATE_DIR / "network.previous"
+
+DEFAULT_HOTSPOT_MINUTES = 30
+MAX_HOTSPOT_MINUTES = 240
+
+_HOSTNAME_RE = re.compile(r"[^A-Za-z0-9-]")
+
+
+def run(args, timeout=45):
+    """Run a command as an argv list. Never a shell, never a format string."""
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{args[0]} timed out"
+    except OSError as exc:
+        return 127, "", str(exc)
+
+
+def have_nmcli() -> bool:
+    return shutil.which("nmcli") is not None
+
+
+def wifi_device() -> str:
+    code, out, _ = run(["nmcli", "-t", "-f", "DEVICE,TYPE", "dev"])
+    if code == 0:
+        for line in out.splitlines():
+            parts = line.split(":")
+            if len(parts) >= 2 and parts[1] == "wifi":
+                return parts[0]
+    return "wlan0"
+
+
+def active_connections():
+    code, out, _ = run(["nmcli", "-t", "-f", "NAME,DEVICE,TYPE", "con", "show", "--active"])
+    if code != 0:
+        return []
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3:
+            rows.append({"name": parts[0], "device": parts[1], "type": parts[2]})
+    return rows
+
+
+def current_wifi_connection():
+    """The non-hotspot wifi connection currently up, if any."""
+    for row in active_connections():
+        if row["type"].endswith("wireless") and row["name"] != HOTSPOT_CON:
+            return row["name"]
+    return ""
+
+
+def scan():
+    """Nearby networks, strongest first, deduplicated by SSID."""
+    if not have_nmcli():
+        return []
+    run(["nmcli", "dev", "wifi", "rescan"], timeout=30)
+    code, out, _ = run(
+        ["nmcli", "-t", "-f", "SSID,SIGNAL,SECURITY,IN-USE", "dev", "wifi", "list"])
+    if code != 0:
+        return []
+    best = {}
+    for line in out.splitlines():
+        # nmcli escapes colons inside fields as "\:", so split on unescaped ones.
+        parts = re.split(r"(?<!\\):", line)
+        if len(parts) < 3:
+            continue
+        ssid = parts[0].replace("\\:", ":").strip()
+        if not ssid:
+            continue  # hidden network; nothing useful to show
+        try:
+            signal = int(parts[1])
+        except ValueError:
+            signal = 0
+        entry = {
+            "ssid": ssid,
+            "signal": signal,
+            "security": parts[2].strip(),
+            "open": not parts[2].strip(),
+            "in_use": "*" in (parts[3] if len(parts) > 3 else ""),
+        }
+        if ssid not in best or signal > best[ssid]["signal"]:
+            best[ssid] = entry
+    return sorted(best.values(), key=lambda e: -e["signal"])
+
+
+def addresses():
+    code, out, _ = run(["nmcli", "-t", "-f", "IP4.ADDRESS", "dev", "show"])
+    found = []
+    if code == 0:
+        for line in out.splitlines():
+            if ":" in line:
+                value = line.split(":", 1)[1].strip()
+                if value and not value.startswith("127."):
+                    found.append(value.split("/")[0])
+    return found
+
+
+def has_address(device: str) -> bool:
+    code, out, _ = run(["nmcli", "-t", "-f", "IP4.ADDRESS", "dev", "show", device])
+    return code == 0 and any(
+        line.split(":", 1)[1].strip() for line in out.splitlines() if ":" in line)
+
+
+# ----------------------------------------------------------------------
+# Actions
+# ----------------------------------------------------------------------
+
+
+def act_scan(_req):
+    return True, {"networks": scan()}, "scanned"
+
+
+def act_join(req):
+    ssid = str(req.get("ssid", "")).strip()
+    psk = str(req.get("password", ""))
+    if not ssid:
+        return False, {}, "no network name given"
+    if not have_nmcli():
+        return False, {}, "NetworkManager (nmcli) is not installed on this node"
+
+    device = wifi_device()
+    previous = current_wifi_connection()
+
+    args = ["nmcli", "dev", "wifi", "connect", ssid, "ifname", device]
+    if psk:
+        args += ["password", psk]
+    code, _out, err = run(args, timeout=90)
+
+    # Connecting is not the same as working. A wrong passphrase can report
+    # success and leave the interface with no address at all.
+    if code == 0:
+        for _ in range(15):
+            if has_address(device):
+                save_previous(ssid)
+                return True, {"ssid": ssid, "addresses": addresses()}, \
+                    f"joined {ssid}"
+            time.sleep(1)
+        err = "connected but no address was issued"
+
+    # Put back whatever was working before, so a failed attempt is not also a
+    # disconnection.
+    if previous:
+        run(["nmcli", "con", "up", previous], timeout=60)
+    return False, {"ssid": ssid, "reverted_to": previous}, \
+        f"could not join {ssid}: {err or 'unknown error'}"
+
+
+def save_previous(name: str) -> None:
+    try:
+        PREVIOUS.write_text((name or "") + "\n")
+    except OSError:
+        pass
+
+
+def read_previous() -> str:
+    try:
+        return PREVIOUS.read_text().strip()
+    except OSError:
+        return ""
+
+
+def act_hotspot_on(req):
+    if not have_nmcli():
+        return False, {}, "NetworkManager (nmcli) is not installed on this node"
+    ssid = str(req.get("ssid") or "pistreamer-setup").strip()[:32]
+    psk = str(req.get("password") or "")
+    if psk and len(psk) < 8:
+        return False, {}, "a hotspot passphrase must be at least 8 characters"
+    minutes = req.get("minutes")
+    try:
+        minutes = int(minutes) if minutes else DEFAULT_HOTSPOT_MINUTES
+    except (TypeError, ValueError):
+        minutes = DEFAULT_HOTSPOT_MINUTES
+    minutes = max(5, min(MAX_HOTSPOT_MINUTES, minutes))
+
+    device = wifi_device()
+    # Remember what we are displacing before the interface changes mode.
+    previous = current_wifi_connection()
+    if previous:
+        save_previous(previous)
+
+    run(["nmcli", "con", "delete", HOTSPOT_CON], timeout=20)
+    add = [
+        "nmcli", "con", "add", "type", "wifi", "ifname", device,
+        "con-name", HOTSPOT_CON, "autoconnect", "no", "ssid", ssid,
+        "802-11-wireless.mode", "ap", "802-11-wireless.band", "bg",
+        "ipv4.method", "shared",
+    ]
+    code, _out, err = run(add, timeout=45)
+    if code != 0:
+        return False, {}, f"could not create the hotspot: {err}"
+    if psk:
+        code, _out, err = run(
+            ["nmcli", "con", "modify", HOTSPOT_CON,
+             "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", psk], timeout=30)
+        if code != 0:
+            return False, {}, f"could not set the hotspot passphrase: {err}"
+
+    code, _out, err = run(["nmcli", "con", "up", HOTSPOT_CON], timeout=90)
+    if code != 0:
+        if previous:
+            run(["nmcli", "con", "up", previous], timeout=60)
+        return False, {}, f"could not start the hotspot: {err}"
+
+    # The safety net. Without this, a hotspot started by mistake on a node
+    # reached over Wi-Fi is unreachable for good.
+    armed = schedule_revert(minutes)
+    note = (f"hotspot {ssid} is up for {minutes} minutes" if armed else
+            f"hotspot {ssid} is up, but the automatic revert could NOT be armed "
+            f"— it will stay up until it is stopped by hand")
+    return True, {
+        "ssid": ssid, "secured": bool(psk), "expires_in_minutes": minutes,
+        "auto_revert": armed, "previous": previous, "addresses": addresses(),
+    }, note
+
+
+def schedule_revert(minutes: int) -> bool:
+    """Arm the timer that puts the old network back. Returns whether it armed.
+
+    The old timer is cleared first: systemd-run refuses a --unit name that
+    already exists, so starting a second hotspot would otherwise fail to arm
+    silently and leave the node with no way back. A hotspot whose safety net
+    did not arm is the exact situation this whole mechanism exists to prevent,
+    so the caller is told rather than left to assume.
+    """
+    run(["systemctl", "stop", REVERT_UNIT + ".timer"], timeout=20)
+    run(["systemctl", "reset-failed", REVERT_UNIT + ".timer"], timeout=20)
+    run(["systemctl", "reset-failed", REVERT_UNIT + ".service"], timeout=20)
+    code, _out, err = run(
+        ["systemd-run", "--on-active=%dmin" % minutes, "--unit=" + REVERT_UNIT,
+         str(HELPER_BIN), "--revert-hotspot"], timeout=20)
+    if code != 0:
+        print(f"warning: could not arm the hotspot revert timer: {err}",
+              file=sys.stderr)
+    return code == 0
+
+
+def act_hotspot_off(_req):
+    return do_revert()
+
+
+def do_revert():
+    if not have_nmcli():
+        return False, {}, "nmcli is not installed"
+    run(["systemctl", "stop", REVERT_UNIT + ".timer"], timeout=20)
+    run(["nmcli", "con", "down", HOTSPOT_CON], timeout=45)
+    run(["nmcli", "con", "delete", HOTSPOT_CON], timeout=20)
+    previous = read_previous()
+    if previous:
+        run(["nmcli", "con", "up", previous], timeout=60)
+    return True, {"restored": previous, "addresses": addresses()}, \
+        (f"hotspot stopped, {previous} restored" if previous else "hotspot stopped")
+
+
+def act_hostname(req):
+    """Set the hostname. This is why the helper exists at all.
+
+    The service cannot do it: ProtectSystem=full makes /etc read-only to it and
+    NoNewPrivileges blocks the polkit path hostnamectl would otherwise take.
+    """
+    raw = str(req.get("hostname", ""))
+    clean = _HOSTNAME_RE.sub("-", raw).strip("-").lower()[:63]
+    if not clean:
+        return False, {}, "that is not a usable hostname"
+    if shutil.which("hostnamectl"):
+        code, _out, err = run(["hostnamectl", "set-hostname", clean], timeout=20)
+        if code != 0:
+            return False, {}, f"hostnamectl failed: {err}"
+    else:
+        try:
+            Path("/etc/hostname").write_text(clean + "\n")
+        except OSError as exc:
+            return False, {}, f"could not write /etc/hostname: {exc}"
+    # 127.0.1.1 has to follow the hostname or sudo and avahi complain about
+    # being unable to resolve it.
+    try:
+        hosts = Path("/etc/hosts")
+        lines = [ln for ln in hosts.read_text().splitlines()
+                 if not ln.split("#")[0].strip().startswith("127.0.1.1")]
+        lines.append(f"127.0.1.1\t{clean}")
+        hosts.write_text("\n".join(lines) + "\n")
+    except OSError:
+        pass  # the hostname is set; hosts is a convenience
+    run(["systemctl", "restart", "avahi-daemon"], timeout=20)
+    return True, {"hostname": clean}, f"hostname set to {clean}"
+
+
+ACTIONS = {
+    "scan": act_scan,
+    "join": act_join,
+    "hotspot-on": act_hotspot_on,
+    "hotspot-off": act_hotspot_off,
+    "hostname": act_hostname,
+}
+
+
+def write_json(path: Path, payload: dict, mode: int = 0o644) -> None:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def status() -> dict:
+    return {
+        "nmcli": have_nmcli(),
+        "device": wifi_device() if have_nmcli() else "",
+        "wifi": current_wifi_connection() if have_nmcli() else "",
+        "hotspot": any(c["name"] == HOTSPOT_CON for c in active_connections()),
+        "addresses": addresses() if have_nmcli() else [],
+        "at": time.time(),
+    }
+
+
+def main(argv) -> int:
+    if len(argv) < 2:
+        print("usage: pistreamer-netcfg status|--from-request|--revert-hotspot",
+              file=sys.stderr)
+        return 2
+
+    if argv[1] == "status":
+        print(json.dumps(status(), indent=2))
+        return 0
+
+    if argv[1] == "--revert-hotspot":
+        ok, data, message = do_revert()
+        write_json(RESULT, {"ok": ok, "action": "hotspot-off", "message": message,
+                            "at": time.time(), **data})
+        write_json(STATE, status())
+        return 0 if ok else 1
+
+    if argv[1] != "--from-request":
+        print(f"unknown argument: {argv[1]}", file=sys.stderr)
+        return 2
+
+    if not REQUEST.exists():
+        return 0
+    try:
+        request = json.loads(REQUEST.read_text())
+        if not isinstance(request, dict):
+            raise ValueError("request is not an object")
+    except (OSError, ValueError) as exc:
+        REQUEST.unlink(missing_ok=True)
+        write_json(RESULT, {"ok": False, "action": "?", "at": time.time(),
+                            "message": f"unreadable request: {exc}"})
+        return 1
+    # Removed before acting, not after: an action that reboots or takes the
+    # interface down must not leave a request that replays on the next boot.
+    REQUEST.unlink(missing_ok=True)
+
+    action = str(request.get("action", ""))
+    handler = ACTIONS.get(action)
+    if handler is None:
+        write_json(RESULT, {"ok": False, "action": action, "at": time.time(),
+                            "message": f"unknown action: {action}"})
+        return 1
+    try:
+        ok, data, message = handler(request)
+    except Exception as exc:  # noqa: BLE001 - never leave the GUI without an answer
+        ok, data, message = False, {}, f"{action} failed: {exc}"
+    write_json(RESULT, {"ok": ok, "action": action, "message": message,
+                        "at": time.time(), **data})
+    write_json(STATE, status())
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

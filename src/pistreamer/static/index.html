@@ -357,6 +357,43 @@
 
   .banner { animation: rise var(--slow) var(--ease); }
 
+  /* The login and first-boot wizard. A full cover rather than a modal: until
+     one of them is dealt with there is nothing behind it worth seeing, and a
+     dimmed-but-visible console invites clicking at it. */
+  #gate {
+    position: fixed; inset: 0; z-index: 200; display: none;
+    background: var(--bg); overflow-y: auto;
+    padding: 32px 20px;
+  }
+  #gate.show { display: block; }
+  #gate .sheet {
+    max-width: 560px; margin: 4vh auto; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 14px; padding: 26px 26px 22px;
+  }
+  #gate h2 { margin: 0 0 6px; font-size: 21px; letter-spacing: -.4px; }
+  #gate .lede { color: var(--muted); font-size: 14px; margin: 0 0 18px; }
+  #gate .step { display: none; }
+  #gate .step.on { display: block; }
+  .steps { display: flex; gap: 6px; margin-bottom: 20px; }
+  .steps i {
+    flex: 1; height: 3px; border-radius: 2px; background: var(--line);
+  }
+  .steps i.done { background: var(--accent); }
+  .connect-urls {
+    display: flex; flex-direction: column; gap: 8px; margin: 14px 0;
+  }
+  .connect-urls a {
+    font-family: var(--mono); font-size: 15px; color: #9dc0ff;
+    text-decoration: none; padding: 10px 12px; border-radius: 8px;
+    background: var(--panel-3); border: 1px solid var(--line);
+    overflow-wrap: anywhere;
+  }
+  .risk {
+    background: #2a1b1d; border: 1px solid #45272a; color: #ffb4ae;
+    border-radius: 8px; padding: 11px 13px; font-size: 13.5px; margin: 12px 0;
+  }
+  .risk b { color: #ffd0cb; }
+
   /* Nothing here is worth motion sickness. One rule, applied last. */
   @media (prefers-reduced-motion: reduce) {
     *, *::before, *::after {
@@ -464,6 +501,103 @@
 </style>
 </head>
 <body>
+
+<!-- Login / first-boot wizard. Hidden unless the node asks for one. -->
+<div id="gate">
+  <div class="sheet">
+    <div id="gateLogin" class="step">
+      <h2>Sign in</h2>
+      <p class="lede">This node is locked. Guest sharing is not &mdash; anyone
+        with the QR code can still send content without signing in.</p>
+      <label class="field">
+        <span class="lbl">Username</span>
+        <input type="text" id="loginUser" autocomplete="username">
+      </label>
+      <label class="field">
+        <span class="lbl">Password</span>
+        <input type="password" id="loginPass" autocomplete="current-password">
+      </label>
+      <div id="loginError"></div>
+      <button class="btn primary" id="btnLogin">Sign in</button>
+      <p class="note" style="margin-top:14px">
+        Forgotten it? Delete <code>/var/lib/pistreamer/auth.json</code> on the
+        node over SSH and the login turns off.
+      </p>
+    </div>
+
+    <div id="gateSetup" class="step">
+      <div class="steps"><i id="sd0"></i><i id="sd1"></i><i id="sd2"></i><i id="sd3"></i></div>
+
+      <div class="step on" id="wiz0">
+        <h2>Set up this node</h2>
+        <p class="lede">Four short steps. You can change any of it later.</p>
+        <div id="wizConnect"></div>
+        <div class="row" style="margin-top:16px">
+          <button class="btn primary" data-wiz="1">Start</button>
+          <button class="btn" id="btnWizShow">Show on the screen</button>
+        </div>
+        <p class="note" style="margin-top:10px">
+          &ldquo;Show on the screen&rdquo; puts this node&rsquo;s name and address on
+          the display it is plugged into, so you can tell which box you are
+          talking to.
+        </p>
+      </div>
+
+      <div class="step" id="wiz1">
+        <h2>Name this node</h2>
+        <p class="lede">The name shows in the AirPlay picker, on the group list,
+          and as <code>name.local</code> in a browser. Give each node in a rig a
+          different one.</p>
+        <label class="field">
+          <span class="lbl">Node name</span>
+          <input type="text" id="wizHostname" placeholder="stage-left">
+        </label>
+        <p class="note">Letters, numbers and dashes. Anything else is converted.</p>
+        <div class="row" style="margin-top:16px">
+          <button class="btn" data-wiz="0">Back</button>
+          <button class="btn primary" data-wiz="2">Next</button>
+        </div>
+      </div>
+
+      <div class="step" id="wiz2">
+        <h2>Network</h2>
+        <p class="lede">Skip this if the node is on ethernet or already on the
+          Wi-Fi you want.</p>
+        <div id="wizNetwork"></div>
+        <div class="row" style="margin-top:16px">
+          <button class="btn" data-wiz="1">Back</button>
+          <button class="btn primary" data-wiz="3">Next</button>
+        </div>
+      </div>
+
+      <div class="step" id="wiz3">
+        <h2>Lock the console</h2>
+        <p class="lede">Optional, and off unless you switch it on. Guest sharing
+          always stays open &mdash; a guest scanning the QR code is never asked
+          for a password.</p>
+        <label class="field">
+          <span class="lbl">Username</span>
+          <input type="text" id="wizUser" placeholder="admin" autocomplete="username">
+        </label>
+        <label class="field">
+          <span class="lbl">Password &mdash; at least 8 characters</span>
+          <input type="password" id="wizPass" autocomplete="new-password">
+        </label>
+        <div class="checkline">
+          <input type="checkbox" id="wizAuthOn">
+          <label for="wizAuthOn">Require this password to use the console</label>
+        </div>
+        <div id="wizError"></div>
+        <div class="row" style="margin-top:16px">
+          <button class="btn" data-wiz="2">Back</button>
+          <button class="btn primary" id="btnWizFinish">Finish</button>
+          <button class="btn" id="btnWizSkip">Skip setup</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
 <header>
   <h1>pi-streamer</h1>
   <span class="host" id="hostname">&hellip;</span>
@@ -529,6 +663,15 @@
     </div>
 
     <div class="card">
+      <h2>Favourites</h2>
+      <div class="note" style="margin-bottom:12px">
+        Saved web pages and streams, by the name you actually call them. The
+        most recently used come first.
+      </div>
+      <ul class="list" id="favList"></ul>
+    </div>
+
+    <div class="card">
       <h2>Web page</h2>
       <div class="note" style="margin-bottom:12px">
         Show a web page full screen &mdash; a dashboard, a scoreboard, a running
@@ -541,7 +684,37 @@
       </label>
       <div class="row">
         <button class="btn primary" id="btnPlayWeb">Show page</button>
+        <button class="btn" id="btnSaveWeb">Save as favourite</button>
       </div>
+    </div>
+
+    <div class="card">
+      <h2>Stream</h2>
+      <div class="note" style="margin-bottom:12px">
+        Play a live stream by address. HLS and DASH arrive over
+        <code>https://</code> (usually an <code>.m3u8</code>); a hardware encoder
+        on the same LAN is normally <code>udp://</code> or <code>srt://</code>.
+        <code>rtsp://</code> covers most IP cameras.
+      </div>
+      <label class="field">
+        <span class="lbl">Stream address</span>
+        <input type="text" id="streamUrl" placeholder="udp://238.0.0.1:1234">
+      </label>
+      <div class="row" style="margin-bottom:12px">
+        <button class="btn primary" id="btnPlayStream">Play stream</button>
+        <button class="btn" id="btnSaveStream">Save as favourite</button>
+      </div>
+      <label class="field">
+        <span class="lbl">Buffer, in seconds &mdash; higher rides out a lumpy
+          network, lower is more immediate</span>
+        <input type="number" id="cfgStreamCache" min="0" max="60">
+      </label>
+      <div class="checkline">
+        <input type="checkbox" id="cfgStreamLowLatency">
+        <label for="cfgStreamLowLatency">Low latency mode &mdash; for IMAG, where
+          the screen is compared against the real stage</label>
+      </div>
+      <button class="btn" id="btnSaveStreamCfg" style="margin-top:8px">Save stream settings</button>
     </div>
 
     <div class="card">
@@ -1099,6 +1272,20 @@
 
   <section id="tab-system">
     <div class="card">
+      <h2>Access</h2>
+      <div class="note" style="margin-bottom:12px">
+        Who can use this console. Guest sharing is deliberately never behind
+        this &mdash; someone scanning the QR code is never asked to sign in.
+      </div>
+      <div id="accessBody"></div>
+    </div>
+
+    <div class="card">
+      <h2>Network</h2>
+      <div id="sysNetwork"></div>
+    </div>
+
+    <div class="card">
       <h2>Last 10 minutes</h2>
       <div id="charts"></div>
       <div class="row" style="margin-top:4px">
@@ -1287,9 +1474,26 @@ async function api(path, opts) {
   try { body = await res.json(); } catch (_) { /* empty body is fine */ }
   if (!res.ok) {
     const detail = (body && (body.detail || body.message)) || res.statusText;
-    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    const err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    // Tagged rather than matched on message text: a session can expire at any
+    // moment, and every caller needs to be able to tell "you are logged out"
+    // from "that failed".
+    err.status = res.status;
+    if (res.status === 401) sessionLost();
+    throw err;
   }
   return body;
+}
+
+// A 401 from anywhere means this browser's session is gone — expired, or ended
+// by a password change elsewhere. Put the login up once, not once per polling
+// request that happens to be in flight.
+let GATE_UP = false;
+function sessionLost() {
+  if (GATE_UP) return;
+  GATE_UP = true;
+  AUTHED = false;
+  showGate("login");
 }
 
 // Which form control holds which config key. Its only job is to know exactly
@@ -1308,6 +1512,8 @@ const CONFIG_FIELDS = {
   cluster_group: "cfgClusterGroup",
   cluster_key: "cfgClusterKey",
   cluster_sync_strength: "cfgSyncStrength",
+  stream_cache_s: "cfgStreamCache",
+  stream_low_latency: "cfgStreamLowLatency",
   connector: "cfgConnector",
   device_name: "cfgHostname",
   ndi_adapter_ips: "cfgAdapterIps",
@@ -1379,8 +1585,8 @@ document.querySelectorAll("nav button").forEach((btn) => {
       }).catch(() => {});
     }
     if (tab === "output") { loadConnectors(); loadAudioDevices(); loadPerf(); }
-    if (tab === "system") { loadTelemetry(); loadOverclock(); loadUpdate(); }
-    if (tab === "ndi") { loadNdiNetwork(); loadAirplay(); }
+    if (tab === "system") { loadAccess(); loadWizNetwork("sysNetwork"); loadTelemetry(); loadOverclock(); loadUpdate(); }
+    if (tab === "ndi") { loadNdiNetwork(); loadAirplay(); loadFavourites(); }
     if (tab === "nodes") loadNodes();
   };
 });
@@ -2860,6 +3066,9 @@ async function loadNdiNetwork() {
   setField("cfgDiscoveryServer", c.ndi_discovery_server);
   setField("cfgUrlAddress", c.ndi_url_address);
   setField("webUrl", c.web_url);
+  setField("streamUrl", c.stream_url);
+  setField("cfgStreamCache", c.stream_cache_s);
+  setField("cfgStreamLowLatency", c.stream_low_latency);
   try {
     const caps = await api("/api/capabilities");
     const nc = caps.ndi_config || {};
@@ -3687,11 +3896,412 @@ setInterval(() => {
   if (activeTab() === "media" && GUEST && GUEST.open) loadGuest();
 }, 15000);
 
+// ---------- access ----------
+
+async function loadAccess() {
+  const box = $("accessBody");
+  if (!box) return;
+  let st;
+  try { st = await api("/api/auth/status"); }
+  catch (err) { box.innerHTML = `<div class="banner">${esc(err.message)}</div>`; return; }
+  box.innerHTML = `
+    <div class="row" style="margin-bottom:12px">
+      <span class="chip ${st.enabled ? "ok" : "warn"}">${
+        st.enabled ? "Locked" : "Open to the network"}</span>
+      <span class="host">${st.configured
+        ? `signed in as ${esc(st.user)} · ${st.sessions} active session${
+            st.sessions === 1 ? "" : "s"}`
+        : "no password set on this node"}</span>
+    </div>
+    <label class="field">
+      <span class="lbl">Username</span>
+      <input type="text" id="acUser" value="${esc(st.user || "admin")}" autocomplete="username">
+    </label>
+    ${st.configured ? `
+    <label class="field">
+      <span class="lbl">Current password</span>
+      <input type="password" id="acCurrent" autocomplete="current-password">
+    </label>` : ""}
+    <label class="field">
+      <span class="lbl">New password &mdash; at least 8 characters</span>
+      <input type="password" id="acNew" autocomplete="new-password">
+    </label>
+    <div id="acError"></div>
+    <div class="row">
+      <button class="btn primary" id="btnAcSave">${
+        st.configured ? "Change password" : "Set a password"}</button>
+      ${st.configured ? `<button class="btn" id="btnAcToggle">${
+        st.enabled ? "Turn the login off" : "Turn the login on"}</button>` : ""}
+      <button class="btn" id="btnRunSetup">Run setup again</button>
+      ${st.enabled ? `<button class="btn" id="btnAcLogout">Sign out</button>` : ""}
+    </div>
+    <p class="note" style="margin-top:12px">
+      Changing the password signs out every other browser. If it is ever
+      forgotten, delete <code>/var/lib/pistreamer/auth.json</code> over SSH and
+      the login turns itself off.
+    </p>`;
+
+  $("btnAcSave").onclick = async () => {
+    $("acError").innerHTML = "";
+    try {
+      await post("/api/auth/password", {
+        username: $("acUser").value.trim(),
+        current: $("acCurrent") ? $("acCurrent").value : "",
+        password: $("acNew").value,
+      });
+      toast("Password set — other browsers have been signed out");
+      loadAccess();
+    } catch (err) {
+      $("acError").innerHTML = `<div class="banner">${esc(err.message)}</div>`;
+    }
+  };
+  const toggle = $("btnAcToggle");
+  if (toggle) toggle.onclick = async () => {
+    const turningOn = !st.enabled;
+    if (turningOn && !confirm(
+        "Require a password to use this console?\n\n" +
+        "Make sure you know it — a node you cannot sign into needs SSH to " +
+        "recover. Guest sharing stays open either way.")) return;
+    try {
+      await post("/api/config", { auth_enabled: turningOn });
+      toast(turningOn ? "The console is now locked" : "The console is open again");
+      loadAccess();
+      checkAuth();
+    } catch (err) { toast(err.message, true); }
+  };
+  const out = $("btnAcLogout");
+  if (out) out.onclick = async () => {
+    try { await post("/api/auth/logout", {}); } catch (_) {}
+    showGate("login");
+  };
+  $("btnRunSetup").onclick = () => openWizard();
+}
+
+// ---------- favourites, web pages and streams ----------
+
+const FAV_KIND_LABEL = { web: "page", stream: "stream" };
+
+async function loadFavourites() {
+  const box = $("favList");
+  if (!box) return;
+  let data;
+  try { data = await api("/api/favourites"); }
+  catch (err) { box.innerHTML = `<div class="banner">${esc(err.message)}</div>`; return; }
+  const favs = data.favourites || [];
+  if (!favs.length) {
+    box.innerHTML = `<div class="empty">Nothing saved yet. Put an address in
+      the box below and press Save as favourite.</div>`;
+    return;
+  }
+  const now = STATE && STATE.config ? STATE.config : {};
+  box.innerHTML = favs.map((f) => {
+    const live = (f.kind === "stream" && now.stream_url === f.url &&
+                  STATE.player.mode === "stream") ||
+                 (f.kind === "web" && now.web_url === f.url &&
+                  STATE.player.mode === "web");
+    return `
+    <li class="${live ? "playing" : ""}">
+      <div class="meta">
+        <div class="name">${esc(f.name)}
+          <span class="chip">${FAV_KIND_LABEL[f.kind] || esc(f.kind)}</span></div>
+        <div class="sub">${esc(f.url)}${
+          f.uses ? ` · used ${f.uses}×` : " · never used"}</div>
+      </div>
+      <button class="btn small accent" data-fav="${encodeURIComponent(f.name)}">Show</button>
+      <button class="btn danger" data-favdel="${encodeURIComponent(f.name)}">Delete</button>
+    </li>`;
+  }).join("");
+
+  box.querySelectorAll("[data-fav]").forEach((b) => {
+    b.onclick = async () => {
+      const name = decodeURIComponent(b.dataset.fav);
+      try {
+        await post(`/api/favourites/${encodeURIComponent(name)}/play`, {});
+        toast("Showing " + name);
+        poll(); loadFavourites();
+      } catch (err) { toast(err.message, true); }
+    };
+  });
+  box.querySelectorAll("[data-favdel]").forEach((b) => {
+    b.onclick = async () => {
+      const name = decodeURIComponent(b.dataset.favdel);
+      if (!confirm(`Delete the favourite "${name}"?\n\nThis only forgets the ` +
+                   `address; nothing else changes.`)) return;
+      try {
+        await api("/api/favourites/" + encodeURIComponent(name), { method: "DELETE" });
+        loadFavourites();
+      } catch (err) { toast(err.message, true); }
+    };
+  });
+}
+
+async function saveFavourite(url, kind) {
+  if (!url) { toast("Put an address in first", true); return; }
+  const name = prompt(`Save this ${FAV_KIND_LABEL[kind]} as:`, "");
+  if (name === null) return;
+  if (!name.trim()) { toast("A favourite needs a name", true); return; }
+  try {
+    await post("/api/favourites", { name: name.trim(), url, kind });
+    toast("Saved " + name.trim());
+    loadFavourites();
+  } catch (err) { toast(err.message, true); }
+}
+
+$("btnSaveWeb").onclick = () => saveFavourite($("webUrl").value.trim(), "web");
+$("btnSaveStream").onclick = () => saveFavourite($("streamUrl").value.trim(), "stream");
+
+$("btnPlayStream").onclick = async () => {
+  const url = $("streamUrl").value.trim();
+  if (!url) return;
+  try {
+    await post("/api/play/stream", { url });
+    toast("Playing the stream");
+    poll(); loadFavourites();
+  } catch (err) { toast(err.message, true); }
+};
+
+$("btnSaveStreamCfg").onclick = async () => {
+  try {
+    await post("/api/config", {
+      stream_cache_s: parseInt($("cfgStreamCache").value, 10) || 0,
+      stream_low_latency: $("cfgStreamLowLatency").checked,
+    });
+    toast("Stream settings saved — they apply to the next stream you start");
+  } catch (err) { toast(err.message, true); }
+  clearDirty("cfgStreamCache", "cfgStreamLowLatency");
+};
+
+// ---------- login and first-boot setup ----------
+//
+// The gate covers everything until the node says it is happy. Two reasons it
+// can be up: the console is locked and this browser has no session, or setup
+// has never been run. Both are answered here rather than on a separate page, so
+// there is one app and one place the state lives.
+
+let AUTHED = true;      // assume open until told otherwise, so a node with no
+                        // login never flashes a sign-in box on load
+let SETUP = null;
+
+function showGate(which) {
+  if (!which) GATE_UP = false;
+  const gate = $("gate");
+  $("gateLogin").classList.toggle("on", which === "login");
+  $("gateSetup").classList.toggle("on", which === "setup");
+  gate.classList.toggle("show", !!which);
+  if (which === "login") setTimeout(() => $("loginUser").focus(), 50);
+}
+
+async function checkAuth() {
+  let st;
+  try { st = await api("/api/auth/status"); }
+  catch (_) { return true; }   // a node that cannot answer is not one to lock
+  AUTHED = !st.enabled || st.signed_in;
+  if (!st.setup_complete) { openWizard(); return AUTHED; }
+  showGate(AUTHED ? null : "login");
+  return AUTHED;
+}
+
+$("btnLogin").onclick = async () => {
+  $("loginError").innerHTML = "";
+  try {
+    await post("/api/auth/login", {
+      username: $("loginUser").value.trim(),
+      password: $("loginPass").value,
+    });
+    $("loginPass").value = "";
+    AUTHED = true;
+    showGate(null);
+    toast("Signed in");
+    poll();
+  } catch (err) {
+    $("loginError").innerHTML = `<div class="banner">${esc(err.message)}</div>`;
+  }
+};
+$("loginPass").onkeydown = (e) => { if (e.key === "Enter") $("btnLogin").click(); };
+$("loginUser").onkeydown = (e) => { if (e.key === "Enter") $("loginPass").focus(); };
+
+// --- the wizard ---
+
+let WIZ_STEP = 0;
+
+function wizGo(n) {
+  WIZ_STEP = n;
+  for (let i = 0; i < 4; i++) {
+    const step = $("wiz" + i);
+    if (step) step.classList.toggle("on", i === n);
+    const dot = $("sd" + i);
+    if (dot) dot.classList.toggle("done", i <= n);
+  }
+  if (n === 2) loadWizNetwork();
+}
+
+document.querySelectorAll("[data-wiz]").forEach((b) => {
+  b.onclick = () => wizGo(parseInt(b.dataset.wiz, 10));
+});
+
+async function openWizard() {
+  try { SETUP = await api("/api/setup"); } catch (_) { return; }
+  const c = SETUP.connect || {};
+  $("wizHostname").value = SETUP.device_name || c.hostname || "";
+  $("wizUser").value = (SETUP.auth && SETUP.auth.user) || "admin";
+  $("wizConnect").innerHTML = `
+    <p class="lede" style="margin-bottom:6px">This node is reachable at:</p>
+    <div class="connect-urls">
+      ${(c.urls || []).map((u) => `<a href="${esc(u)}">${esc(u)}</a>`).join("")
+        || `<span class="host">no address yet &mdash; is it on a network?</span>`}
+    </div>`;
+  showGate("setup");
+  wizGo(0);
+}
+
+$("btnWizShow").onclick = async () => {
+  try {
+    const r = await post("/api/setup/show", { on: true });
+    toast(r.applied ? "Showing on the node's screen" : "Nothing is playing to show it on");
+  } catch (err) { toast(err.message, true); }
+};
+
+$("btnWizSkip").onclick = async () => {
+  try { await post("/api/setup", { enable_auth: false }); } catch (_) {}
+  showGate(null);
+  toast("Setup skipped — it is under System if you want it later");
+  poll();
+};
+
+$("btnWizFinish").onclick = async () => {
+  $("wizError").innerHTML = "";
+  const body = {
+    hostname: $("wizHostname").value.trim(),
+    username: $("wizUser").value.trim(),
+    password: $("wizPass").value,
+    enable_auth: $("wizAuthOn").checked,
+  };
+  if (body.enable_auth && !body.password) {
+    $("wizError").innerHTML =
+      `<div class="banner">Set a password, or untick the lock.</div>`;
+    return;
+  }
+  try {
+    const r = await post("/api/setup", body);
+    $("wizPass").value = "";
+    showGate(null);
+    if (r.hostname && r.hostname.ok === false) {
+      toast("Set up, but the name could not be changed: " + r.hostname.message, true);
+    } else {
+      toast("Setup finished");
+    }
+    // Switching the login on ends this browser's anonymous access, so ask the
+    // node what we are now rather than assuming.
+    await checkAuth();
+    poll();
+  } catch (err) {
+    $("wizError").innerHTML = `<div class="banner">${esc(err.message)}</div>`;
+  }
+};
+
+// --- network, used by the wizard and the System tab ---
+
+async function loadWizNetwork(into) {
+  const box = $(into || "wizNetwork");
+  if (!box) return;
+  let n;
+  try { n = await api("/api/network"); }
+  catch (err) { box.innerHTML = `<div class="banner">${esc(err.message)}</div>`; return; }
+  if (!n.available || !n.nmcli) {
+    box.innerHTML = `<div class="banner warn">${esc(n.reason ||
+      "NetworkManager is not running here, so Wi-Fi cannot be set from the GUI.")}</div>`;
+    return;
+  }
+  const nets = n.networks || [];
+  // The helper answers asynchronously, so its last result is the only place a
+  // failure shows up — including "the hotspot is up but its automatic revert
+  // could not be armed", which the operator must not miss.
+  const last = n.last && n.last.message
+    ? `<div class="banner${n.last.ok ? " warn" : ""}"${
+        n.last.ok ? ' style="background:#1b2a1f;border-color:#274a2f;color:#a8dcb5"' : ""}>${
+        esc(n.last.message)}</div>`
+    : "";
+  box.innerHTML = last + `
+    <div class="row" style="margin-bottom:10px">
+      <button class="btn" data-net="scan">Scan for networks</button>
+      <span class="host">${n.wifi ? "on " + esc(n.wifi) : "not on Wi-Fi"}${
+        n.hotspot ? " · hotspot running" : ""}</span>
+    </div>
+    ${nets.length ? `
+      <label class="field">
+        <span class="lbl">Network</span>
+        <select id="netSsid">${nets.map((w) =>
+          `<option value="${esc(w.ssid)}">${esc(w.ssid)} · ${w.signal}%${
+            w.open ? " · open" : ""}${w.in_use ? " · connected" : ""}</option>`).join("")}</select>
+      </label>
+      <label class="field">
+        <span class="lbl">Passphrase &mdash; leave blank for an open network</span>
+        <input type="password" id="netPsk" autocomplete="off">
+      </label>
+      <button class="btn primary" data-net="join">Join</button>` : ""}
+    <div class="risk">
+      <b>Hotspot.</b> This turns the node's Wi-Fi into an access point so you can
+      reach it with no network at all. It drops any Wi-Fi connection the node
+      has, including the one you may be reading this over. It switches itself
+      back after 30 minutes if setup is not finished.
+    </div>
+    <button class="btn" data-net="${n.hotspot ? "hotspot-off" : "hotspot-on"}">
+      ${n.hotspot ? "Stop the hotspot" : "Start a setup hotspot"}</button>`;
+
+  box.querySelectorAll("[data-net]").forEach((b) => {
+    b.onclick = () => netAction(b.dataset.net, into, box);
+  });
+}
+
+// `box` is passed rather than looked up by id: the wizard panel and the System
+// tab panel can both be in the document at the same time, and both contain a
+// #netSsid. A global lookup would read the wrong one.
+async function netAction(what, into, box) {
+  const field = (id) => (box ? box.querySelector("#" + id) : $(id));
+  try {
+    if (what === "scan") {
+      toast("Scanning…");
+      await post("/api/network/scan", {});
+      loadWizNetwork(into);
+      return;
+    }
+    if (what === "join") {
+      const ssid = field("netSsid") ? field("netSsid").value : "";
+      if (!ssid) return;
+      if (!confirm(`Join "${ssid}"?\n\nThe node will drop off its current ` +
+                   `network for a moment. If it cannot join, it puts the old ` +
+                   `one back by itself.`)) return;
+      const r = await post("/api/network/join",
+                           { ssid, password: field("netPsk") ? field("netPsk").value : "" });
+      toast(r.note, true);
+      return;
+    }
+    if (what === "hotspot-on") {
+      if (!confirm("Start the setup hotspot?\n\nThe node's Wi-Fi becomes an " +
+                   "access point, so it will disappear from this network. Join " +
+                   "'pistreamer-setup' and open http://10.42.0.1 to carry on.\n\n" +
+                   "It switches back on its own after 30 minutes.")) return;
+      const r = await post("/api/network/hotspot", { on: true, minutes: 30 });
+      toast(r.note, true);
+      return;
+    }
+    if (what === "hotspot-off") {
+      const r = await post("/api/network/hotspot", { on: false });
+      toast(r.note);
+      loadWizNetwork(into);
+    }
+  } catch (err) { toast(err.message, true); }
+}
+
 // ---------- boot ----------
 
-poll();
-pollTimer = setInterval(poll, 2000);
-setTimeout(() => scanNdi(false), 400);
+// Ask what we are before drawing anything: a locked node should show its login
+// rather than a console full of "unreachable".
+checkAuth().then(() => {
+  poll();
+  pollTimer = setInterval(poll, 2000);
+  setTimeout(() => scanNdi(false), 400);
+});
 </script>
 </body>
 </html>

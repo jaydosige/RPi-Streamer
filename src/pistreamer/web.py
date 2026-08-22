@@ -20,11 +20,12 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, Field
 
-from . import (airplay, cluster, config, diagnose, display, guest, media,
-               ndiconfig, playlists, pushjob, schedule as schedule_mod, sources,
-               syncplay, system, transcode, updates)
-from .player import (MODE_AIRPLAY, MODE_IDLE, MODE_LOCAL, MODE_NDI, MODE_WEB,
-                     identify_text, player)
+from . import (airplay, auth, cluster, config, diagnose, display, favourites,
+               guest, media, ndiconfig, network, playlists, pushjob,
+               schedule as schedule_mod, sources, syncplay, system, transcode,
+               updates)
+from .player import (MODE_AIRPLAY, MODE_IDLE, MODE_LOCAL, MODE_NDI,
+                     MODE_STREAM, MODE_WEB, identify_text, player)
 from .telemetry import telemetry
 
 # The conductor is given callables rather than importing the player and the
@@ -157,7 +158,8 @@ async def lifespan(app: FastAPI):
         schedule_mod.scheduler.start()
     if cfg.autostart and cfg.mode != MODE_IDLE:
         target = {MODE_AIRPLAY: "", MODE_NDI: cfg.ndi_source,
-                  MODE_WEB: cfg.web_url}.get(cfg.mode, cfg.local_file)
+                  MODE_WEB: cfg.web_url,
+                  MODE_STREAM: cfg.stream_url}.get(cfg.mode, cfg.local_file)
         log.info("autostarting mode=%s target=%s", cfg.mode, target)
         player.apply(cfg.mode, target)
     yield
@@ -236,6 +238,19 @@ def apply_cue_action(action: str, target: str) -> None:
             raise ValueError("a web cue needs an address")
         config.update(mode=MODE_WEB, web_url=target)
         player.apply(MODE_WEB, target)
+    elif action == "stream":
+        if not target:
+            raise ValueError("a stream cue needs an address")
+        config.update(mode=MODE_STREAM, stream_url=target)
+        player.apply(MODE_STREAM, target)
+    elif action == "favourite":
+        fav = favourites.get(target)
+        if fav is None:
+            raise ValueError(f"no such favourite: {target}")
+        mode = MODE_STREAM if fav.kind == "stream" else MODE_WEB
+        key = "stream_url" if fav.kind == "stream" else "web_url"
+        config.update(mode=mode, **{key: fav.url})
+        player.apply(mode, fav.url)
     elif action == "airplay":
         ok, reason = airplay.available()
         if not ok:
@@ -256,6 +271,143 @@ app = FastAPI(title="pi-streamer", version="0.1.0", lifespan=lifespan)
 
 
 # ----------------------------------------------------------------------
+# Operator login
+#
+# One middleware rather than a dependency on each route: a dependency has to be
+# remembered on every new endpoint, and the one that gets forgotten is the hole.
+# This is deny-by-default, with the exemptions written out in one place where
+# they can be read and argued with.
+# ----------------------------------------------------------------------
+
+
+def _client_key(request: Request) -> str:
+    return (request.client.host if request.client else "?") or "?"
+
+
+def _open_path(path: str) -> bool:
+    """Paths that never require a login, whatever the settings say."""
+    # Guest sharing. The QR code is the credential and the whole feature is
+    # that a stranger can use it — see the module docstring in auth.py.
+    if path == "/s" or path.startswith("/s/"):
+        return True
+    # The GUI shell and its assets carry no data of their own; everything they
+    # show arrives over /api, which is what is actually protected. Serving them
+    # openly is what lets the login prompt be part of the app rather than a
+    # separate page.
+    if path == "/" or path.startswith("/static/"):
+        return True
+    # Logging in cannot itself require being logged in.
+    if path.startswith("/api/auth/"):
+        return True
+    # Docs are FastAPI's, and give away the shape of the API but none of its
+    # data. Closed anyway: there is no reason for a guest to read them.
+    return False
+
+
+@app.middleware("http")
+async def require_login(request: Request, call_next):
+    path = request.url.path
+    if _open_path(path):
+        return await call_next(request)
+
+    cfg = config.load()
+    # Until a credential exists there is nothing to check against, and the
+    # wizard needs to be reachable to create one. This is also what stops a
+    # half-finished setup bricking access to the node.
+    if not (cfg.auth_enabled and auth.configured()):
+        return await call_next(request)
+    if path.startswith("/api/setup") and not cfg.setup_complete:
+        return await call_next(request)
+
+    # A peer, not a browser. Followers have no session and cannot get one, so
+    # without this every group command breaks the moment auth is switched on.
+    supplied = request.headers.get(cluster.AUTH_HEADER)
+    if supplied is not None and cfg.cluster_enabled and hmac.compare_digest(
+            supplied, cfg.cluster_key):
+        return await call_next(request)
+
+    if auth.valid_session(request.cookies.get(auth.COOKIE_NAME, "")):
+        return await call_next(request)
+
+    return JSONResponse({"detail": "log in to use this node"}, status_code=401)
+
+
+class LoginBody(BaseModel):
+    username: str = ""
+    password: str = ""
+
+
+@app.get("/api/auth/status")
+async def auth_status(request: Request) -> Dict[str, Any]:
+    """Who, if anyone, this browser is — and whether it needs to log in."""
+    cfg = config.load()
+    return {
+        **auth.summary(),
+        "setup_complete": cfg.setup_complete,
+        "signed_in": auth.valid_session(request.cookies.get(auth.COOKIE_NAME, "")),
+    }
+
+
+@app.post("/api/auth/login")
+async def auth_login(body: LoginBody, request: Request) -> JSONResponse:
+    who = _client_key(request)
+    wait = auth.throttled_for(who)
+    if wait > 0:
+        raise HTTPException(429, f"too many attempts — try again in {wait:.0f}s")
+    if not auth.verify(body.username, body.password):
+        auth.note_failure(who)
+        # One message for both wrong-username and wrong-password: saying which
+        # was wrong tells an attacker which half to keep.
+        raise HTTPException(401, "that username and password do not match")
+    auth.note_success(who)
+    token = auth.start_session(body.username)
+    response = JSONResponse({"signed_in": True, "user": body.username})
+    response.set_cookie(
+        auth.COOKIE_NAME, token,
+        max_age=int(config.load().auth_session_hours * 3600),
+        httponly=True,      # JavaScript cannot read it, so an injected script
+                            # on the page cannot walk off with the session
+        samesite="lax",     # not sent on cross-site requests
+        # Deliberately NOT secure=True: this is served over plain HTTP on a LAN
+        # and a secure cookie would simply never be sent, locking everyone out.
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+async def auth_logout(request: Request) -> JSONResponse:
+    auth.end_session(request.cookies.get(auth.COOKIE_NAME, ""))
+    response = JSONResponse({"signed_in": False})
+    response.delete_cookie(auth.COOKIE_NAME)
+    return response
+
+
+class PasswordBody(BaseModel):
+    username: str = ""
+    current: str = ""
+    password: str = ""
+
+
+@app.post("/api/auth/password")
+async def auth_set_password(body: PasswordBody, request: Request) -> Dict[str, Any]:
+    """Change the credential. Knowing the current one is required once set."""
+    if auth.configured():
+        user = body.username or auth.username()
+        if not auth.verify(auth.username(), body.current):
+            raise HTTPException(403, "the current password is not right")
+    else:
+        user = body.username
+    try:
+        auth.set_password(user, body.password)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    # Every other browser is now holding a session that outlived the password
+    # that created it. Changing a password because it leaked has to end them.
+    auth.clear_sessions()
+    return {"user": user, "sessions_ended": True}
+
+
+# ----------------------------------------------------------------------
 # Models
 # ----------------------------------------------------------------------
 
@@ -271,6 +423,16 @@ class PlayLocal(BaseModel):
 
 class PlayWeb(BaseModel):
     url: str = Field(min_length=1)
+
+
+class PlayStream(BaseModel):
+    url: str = Field(min_length=1)
+
+
+class FavouriteBody(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    url: str = Field(min_length=1, max_length=2000)
+    kind: Literal["web", "stream"] = "web"
 
 
 class HostnameBody(BaseModel):
@@ -431,6 +593,19 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     ):
         if key in patch and patch[key] not in allowed:
             raise HTTPException(400, f"{key} must be one of: {', '.join(allowed)}")
+    if "stream_cache_s" in patch and not (0 <= int(patch["stream_cache_s"]) <= 60):
+        raise HTTPException(400, "stream_cache_s must be between 0 and 60 seconds")
+    if "auth_session_hours" in patch and not (1 <= int(patch["auth_session_hours"]) <= 8760):
+        raise HTTPException(400, "auth_session_hours must be between 1 and 8760")
+    # The play endpoints check these, but they can also be set directly. Without
+    # this the error surfaces at the next boot, as a node that will not start
+    # its source, rather than here where it was typed.
+    for key, kind in (("web_url", "web"), ("stream_url", "stream")):
+        if patch.get(key):
+            try:
+                patch[key] = favourites.check_url(str(patch[key]), kind)
+            except ValueError as exc:
+                raise HTTPException(400, f"{key}: {exc}") from exc
     if "scale_method" in patch and patch["scale_method"] not in (0, 1, 2, 3):
         raise HTTPException(400, "scale_method must be 0 (nearest), 1, 2 or 3")
     if "video_format" in patch and patch["video_format"] not in VIDEO_FORMATS:
@@ -468,6 +643,7 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         "snapshot_enabled", "snapshot_interval_s",
         "idle_mode", "standby_file",
         "loop",
+        "stream_cache_s", "stream_low_latency",
     }
     # The standby screen is itself a live pipeline now, so idle restarts too.
     if restart_keys & set(patch):
@@ -583,7 +759,68 @@ async def play_web(body: PlayWeb) -> Dict[str, Any]:
     status = player.status()
     if status["last_error"]:
         raise HTTPException(500, status["last_error"])
+    favourites.mark_used(body.url)
     return status
+
+
+@app.post("/api/play/stream")
+async def play_stream(body: PlayStream) -> Dict[str, Any]:
+    """Play a live stream: HLS/DASH over http(s), or udp/rtp/rtsp/srt."""
+    take_local_control("stream playback started")
+    try:
+        url = favourites.check_url(body.url, "stream")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    config.update(mode=MODE_STREAM, stream_url=url)
+    player.apply(MODE_STREAM, url)
+    status = player.status()
+    if status["last_error"]:
+        raise HTTPException(500, status["last_error"])
+    favourites.mark_used(url)
+    return status
+
+
+# ----------------------------------------------------------------------
+# Favourites
+# ----------------------------------------------------------------------
+
+
+@app.get("/api/favourites")
+async def get_favourites() -> Dict[str, Any]:
+    return {
+        "favourites": [f.to_dict() for f in favourites.all_favourites()],
+        "kinds": list(favourites.KINDS),
+        "web_schemes": list(favourites.WEB_SCHEMES),
+        "stream_schemes": list(favourites.STREAM_SCHEMES),
+    }
+
+
+@app.post("/api/favourites")
+async def post_favourite(body: FavouriteBody) -> Dict[str, Any]:
+    try:
+        saved = favourites.save(favourites.Favourite(
+            name=body.name.strip(), url=body.url, kind=body.kind))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return saved.to_dict()
+
+
+@app.delete("/api/favourites/{name}")
+async def delete_favourite(name: str) -> Dict[str, Any]:
+    if not favourites.delete(name):
+        raise HTTPException(404, f"no such favourite: {name}")
+    return {"deleted": name}
+
+
+@app.post("/api/favourites/{name}/play")
+async def play_favourite(name: str) -> Dict[str, Any]:
+    """Put a saved source on the screen — the point of saving it."""
+    fav = favourites.get(name)
+    if fav is None:
+        raise HTTPException(404, f"no such favourite: {name}")
+    if fav.kind == "stream":
+        return await play_stream(PlayStream(url=fav.url))
+    return await play_web(PlayWeb(url=fav.url))
 
 
 # ----------------------------------------------------------------------
@@ -784,7 +1021,9 @@ async def post_transcode(body: TranscodeBody) -> Dict[str, Any]:
     if dest == src:
         raise HTTPException(400, "that file is already the converted one")
 
-    duration, info = media.probe_file(src)
+    # ffprobe on a multi-gigabyte file is seconds of blocking work.
+    duration, info = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: media.probe_file(src))
     transcode_job = transcode.TranscodeJob(body.name, {})
     transcode_job.start(src, dest, encoder, duration,
                         source_fps=info.fps if info else 0.0)
@@ -1351,6 +1590,211 @@ async def post_reboot() -> JSONResponse:
 async def post_poweroff() -> JSONResponse:
     system.poweroff()
     return JSONResponse({"status": "shutting down"})
+
+
+# ----------------------------------------------------------------------
+# First-boot setup and networking
+#
+# Everything privileged here goes through the root helper (see network.py): the
+# service cannot set a hostname or drive NetworkManager itself. That makes these
+# endpoints request-and-poll rather than request-and-answer, which is honest
+# about what is happening — joining a network really does take away the
+# connection the answer would have travelled over.
+# ----------------------------------------------------------------------
+
+
+def _connect_hints() -> Dict[str, Any]:
+    """Every way somebody could reach this node, for the wizard to display."""
+    cfg = config.load()
+    host = system.hostname()
+    ip = cluster.primary_ip()
+    port = "" if cfg.web_port == 80 else f":{cfg.web_port}"
+    urls = []
+    if host:
+        urls.append(f"http://{host}.local{port}")
+    if ip:
+        urls.append(f"http://{ip}{port}")
+    return {
+        "hostname": host,
+        "ip": ip,
+        "port": cfg.web_port,
+        "urls": urls,
+        "wifi": system.wifi(),
+        "interfaces": [
+            {"name": n.get("name"), "addresses": n.get("addresses"),
+             "up": n.get("up")}
+            for n in system.network()
+        ],
+    }
+
+
+@app.get("/api/setup")
+async def get_setup() -> Dict[str, Any]:
+    cfg = config.load()
+    return {
+        "complete": cfg.setup_complete,
+        "auth": auth.summary(),
+        "device_name": cfg.device_name,
+        "connect": _connect_hints(),
+        "network": network.summary(),
+    }
+
+
+class SetupBody(BaseModel):
+    hostname: str = ""
+    username: str = ""
+    password: str = ""
+    # Turning the login on is a separate decision from creating the credential,
+    # so upgrading a node that is mid-job never starts demanding a password.
+    enable_auth: bool = False
+
+
+@app.post("/api/setup")
+async def post_setup(body: SetupBody) -> Dict[str, Any]:
+    """Finish first-boot setup: name the node, set a login, and lock up.
+
+    Order matters. The credential is created before auth is switched on, so a
+    failure in the middle cannot leave a node demanding a password that does
+    not exist yet.
+    """
+    out: Dict[str, Any] = {"hostname": None, "auth": None}
+
+    # Only when a password was actually typed. The wizard pre-fills the username
+    # box, so keying off that instead would make "name the node, skip the lock"
+    # — the ordinary path through setup — fail with "a password is required".
+    if body.password:
+        try:
+            auth.set_password(body.username or auth.username() or "admin",
+                              body.password)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        out["auth"] = {"user": auth.username()}
+
+    if body.enable_auth and not auth.configured():
+        raise HTTPException(
+            400, "set a username and password before switching the login on")
+
+    if body.hostname:
+        name = body.hostname.strip()
+        config.update(device_name=name)
+        try:
+            before = network.submit("hostname", hostname=name)
+            # Off the event loop: wait_for polls a file with time.sleep, and
+            # blocking here would freeze every other request on the node —
+            # including the playback status the screen is driven from.
+            answer = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: network.wait_for(before, timeout=20))
+            out["hostname"] = answer or {"ok": None,
+                                         "message": "the helper did not answer in time"}
+        except (RuntimeError, ValueError) as exc:
+            # A node that cannot rename itself is still a usable node; say so
+            # rather than failing the whole wizard over it.
+            out["hostname"] = {"ok": False, "message": str(exc)}
+
+    config.update(setup_complete=True, auth_enabled=bool(body.enable_auth))
+    out["complete"] = True
+    out["auth_enabled"] = bool(body.enable_auth)
+    out["connect"] = _connect_hints()
+    return out
+
+
+@app.post("/api/setup/show")
+async def post_setup_show(body: Dict[str, Any] = Body(default={})) -> Dict[str, Any]:
+    """Put the node's name and address on the screen it is plugged into.
+
+    The wizard is being read on a phone or laptop; the node is the thing on the
+    end of an HDMI cable across the room. This is how the two get associated,
+    and it reuses the identify overlay rather than inventing a second one.
+    """
+    on = bool(body.get("on", True))
+    cfg = config.load()
+    hints = _connect_hints()
+    caption = "\n".join(
+        [cfg.device_name or system.hostname() or "pistreamer"] + hints["urls"][:2])
+    applied = player.set_identify(on, caption if on else "")
+    return {"showing": on, "applied": applied, "caption": caption}
+
+
+@app.get("/api/network")
+async def get_network() -> Dict[str, Any]:
+    return {**network.summary(), "connect": _connect_hints()}
+
+
+@app.post("/api/network/scan")
+async def post_network_scan() -> Dict[str, Any]:
+    try:
+        before = network.submit("scan")
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    answer = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: network.wait_for(before, timeout=30))
+    if answer is None:
+        raise HTTPException(504, "the network helper did not answer — check "
+                                 "'systemctl status pistreamer-netcfg.path'")
+    if not answer.get("ok"):
+        raise HTTPException(500, answer.get("message") or "scan failed")
+    return {"networks": answer.get("networks", [])}
+
+
+class JoinBody(BaseModel):
+    ssid: str = Field(min_length=1, max_length=64)
+    password: str = ""
+
+
+@app.post("/api/network/join")
+async def post_network_join(body: JoinBody) -> Dict[str, Any]:
+    """Join a Wi-Fi network.
+
+    Returns as soon as the request is posted and does NOT wait: switching
+    networks takes down the connection this response would travel over. The
+    helper verifies the new connection has an address and puts the old one back
+    if it does not, so a wrong passphrase costs a wait rather than the node.
+    """
+    try:
+        network.submit("join", ssid=body.ssid, password=body.password)
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "joining": body.ssid,
+        "note": ("The node is switching networks and will be unreachable at this "
+                 "address for a moment. If it cannot join, it puts the previous "
+                 "network back by itself."),
+    }
+
+
+class HotspotBody(BaseModel):
+    on: bool = True
+    ssid: str = "pistreamer-setup"
+    password: str = ""
+    # The hotspot expires on its own. Starting one on a node reached over
+    # Wi-Fi drops that connection, so it must never be permanent.
+    minutes: int = Field(default=30, ge=5, le=240)
+
+
+@app.post("/api/network/hotspot")
+async def post_network_hotspot(body: HotspotBody) -> Dict[str, Any]:
+    if body.password and len(body.password) < 8:
+        raise HTTPException(400, "a hotspot passphrase must be at least 8 characters")
+    try:
+        if body.on:
+            network.submit("hotspot-on", ssid=body.ssid, password=body.password,
+                           minutes=body.minutes)
+        else:
+            network.submit("hotspot-off")
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    if not body.on:
+        return {"hotspot": False, "note": "Stopping the hotspot and restoring "
+                                          "the previous network."}
+    return {
+        "hotspot": True,
+        "ssid": body.ssid,
+        "minutes": body.minutes,
+        "note": (f"The node is switching its Wi-Fi into hotspot mode, so it will "
+                 f"disappear from this network. Join '{body.ssid}' and open "
+                 f"http://10.42.0.1 to carry on. It puts the previous network "
+                 f"back on its own after {body.minutes} minutes."),
+    }
 
 
 # ----------------------------------------------------------------------

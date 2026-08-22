@@ -30,8 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
-from . import (airplay, config, display, guest, media, mpvipc, playlists,
-               sources, syncplay)
+from . import (airplay, config, display, favourites, guest, media, mpvipc,
+               playlists, sources, syncplay)
 
 log = logging.getLogger(__name__)
 
@@ -39,10 +39,15 @@ MODE_IDLE = "idle"
 MODE_NDI = "ndi"
 MODE_LOCAL = "local"
 MODE_WEB = "web"
+# A live video stream pulled from a URL — HLS, DASH, UDP/RTP multicast, RTSP,
+# SRT. Distinct from MODE_LOCAL because there is no file and no playlist, and
+# distinct from MODE_NDI because it is mpv rather than the GStreamer runner.
+MODE_STREAM = "stream"
 # Receiving an AirPlay mirror. A mode, not a background service, because the
 # session takes the display and the display has exactly one owner.
 MODE_AIRPLAY = "airplay"
-VALID_MODES = {MODE_IDLE, MODE_NDI, MODE_LOCAL, MODE_WEB, MODE_AIRPLAY}
+VALID_MODES = {MODE_IDLE, MODE_NDI, MODE_LOCAL, MODE_WEB, MODE_STREAM,
+               MODE_AIRPLAY}
 
 # Backoff schedule for automatic restarts, in seconds.
 _BACKOFF = [1, 2, 5, 10, 15, 30]
@@ -590,6 +595,51 @@ class Player:
         cmd.append(url)
         return cmd
 
+    def _stream_command(self, cfg: config.Config, url: str) -> List[str]:
+        """Play a live stream — HLS, DASH, UDP/RTP multicast, RTSP, SRT.
+
+        mpv already speaks all of these, so this is the local-file command with
+        the file swapped for a URL and the buffering changed. The buffering is
+        the whole difference: a file can be re-read, a multicast packet that was
+        dropped is gone. So the demuxer cache is sized in seconds of stream
+        rather than left at mpv's file-oriented default, and the stream is never
+        looped — there is no end to loop back from.
+
+        The URL is validated before it reaches argv: mpv reads a leading "-" as
+        an option, so an address typed into the GUI must not be able to become
+        one.
+        """
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme.lower() not in favourites.STREAM_SCHEMES:
+            raise RuntimeError(
+                f"{parsed.scheme or 'that'} is not a stream address — use one of: "
+                f"{', '.join(favourites.STREAM_SCHEMES)}")
+        if not parsed.netloc:
+            raise RuntimeError(f"not a usable stream address: {url}")
+
+        cmd = self._mpv_base(cfg, 10)
+        cmd += [
+            # Live streams have no seekable history, so a big cache buys nothing
+            # but latency. These are the numbers that keep a wall responsive.
+            "--cache=yes",
+            f"--demuxer-readahead-secs={max(0, cfg.stream_cache_s)}",
+            "--demuxer-max-bytes=64MiB",
+            # Drop rather than fall behind: on a signage screen being a second
+            # late for ever is worse than missing a frame once.
+            "--framedrop=decoder+vo",
+            # A stream that dies should be retried rather than ending playback;
+            # the supervisor restarts us either way, but this rides out a blip
+            # without a black frame.
+            "--stream-lavf-o=reconnect=1,reconnect_streamed=1,reconnect_delay_max=5",
+        ]
+        if cfg.stream_low_latency:
+            # Trades smoothing for immediacy. Worth it for IMAG, wrong for a
+            # dashboard nobody is comparing against a live stage.
+            cmd += ["--profile=low-latency"]
+        cmd += ["--"]
+        cmd.append(url)
+        return cmd
+
     def _mpv_base(self, cfg: config.Config, image_duration: int) -> List[str]:
         """Flags shared by single-file, whole-playlist and per-segment mpv.
 
@@ -820,6 +870,12 @@ class Player:
             if not target:
                 raise RuntimeError("no web address given")
             return self._web_command(cfg, target)
+        if mode == MODE_STREAM:
+            if not target:
+                raise RuntimeError("no stream address given")
+            if not shutil.which("mpv"):
+                raise RuntimeError("mpv not installed")
+            return self._stream_command(cfg, target)
         if mode == MODE_AIRPLAY:
             # Checked before spawning, not after: with no Avahi, uxplay prints
             # one line and exits, and a supervisor reads that as a crash worth

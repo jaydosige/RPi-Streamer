@@ -1,0 +1,16 @@
+[Unit]
+Description=Apply a pi-streamer network or hostname change
+Documentation=man:systemd.service(5)
+After=NetworkManager.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+# Runs as root: it sets the hostname and drives NetworkManager, neither of
+# which the sandboxed service can do. It accepts a fixed set of action names
+# and passes every user-supplied value as an argv element, never through a
+# shell — see the module docstring in the script.
+ExecStart=/opt/pistreamer/bin/pistreamer-netcfg --from-request
+# The hotspot revert timer this schedules must outlive the oneshot that made
+# it, or turning the hotspot on would cancel its own safety net.
+KillMode=process
