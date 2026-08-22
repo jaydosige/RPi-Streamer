@@ -1,0 +1,204 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>shader</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #err {
+    position: fixed; inset: 0; margin: 0; padding: 18px;
+    font: 13px/1.5 ui-monospace, Menlo, Consolas, monospace;
+    color: #ffb4ae; background: #17090b; white-space: pre-wrap;
+    overflow: auto; display: none;
+  }
+</style>
+<canvas id="gl"></canvas>
+<pre id="err"></pre>
+<script>
+// One renderer, used by the node's display and by the editor's preview. Two
+// renderers would agree right up until the moment they did not, which is the
+// worst time to find out.
+(() => {
+  const canvas = document.getElementById("gl");
+  const errBox = document.getElementById("err");
+
+  function fail(text) {
+    errBox.textContent = text;
+    errBox.style.display = "block";
+    canvas.style.display = "none";
+    // The editor listens for this so a compile error lands beside the code
+    // rather than only inside the frame.
+    try {
+      parent.postMessage({ shaderError: text }, "*");
+    } catch (_) { /* not framed */ }
+  }
+
+  function ok() {
+    errBox.style.display = "none";
+    canvas.style.display = "block";
+    try { parent.postMessage({ shaderError: "" }, "*"); } catch (_) {}
+  }
+
+  const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
+  if (!gl) { fail("WebGL is not available in this browser."); return; }
+
+  const VERT = `attribute vec2 p; void main(){ gl_Position = vec4(p, 0.0, 1.0); }`;
+  // Shadertoy's uniforms, because that is the dialect anything pasted in is
+  // already written in.
+  const PREAMBLE = `#ifdef GL_ES
+precision highp float;
+#endif
+uniform vec3 iResolution;
+uniform float iTime;
+uniform float iTimeDelta;
+uniform int iFrame;
+uniform vec4 iMouse;
+`;
+  const WRAPPER = `
+void main() {
+  vec4 colour = vec4(0.0, 0.0, 0.0, 1.0);
+  mainImage(colour, gl_FragCoord.xy);
+  gl_FragColor = colour;
+}
+`;
+
+  // A lost context reports every compile as failed with an empty log, which
+  // surfaced as "unknown compile error" and sent the search to the GLSL. The
+  // GPU can reset under memory pressure on a Pi, so say what actually
+  // happened and pick the shader back up when the context returns.
+  let lost = false;
+  let lastSource = null;
+  canvas.addEventListener("webglcontextlost", (e) => {
+    e.preventDefault();
+    lost = true;
+    fail("The graphics context was lost — the GPU reset.\nWaiting for it to "
+         + "come back; nothing is wrong with the shader.");
+  });
+  canvas.addEventListener("webglcontextrestored", () => {
+    lost = false;
+    if (lastSource !== null) build(lastSource);
+  });
+
+  function compile(type, source) {
+    if (gl.isContextLost()) throw new Error("the graphics context is lost");
+    const sh = gl.createShader(type);
+    gl.shaderSource(sh, source);
+    gl.compileShader(sh);
+    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+      const log = gl.getShaderInfoLog(sh) || "unknown compile error";
+      gl.deleteShader(sh);
+      throw new Error(log);
+    }
+    return sh;
+  }
+
+  let program = null, uniforms = {}, start = performance.now(), frame = 0;
+  let last = start;
+  const mouse = { x: 0, y: 0, cx: 0, cy: 0 };
+
+  function build(userSource) {
+    lastSource = userSource;
+    if (lost) return false;
+    const wrap = !/\bvoid\s+main\s*\(/.test(userSource);
+    const fragSource = PREAMBLE + userSource + (wrap ? WRAPPER : "");
+    let vs, fs;
+    try {
+      vs = compile(gl.VERTEX_SHADER, VERT);
+      fs = compile(gl.FRAGMENT_SHADER, fragSource);
+    } catch (e) {
+      // Line numbers are against the assembled source; tell the reader how
+      // many lines were bolted on so they can find it in their own file.
+      const offset = PREAMBLE.split("\n").length - 1;
+      fail(String(e.message).trim() +
+           `\n\n(line numbers include ${offset} lines of preamble added above your code)`);
+      return false;
+    }
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.bindAttribLocation(prog, 0, "p");
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      fail(gl.getProgramInfoLog(prog) || "link failed");
+      return false;
+    }
+    if (program) gl.deleteProgram(program);
+    program = prog;
+    gl.useProgram(program);
+    uniforms = {
+      iResolution: gl.getUniformLocation(program, "iResolution"),
+      iTime: gl.getUniformLocation(program, "iTime"),
+      iTimeDelta: gl.getUniformLocation(program, "iTimeDelta"),
+      iFrame: gl.getUniformLocation(program, "iFrame"),
+      iMouse: gl.getUniformLocation(program, "iMouse"),
+    };
+    ok();
+    return true;
+  }
+
+  const buffer = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+  gl.bufferData(gl.ARRAY_BUFFER,
+                new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+  function resize() {
+    // Cap the backing store: a shader that is cheap at 1080p can be four times
+    // the work on a high-DPI laptop, and the preview is not what should be
+    // deciding whether the Pi can run it.
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.max(1, Math.floor(canvas.clientWidth * dpr));
+    const h = Math.max(1, Math.floor(canvas.clientHeight * dpr));
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w; canvas.height = h;
+    }
+  }
+
+  canvas.addEventListener("pointermove", (e) => {
+    const r = canvas.getBoundingClientRect();
+    mouse.x = (e.clientX - r.left) * (canvas.width / r.width);
+    mouse.y = (r.bottom - e.clientY) * (canvas.height / r.height);
+  });
+  canvas.addEventListener("pointerdown", () => { mouse.cx = mouse.x; mouse.cy = mouse.y; });
+
+  function draw(now) {
+    requestAnimationFrame(draw);
+    if (!program) return;
+    resize();
+    gl.viewport(0, 0, canvas.width, canvas.height);
+    const t = (now - start) / 1000;
+    if (uniforms.iResolution) gl.uniform3f(uniforms.iResolution, canvas.width, canvas.height, 1);
+    if (uniforms.iTime) gl.uniform1f(uniforms.iTime, t);
+    if (uniforms.iTimeDelta) gl.uniform1f(uniforms.iTimeDelta, (now - last) / 1000);
+    if (uniforms.iFrame) gl.uniform1i(uniforms.iFrame, frame);
+    if (uniforms.iMouse) gl.uniform4f(uniforms.iMouse, mouse.x, mouse.y, mouse.cx, mouse.cy);
+    last = now;
+    frame++;
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+  }
+  requestAnimationFrame(draw);
+
+  // The editor pushes source in as it is typed; the display loads it once from
+  // the URL. Same page either way.
+  window.addEventListener("message", (e) => {
+    if (e.data && typeof e.data.shaderSource === "string") {
+      start = performance.now(); frame = 0;
+      build(e.data.shaderSource);
+    }
+  });
+
+  const name = new URLSearchParams(location.search).get("name");
+  if (name) {
+    fetch("/api/shaders/" + encodeURIComponent(name))
+      .then((r) => r.ok ? r.json() : Promise.reject(new Error("shader not found")))
+      .then((d) => build(d.source))
+      .catch((e) => fail(String(e.message || e)));
+  } else {
+    build(`void mainImage(out vec4 c, in vec2 f){
+  vec2 uv = f / iResolution.xy;
+  c = vec4(0.5 + 0.5 * cos(iTime + uv.xyx + vec3(0,2,4)), 1.0);
+}`);
+  }
+})();
+</script>

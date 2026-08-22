@@ -328,6 +328,23 @@
   .chip.err { background: rgba(229, 84, 75, .14); color: #f2a29c; border-color: transparent; }
   .chip[title] { cursor: help; }
 
+  /* Code beside its result. They stack on a phone, where a split would give
+     neither half enough room to be useful. */
+  .shader-split {
+    display: grid; gap: 12px; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  @media (max-width: 820px) { .shader-split { grid-template-columns: 1fr; } }
+  #shaderSrc {
+    width: 100%; min-height: 340px; resize: vertical;
+    background: var(--panel-3); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 12px;
+    font: 13px/1.55 var(--mono); tab-size: 2;
+  }
+  #shaderPreview {
+    width: 100%; min-height: 340px; border: 1px solid var(--line);
+    border-radius: 10px; background: #000;
+  }
+
   /* Preview. Sized by aspect-ratio rather than a fixed height so a 4:3 or
      vertical source is not letterboxed into a 16:9 hole. */
   .preview-frame {
@@ -762,6 +779,41 @@
         <button class="btn" id="btnSaveWeb">Save as favourite</button>
       </div>
       <div id="browserState" style="margin-top:12px"></div>
+    </div>
+
+    <div class="card">
+      <h2>Shaders</h2>
+      <div class="note" style="margin-bottom:12px">
+        Write a GLSL fragment shader and put it on the screen.
+        Shadertoy&rsquo;s conventions apply &mdash; <code>mainImage(out vec4
+        fragColor, in vec2 fragCoord)</code> with <code>iTime</code>,
+        <code>iResolution</code> and <code>iMouse</code> &mdash; so anything
+        written for that pastes straight in. The preview below is the same
+        renderer the screen uses.
+      </div>
+      <ul class="list" id="shaderList"></ul>
+      <div class="row" style="margin:12px 0">
+        <button class="btn" id="btnShaderNew">New shader</button>
+      </div>
+      <div id="shaderEditor" style="display:none">
+        <label class="field">
+          <span class="lbl">Name</span>
+          <input type="text" id="shaderName" placeholder="plasma">
+        </label>
+        <div class="shader-split">
+          <textarea id="shaderSrc" spellcheck="false"
+                    aria-label="Shader source"></textarea>
+          <iframe id="shaderPreview" title="Shader preview"
+                  src="/shader" sandbox="allow-scripts"></iframe>
+        </div>
+        <div id="shaderError"></div>
+        <div class="row" style="margin-top:12px">
+          <button class="btn primary" id="btnShaderSave">Save</button>
+          <button class="btn accent" id="btnShaderPlay">Save &amp; show</button>
+          <button class="btn" id="btnShaderClose">Close</button>
+          <span class="host" id="shaderNote"></span>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -1362,6 +1414,17 @@
     </div>
 
     <div class="card">
+      <h2>Support bundle</h2>
+      <div class="note" style="margin-bottom:12px">
+        One file with everything needed to diagnose this node: the player log,
+        the systemd journal, versions, capabilities, telemetry and the settings
+        &mdash; with the group key, password and Wi-Fi passphrase redacted, so
+        it is safe to attach to a message.
+      </div>
+      <a class="btn primary" id="btnSupport" href="/api/support" download>Download</a>
+    </div>
+
+    <div class="card">
       <h2>Last 10 minutes</h2>
       <div id="charts"></div>
       <div class="row" style="margin-top:4px">
@@ -1673,7 +1736,7 @@ document.querySelectorAll("nav button").forEach((btn) => {
     }
     if (tab === "output") { loadConnectors(); loadAudioDevices(); loadPerf(); }
     if (tab === "system") { loadAccess(); loadWizNetwork("sysNetwork"); loadTelemetry(); loadOverclock(); loadUpdate(); }
-    if (tab === "ndi") { loadNdiNetwork(); loadAirplay(); loadFavourites(); loadBrowserState(); }
+    if (tab === "ndi") { loadNdiNetwork(); loadAirplay(); loadFavourites(); loadBrowserState(); loadShaders(); }
     if (tab === "nodes") loadNodes();
   };
 });
@@ -4137,6 +4200,125 @@ async function loadBrowserState() {
   };
   if (BROWSER_POLL) { clearInterval(BROWSER_POLL); BROWSER_POLL = null; }
 }
+
+// ---------- shaders ----------
+//
+// The preview is an iframe running the same page the screen runs, fed the
+// source over postMessage as it is typed. Nothing is saved to preview, and the
+// node does no work: the browser you are editing in does the compiling, and
+// reports its own errors back.
+
+let SHADERS = null;
+let SHADER_TEMPLATE = "";
+let SHADER_DEBOUNCE = null;
+
+async function loadShaders() {
+  const box = $("shaderList");
+  if (!box) return;
+  let data;
+  try { data = await api("/api/shaders"); }
+  catch (err) { box.innerHTML = `<div class="banner">${esc(err.message)}</div>`; return; }
+  SHADERS = data.shaders || [];
+  SHADER_TEMPLATE = data.template || "";
+  if (!SHADERS.length) {
+    box.innerHTML = `<div class="empty">No shaders yet. New shader starts you
+      off with one that works.</div>`;
+    return;
+  }
+  box.innerHTML = SHADERS.map((sh) => `
+    <li>
+      <div class="meta">
+        <div class="name">${esc(sh.name)}</div>
+        <div class="sub">${fmtBytes(sh.size)}</div>
+      </div>
+      <button class="btn small" data-shedit="${encodeURIComponent(sh.name)}">Edit</button>
+      <button class="btn small accent" data-shplay="${encodeURIComponent(sh.name)}">Show</button>
+      <button class="btn danger" data-shdel="${encodeURIComponent(sh.name)}">Delete</button>
+    </li>`).join("");
+
+  box.querySelectorAll("[data-shedit]").forEach((b) => {
+    b.onclick = () => openShader(decodeURIComponent(b.dataset.shedit));
+  });
+  box.querySelectorAll("[data-shplay]").forEach((b) => {
+    b.onclick = () => playShader(decodeURIComponent(b.dataset.shplay));
+  });
+  box.querySelectorAll("[data-shdel]").forEach((b) => {
+    b.onclick = async () => {
+      const name = decodeURIComponent(b.dataset.shdel);
+      if (!confirm(`Delete the shader "${name}"?`)) return;
+      try {
+        await api("/api/shaders/" + encodeURIComponent(name), { method: "DELETE" });
+        loadShaders();
+      } catch (err) { toast(err.message, true); }
+    };
+  });
+}
+
+function showEditor(name, source) {
+  $("shaderEditor").style.display = "";
+  $("shaderName").value = name;
+  $("shaderSrc").value = source;
+  $("shaderNote").textContent = "";
+  pushShader();
+}
+
+async function openShader(name) {
+  try {
+    const d = await api("/api/shaders/" + encodeURIComponent(name));
+    showEditor(d.name, d.source);
+  } catch (err) { toast(err.message, true); }
+}
+
+$("btnShaderNew").onclick = () => showEditor("", SHADER_TEMPLATE);
+$("btnShaderClose").onclick = () => { $("shaderEditor").style.display = "none"; };
+
+// Compiling on every keystroke fights the typist; a short pause after they
+// stop is the moment they are actually looking at the result.
+function pushShader() {
+  clearTimeout(SHADER_DEBOUNCE);
+  SHADER_DEBOUNCE = setTimeout(() => {
+    const frame = $("shaderPreview");
+    if (frame && frame.contentWindow) {
+      frame.contentWindow.postMessage({ shaderSource: $("shaderSrc").value }, "*");
+    }
+  }, 300);
+}
+$("shaderSrc").oninput = pushShader;
+
+// The preview reports its own compile errors — it is the thing doing the
+// compiling, so it is the only one that can.
+window.addEventListener("message", (e) => {
+  if (!e.data || typeof e.data.shaderError !== "string") return;
+  $("shaderError").innerHTML = e.data.shaderError
+    ? `<pre class="log" style="max-height:150px;margin-top:10px">${esc(e.data.shaderError)}</pre>`
+    : "";
+});
+
+async function saveShader() {
+  const name = $("shaderName").value.trim();
+  if (!name) { toast("Give the shader a name", true); return null; }
+  try {
+    await post("/api/shaders", { name, source: $("shaderSrc").value });
+    $("shaderNote").textContent = "saved";
+    loadShaders();
+    return name;
+  } catch (err) { toast(err.message, true); return null; }
+}
+
+$("btnShaderSave").onclick = saveShader;
+
+async function playShader(name) {
+  try {
+    await post("/api/play/shader", { name });
+    toast("Showing " + name);
+    poll();
+  } catch (err) { toast(err.message, true); }
+}
+
+$("btnShaderPlay").onclick = async () => {
+  const name = await saveShader();
+  if (name) playShader(name);
+};
 
 // ---------- documents ----------
 //

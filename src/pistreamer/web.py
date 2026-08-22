@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import time
+import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -22,10 +23,8 @@ from pydantic import BaseModel, Field
 
 from . import (airplay, auth, cluster, config, diagnose, display, documents,
                favourites, guest, ingest, media, ndiconfig, network, playlists,
-               preview,
-               pushjob,
-               schedule as schedule_mod, sources, syncplay, system, transcode,
-               updates)
+               preview, pushjob, schedule as schedule_mod, shaders, sources,
+               support, syncplay, system, transcode, updates)
 from .player import (MODE_AIRPLAY, MODE_IDLE, MODE_LOCAL, MODE_NDI,
                      MODE_STREAM, MODE_WEB, identify_text, player)
 from .telemetry import telemetry
@@ -595,6 +594,59 @@ async def post_preview_stop() -> Dict[str, Any]:
     return preview.summary(player.status().get("mode", ""))
 
 
+@app.get("/api/support")
+async def get_support() -> Response:
+    """Everything needed to diagnose this node, as one downloadable file.
+
+    Gathered in a worker thread: it shells out to journalctl and half a dozen
+    version commands, and blocking the event loop for that would stall the
+    playback status and the guest uploads while somebody files a bug report.
+    """
+    def build() -> Dict[str, Any]:
+        cfg = config.load()
+        return support.collect({
+            "config": lambda: support.redact_config(cfg.to_dict()),
+            "player": player.status,
+            "stream": player.stream_stats,
+            "player_log": lambda: player.logs(),
+            "system": system.summary,
+            "versions": system.versions,
+            "diagnose": lambda: diagnose.diagnose(
+                player.stream_stats(), system.summary(), player.status()),
+            "capabilities": lambda: {
+                "hardware_codecs": sorted(hardware_codecs() or []),
+                "transcode_encoders": transcode.encoders(),
+                "ingest_tools": ingest.tools(),
+                "preview": preview.summary(player.status().get("mode", "")),
+            },
+            "discovery": sources.status,
+            "airplay": airplay.summary,
+            "cluster": lambda: {
+                "enabled": cfg.cluster_enabled,
+                "self": cluster.node_id(),
+                "ip": cluster.primary_ip(),
+                "peers": [p.to_dict() for p in cluster.registry.all()],
+                "beacon": cluster.beacon().stats(),
+                "sync": conductor.state(),
+            },
+            "network": network.summary,
+            "auth": auth.summary,
+            "updates": updates.summary,
+            "schedule": lambda: [c.to_dict() for c in schedule_mod.all_cues()],
+            "playlists": lambda: [pl.to_dict() for pl in playlists.all_playlists()],
+            "media": lambda: [m.to_dict() for m in media.list_media()],
+            "telemetry": telemetry.history,
+        })
+
+    bundle = await asyncio.get_running_loop().run_in_executor(None, build)
+    name = support.filename(config.load().device_name)
+    return Response(
+        content=support.to_bytes(bundle),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
+
+
 @app.get("/api/diagnose")
 async def get_diagnose() -> Dict[str, Any]:
     """Why are frames being lost — the network, or this Pi?"""
@@ -825,6 +877,90 @@ async def play_web(body: PlayWeb) -> Dict[str, Any]:
         raise HTTPException(500, status["last_error"])
     favourites.mark_used(body.url)
     return status
+
+
+# ----------------------------------------------------------------------
+# Shaders
+#
+# A shader is a web page: web mode already runs Chromium full-screen on the
+# display, so playing one is web mode pointed back at this node. The editor
+# previews with the same page, which is what stops "what I wrote" and "what is
+# on the wall" from being two different renderers.
+# ----------------------------------------------------------------------
+
+
+@app.get("/shader", include_in_schema=False)
+async def shader_page() -> FileResponse:
+    return FileResponse(STATIC_DIR / "shader.html")
+
+
+class ShaderBody(BaseModel):
+    name: str = Field(min_length=1, max_length=60)
+    source: str = Field(min_length=1)
+
+
+@app.get("/api/shaders")
+async def get_shaders() -> Dict[str, Any]:
+    cfg = config.load()
+    return {
+        "shaders": shaders.all_shaders(),
+        "template": shaders.DEFAULT_SOURCE,
+        # What the browser needs to point web mode at this node.
+        "base": f"http://127.0.0.1{'' if cfg.web_port == 80 else ':' + str(cfg.web_port)}",
+    }
+
+
+@app.get("/api/shaders/{name}")
+async def get_shader(name: str) -> Dict[str, Any]:
+    source = shaders.get(name)
+    if source is None:
+        raise HTTPException(404, f"no such shader: {name}")
+    return {"name": name, "source": source}
+
+
+@app.post("/api/shaders")
+async def post_shader(body: ShaderBody) -> Dict[str, Any]:
+    try:
+        saved = shaders.save(body.name.strip(), body.source)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"name": saved}
+
+
+@app.delete("/api/shaders/{name}")
+async def delete_shader(name: str) -> Dict[str, Any]:
+    cfg = config.load()
+    if cfg.mode == MODE_WEB and shader_url(name) == cfg.web_url:
+        raise HTTPException(409, "that shader is on the screen now; stop it first")
+    if not shaders.delete(name):
+        raise HTTPException(404, f"no such shader: {name}")
+    return {"deleted": name}
+
+
+def shader_url(name: str) -> str:
+    cfg = config.load()
+    port = "" if cfg.web_port == 80 else f":{cfg.web_port}"
+    return f"http://127.0.0.1{port}/shader?name={urllib.parse.quote(name)}"
+
+
+@app.post("/api/play/shader")
+async def play_shader(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+    """Put a shader on the screen, which is web mode aimed at ourselves."""
+    name = str(body.get("name", ""))
+    if shaders.get(name) is None:
+        raise HTTPException(404, f"no such shader: {name}")
+    ok, reason = _browser_ready()
+    if not ok:
+        raise HTTPException(409, reason)
+    return await play_web(PlayWeb(url=shader_url(name)))
+
+
+def _browser_ready() -> tuple[bool, str]:
+    if next((b for b in ("chromium-browser", "chromium",
+                         "chromium-browser-stable") if shutil.which(b)), None):
+        return True, ""
+    return False, ("a shader is drawn by the browser, which is not installed "
+                   "yet — the Web page card has a button for it")
 
 
 @app.get("/api/web/browser")
