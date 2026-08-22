@@ -18,6 +18,7 @@ assert "install-chromium" in m.ACTIONS
 calls = []
 m.subprocess_env = lambda a, e, t: (calls.append(a), (0, "", ""))[1]
 m.shutil.which = lambda _n: None
+m.shutil.which = lambda _n: None
 ok, _d, msg = m.act_install_chromium({"package": "; rm -rf /", "action": "install-chromium"})
 assert not any("rm" in " ".join(c) for c in calls), calls
 assert all(c[0] == "apt-get" for c in calls), calls
@@ -26,9 +27,18 @@ assert any(c[:2] == ["apt-get", "update"] for c in calls), calls
 # which() still says no after a "successful" apt: report failure, not success.
 assert not ok, "must verify the binary exists, not trust apt's exit code"
 
-# Already installed: do nothing at all.
+# Chromium alone is not enough: without a compositor it has nothing to draw
+# onto here, so the install is not finished and must still fetch cage.
 calls.clear()
 m.shutil.which = lambda n: "/usr/bin/chromium" if n == "chromium" else None
+ok, data, msg = m.act_install_chromium({})
+assert any("cage" in c for c in calls), ("cage must still be installed", calls)
+assert not any("chromium" in " ".join(c) for c in calls if c[0] == "apt-get"
+               and "install" in c), ("chromium must not be reinstalled", calls)
+
+# Both present: do nothing at all.
+calls.clear()
+m.shutil.which = lambda n: f"/usr/bin/{n}" if n in ("chromium", "cage") else None
 ok, data, msg = m.act_install_chromium({})
 assert ok and data.get("already") and not calls, (ok, data, calls)
 
