@@ -34,13 +34,14 @@ for m in ("idle", "local", "ndi", "stream", "web", "airplay"):
         assert "cmdline.txt" in str(e), "must name the headless fix"
         assert "HDMI-A-1" in str(e), "must name the connector"
 
-# No DRM at all.
+# No connectors at all is a machine without DRM, not a cable that fell out.
+# The guard must stay quiet so the missing backend is what gets reported.
 display.pick_connector = lambda pref="": None
 try:
-    Player._build_command(pl, cfg, "idle", "")
-    raise AssertionError("should have refused")
+    Player._build_command(pl, cfg, "ndi", "SOME (Source)")
 except RuntimeError as e:
-    assert "no modes" in str(e), e
+    assert "nothing is plugged in" not in str(e), \
+        f"display guard masked the real error: {e}"
 
 def refuses_for_no_modes():
     """Did the no-modes guard fire? Anything further (no GStreamer on a dev

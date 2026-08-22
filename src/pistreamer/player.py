@@ -896,13 +896,16 @@ class Player:
         # nothing to set. Without this the failure is "failed to set pipeline
         # to PLAYING" on a backoff loop for ever, which says nothing about the
         # cable being out.
+        # Only when a connector exists but advertises nothing, which is the
+        # cable-out case. No connectors at all means no DRM on this machine,
+        # where a missing backend is the more useful thing to report.
         conn = display.pick_connector(cfg.connector)
-        if conn is None or not conn.modes:
+        if conn is not None and not conn.modes:
             raise RuntimeError(
-                f"{conn.name if conn else 'the display'} reports no modes — "
-                f"nothing is plugged in. Either connect a display, or run "
-                f"headless by adding video=HDMI-A-1:1920x1080@60e to "
-                f"/boot/firmware/cmdline.txt and rebooting."
+                f"{conn.name} reports no modes — nothing is plugged in. Either "
+                f"connect a display, or run headless by adding "
+                f"video=HDMI-A-1:1920x1080@60e to /boot/firmware/cmdline.txt "
+                f"and rebooting."
             )
         if mode == MODE_IDLE:
             if cfg.use_gst_launch:
