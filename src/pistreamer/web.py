@@ -21,7 +21,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, Field
 
 from . import (airplay, auth, cluster, config, diagnose, display, favourites,
-               guest, media, ndiconfig, network, playlists, preview,
+               guest, ingest, media, ndiconfig, network, playlists, preview,
                pushjob,
                schedule as schedule_mod, sources, syncplay, system, transcode,
                updates)
@@ -1008,7 +1008,33 @@ async def upload_media(file: UploadFile) -> Dict[str, Any]:
         raise HTTPException(500, f"write failed: {exc}") from exc
     finally:
         await file.close()
-    return {"name": name, "size": dest.stat().st_size}
+    return await _ingest(dest, name)
+
+
+async def _ingest(dest: Path, name: str) -> Dict[str, Any]:
+    """Convert an upload into something showable, if it is not already.
+
+    Both upload paths go through here rather than each doing their own: a
+    format the operator can upload and a guest cannot (or the reverse) is a
+    difference nobody intends and nobody notices until a show.
+    """
+    if not ingest.needs_conversion(name):
+        return {"name": name, "size": dest.stat().st_size, "pages": 1}
+    produced, problem = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: ingest.convert(dest))
+    if problem or not produced:
+        return {"name": name, "size": dest.stat().st_size if dest.is_file() else 0,
+                "pages": 0,
+                "problem": problem or f"could not convert {name}"}
+    first = produced[0]
+    log.info("converted %s into %d image(s)", name, len(produced))
+    return {
+        "name": first.name,
+        "size": first.stat().st_size,
+        "pages": len(produced),
+        "files": [p.name for p in produced],
+        "converted_from": name,
+    }
 
 
 @app.put("/api/media/raw/{name}")
@@ -1327,6 +1353,18 @@ async def guest_upload(token: str, request: Request) -> Dict[str, Any]:
         raise HTTPException(500, f"the node could not save it: {exc}") from exc
     finally:
         await upload.close()
+
+    # A phone sends HEIC and an office sends a PDF; both become images here,
+    # before anything downstream — the queue, the operator's list, the screen —
+    # ever sees them.
+    result = await _ingest(dest, name)
+    if result.get("problem"):
+        # The file is still there and still refusable by hand, but a guest
+        # standing by the screen needs to know it will not appear.
+        raise HTTPException(415, result["problem"])
+    name = result["name"]
+    dest = config.MEDIA_DIR / name
+    written = dest.stat().st_size if dest.is_file() else written
 
     sender = str(form.get("from") or "")
     guest.record(name, written, sender=sender)

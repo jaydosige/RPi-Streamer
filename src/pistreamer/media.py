@@ -22,7 +22,11 @@ from . import config
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm", ".ts", ".mpg", ".mpeg"}
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".aac", ".m4a", ".ogg"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
-ALLOWED_EXTS = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS
+# Accepted on upload and converted to images on arrival — see ingest.py.
+# Nothing downstream ever sees these: by the time a file is in the library it
+# is a JPEG like any other.
+DOC_EXTS = {".heic", ".heif", ".pdf", ".txt", ".md", ".log", ".csv"}
+ALLOWED_EXTS = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS | DOC_EXTS
 
 _SAFE_RE = re.compile(r"[^A-Za-z0-9._ -]")
 

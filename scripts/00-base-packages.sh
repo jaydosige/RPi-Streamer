@@ -34,6 +34,11 @@ apt_install \
   `# A font for it to draw the address with. Pango finds one for the caption` \
   `# via fontconfig; Pillow is handed a file path and needs it to exist.` \
   fonts-dejavu-core \
+  `# Uploads arrive in formats a display cannot show. A phone takes HEIC and` \
+  `# an office sends a PDF; both are turned into JPEGs on arrival so nothing` \
+  `# downstream has to learn a new format. Both packages are small.` \
+  libheif-examples \
+  poppler-utils \
   alsa-utils \
   avahi-daemon \
   libdrm2 \
