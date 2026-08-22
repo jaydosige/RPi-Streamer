@@ -39,10 +39,6 @@ from . import config
 
 log = logging.getLogger(__name__)
 
-# Where a frame is kept. RAM, in preference order: systemd's own runtime
-# directory, then the shared-memory tmpfs every Linux has, and only then the
-# state directory — which is on the SD card and is the thing being avoided.
-_TMPFS_CANDIDATES = ("/run/pistreamer", "/dev/shm/pistreamer")
 
 # Named rates. The GUI offers these rather than a free number: the useful
 # choices are "roughly live", "ticking over" and "off", and a box that lets
@@ -69,32 +65,26 @@ _lock = threading.Lock()
 _demand: Dict[str, Any] = {"until": 0.0, "interval": 0.0, "asks": 0}
 
 
-def _writable_dir() -> Path:
-    for candidate in _TMPFS_CANDIDATES:
-        path = Path(candidate)
-        try:
-            path.mkdir(parents=True, exist_ok=True)
-            probe = path / ".probe"
-            probe.write_bytes(b"")
-            probe.unlink()
-            return path
-        except OSError:
-            continue
-    # The SD card. Works, wears the card; only reached where there is no tmpfs.
-    return config.STATE_DIR
-
-
-_dir_cache: Optional[Path] = None
-
-
 def directory() -> Path:
-    global _dir_cache
-    if _dir_cache is None:
-        _dir_cache = _writable_dir()
-        if _dir_cache == config.STATE_DIR:
-            log.warning("no tmpfs available for previews; frames will be written "
-                        "to %s, which is usually the SD card", _dir_cache)
-    return _dir_cache
+    """Where a frame is kept. Shared with rasterised document pages."""
+    path = config.runtime_dir()
+    if path == config.STATE_DIR and not _warned:
+        _warn_once(path)
+    return path
+
+
+_warned = False
+
+
+def _warn_once(path) -> None:
+    global _warned
+    _warned = True
+    log.warning("no tmpfs available; preview frames will be written to %s, "
+                "which is usually the SD card", path)
+
+
+def on_tmpfs() -> bool:
+    return config.on_tmpfs()
 
 
 def frame_path() -> Path:
@@ -109,10 +99,6 @@ def rate_path() -> Path:
     the simplest thing that survives either end restarting.
     """
     return directory() / "preview.rate"
-
-
-def on_tmpfs() -> bool:
-    return directory() != config.STATE_DIR
 
 
 # ----------------------------------------------------------------------

@@ -668,6 +668,17 @@
         <button class="btn primary" id="btnRestart">Restart pipeline</button>
         <button class="btn danger" id="btnStop">Stop output</button>
       </div>
+      <div id="docControls" style="display:none;margin-top:14px">
+        <div class="row">
+          <button class="btn" id="btnPagePrev" title="Previous page (←)">‹ Back</button>
+          <span class="seg"><input type="number" id="pageNum" min="1"
+            style="width:74px;text-align:center" aria-label="Page number"></span>
+          <span class="host" id="pageOf"></span>
+          <button class="btn" id="btnPageNext" title="Next page (→)">Next ›</button>
+        </div>
+        <p class="note" style="margin-top:8px">Arrow keys turn the page. Set a
+          dwell in Output to page through on its own.</p>
+      </div>
       <div class="grid" id="healthGrid" style="margin-top:16px"></div>
     </div>
     <div class="card" id="previewCard">
@@ -1835,6 +1846,7 @@ function renderStatus() {
   renderAirplayLive();
 
   renderStream(STATE.stream || {}, p);
+  renderDocControls(p, STATE.stream || {});
 
   const mem = s.memory || {};
   const memUsed = (mem.total && mem.available !== null && mem.available !== undefined)
@@ -4124,6 +4136,53 @@ async function loadBrowserState() {
     } catch (err) { toast(err.message, true); btn.disabled = false; }
   };
   if (BROWSER_POLL) { clearInterval(BROWSER_POLL); BROWSER_POLL = null; }
+}
+
+// ---------- documents ----------
+//
+// mpv owns the page list, so it is the only thing that cannot be wrong about
+// which page is showing: the numbers here are read back from it rather than
+// counted on this side.
+
+async function turnPage(to) {
+  try {
+    const r = await post("/api/document/page", { to: String(to) });
+    if (r.page) $("pageNum").value = r.page;
+    poll();
+  } catch (err) { toast(err.message, true); }
+}
+
+$("btnPagePrev").onclick = () => turnPage("prev");
+$("btnPageNext").onclick = () => turnPage("next");
+$("pageNum").onchange = () => {
+  const n = parseInt($("pageNum").value, 10);
+  if (n > 0) turnPage(n);
+};
+
+document.addEventListener("keydown", (e) => {
+  // Only while a document is up, and never while something is being typed
+  // into — arrow keys belong to the field then.
+  if ($("docControls").style.display === "none") return;
+  const tag = (document.activeElement || {}).tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+  if (e.key === "ArrowRight") { e.preventDefault(); turnPage("next"); }
+  if (e.key === "ArrowLeft") { e.preventDefault(); turnPage("prev"); }
+});
+
+function renderDocControls(p, st) {
+  const box = $("docControls");
+  if (!box) return;
+  const isDoc = p.mode === "local" && /\.(pdf|txt|md|log|csv)$/i.test(p.target || "");
+  box.style.display = isDoc ? "" : "none";
+  if (!isDoc) return;
+  const page = st.playlist_position, total = st.playlist_count;
+  $("pageOf").textContent = total ? `of ${total}` : "rendering…";
+  const field = $("pageNum");
+  // Do not fight the operator mid-type.
+  if (page && document.activeElement !== field) field.value = page;
+  if (total) field.max = total;
+  $("btnPagePrev").disabled = !total;
+  $("btnPageNext").disabled = !total;
 }
 
 // ---------- preview ----------

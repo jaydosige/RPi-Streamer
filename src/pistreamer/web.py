@@ -20,8 +20,9 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, Field
 
-from . import (airplay, auth, cluster, config, diagnose, display, favourites,
-               guest, ingest, media, ndiconfig, network, playlists, preview,
+from . import (airplay, auth, cluster, config, diagnose, display, documents,
+               favourites, guest, ingest, media, ndiconfig, network, playlists,
+               preview,
                pushjob,
                schedule as schedule_mod, sources, syncplay, system, transcode,
                updates)
@@ -654,6 +655,8 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     ):
         if key in patch and patch[key] not in allowed:
             raise HTTPException(400, f"{key} must be one of: {', '.join(allowed)}")
+    if "document_dwell_s" in patch and not (0 <= int(patch["document_dwell_s"]) <= 3600):
+        raise HTTPException(400, "document_dwell_s must be between 0 and 3600 seconds")
     if "stream_cache_s" in patch and not (0 <= int(patch["stream_cache_s"]) <= 60):
         raise HTTPException(400, "stream_cache_s must be between 0 and 60 seconds")
     if "auth_session_hours" in patch and not (1 <= int(patch["auth_session_hours"]) <= 8760):
@@ -704,7 +707,7 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         "snapshot_enabled", "snapshot_interval_s",
         "idle_mode", "standby_file",
         "loop",
-        "stream_cache_s", "stream_low_latency",
+        "stream_cache_s", "stream_low_latency", "document_dwell_s",
     }
     # The standby screen is itself a live pipeline now, so idle restarts too.
     if restart_keys & set(patch):
@@ -1074,9 +1077,60 @@ async def delete_media(name: str) -> Dict[str, Any]:
     cfg = config.load()
     if cfg.mode == MODE_LOCAL and cfg.local_file == name:
         raise HTTPException(409, "file is currently playing; stop playback first")
+    path = media.resolve(name)
+    if path is not None and documents.is_document(name):
+        documents.forget(path)
     if not media.delete(name):
         raise HTTPException(404, f"no such media file: {name}")
     return {"deleted": name}
+
+
+# ----------------------------------------------------------------------
+# Documents
+# ----------------------------------------------------------------------
+
+
+class PageBody(BaseModel):
+    # "next", "prev", or a 1-based page number as a string.
+    to: str = "next"
+
+
+@app.get("/api/document")
+async def get_document() -> Dict[str, Any]:
+    """What document is on screen, and where in it we are.
+
+    The page numbers come from mpv rather than being tracked here: it owns the
+    playlist, so it is the only thing that cannot be wrong about which entry is
+    showing.
+    """
+    cfg = config.load()
+    name = cfg.local_file
+    if not name or not documents.is_document(name):
+        return {"open": False}
+    stats = player.stream_stats()
+    path = media.resolve(name)
+    ok, reason = documents.available(name)
+    return {
+        "open": True,
+        "name": name,
+        "available": ok,
+        "reason": reason,
+        "page": stats.get("playlist_position"),
+        "pages": stats.get("playlist_count"),
+        "dwell_s": cfg.document_dwell_s,
+        "cached": bool(path and documents.cache_dir(path).is_dir()),
+    }
+
+
+@app.post("/api/document/page")
+async def post_document_page(body: PageBody) -> Dict[str, Any]:
+    cfg = config.load()
+    if not cfg.local_file or not documents.is_document(cfg.local_file):
+        raise HTTPException(409, "no document is on screen")
+    try:
+        return player.turn_page(body.to)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 # ----------------------------------------------------------------------

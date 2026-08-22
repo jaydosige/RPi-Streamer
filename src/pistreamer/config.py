@@ -150,6 +150,11 @@ class Config:
     snapshot_enabled: bool = True
     snapshot_interval_s: int = 3
 
+    # Seconds each page of a document is held. 0 holds it until somebody turns
+    # the page, which is what a document is usually for; anything above 0
+    # makes it a slideshow.
+    document_dwell_s: int = 0
+
     # Fall back to shelling out to gst-launch-1.0 instead of the instrumented
     # runner. Loses all stream telemetry; kept as an escape hatch.
     use_gst_launch: bool = False
@@ -324,6 +329,39 @@ def update(**kwargs: Any) -> Config:
             setattr(cfg, key, value)
     save(cfg)
     return cfg
+
+
+# Scratch space that is NOT the SD card. Preview frames and rasterised
+# document pages are both regenerable and both written often; flash wears out
+# on writes, and an appliance that quietly eats its own boot media is a worse
+# bug than a slow GUI. Order of preference: systemd's RuntimeDirectory, the
+# shared-memory tmpfs every Linux has, then the state directory as a last
+# resort — which works, and wears the card.
+_RUNTIME_CANDIDATES = ("/run/pistreamer", "/dev/shm/pistreamer")
+_runtime_cache: Path | None = None
+
+
+def runtime_dir() -> Path:
+    global _runtime_cache
+    if _runtime_cache is not None:
+        return _runtime_cache
+    for candidate in _RUNTIME_CANDIDATES:
+        path = Path(candidate)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".probe"
+            probe.write_bytes(b"")
+            probe.unlink()
+            _runtime_cache = path
+            return path
+        except OSError:
+            continue
+    _runtime_cache = STATE_DIR
+    return _runtime_cache
+
+
+def on_tmpfs() -> bool:
+    return runtime_dir() != STATE_DIR
 
 
 def ensure_dirs() -> None:

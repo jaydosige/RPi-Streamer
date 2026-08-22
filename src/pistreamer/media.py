@@ -22,11 +22,13 @@ from . import config
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".m4v", ".avi", ".webm", ".ts", ".mpg", ".mpeg"}
 AUDIO_EXTS = {".mp3", ".wav", ".flac", ".aac", ".m4a", ".ogg"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp"}
-# Accepted on upload and converted to images on arrival — see ingest.py.
-# Nothing downstream ever sees these: by the time a file is in the library it
-# is a JPEG like any other.
-DOC_EXTS = {".heic", ".heif", ".pdf", ".txt", ".md", ".log", ".csv"}
-ALLOWED_EXTS = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS | DOC_EXTS
+# A HEIC is one photograph in a container nothing here can read, so it is
+# converted to JPEG on arrival — see ingest.py — and never seen again.
+HEIC_EXTS = {".heic", ".heif"}
+# Documents stay whole. They are many pages and one library entry; the pages
+# are rasterised at playback — see documents.py.
+DOC_EXTS = {".pdf", ".txt", ".md", ".log", ".csv"}
+ALLOWED_EXTS = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS | HEIC_EXTS | DOC_EXTS
 
 _SAFE_RE = re.compile(r"[^A-Za-z0-9._ -]")
 
@@ -129,6 +131,8 @@ def _kind_for(suffix: str) -> Optional[str]:
         return "audio"
     if s in IMAGE_EXTS:
         return "image"
+    if s in DOC_EXTS:
+        return "document"
     return None
 
 
@@ -387,4 +391,5 @@ def playlist_paths(selection: str = "") -> List[str]:
     if selection:
         path = resolve(selection)
         return [str(path)] if path else []
-    return [str(config.MEDIA_DIR / m.name) for m in list_media() if m.kind != "image"]
+    return [str(config.MEDIA_DIR / m.name) for m in list_media()
+            if m.kind not in ("image", "document")]

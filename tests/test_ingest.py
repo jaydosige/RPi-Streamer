@@ -1,13 +1,9 @@
-"""Uploads that are not showable get converted on arrival.
+"""HEIC uploads get converted on arrival.
 
-A phone takes HEIC and an office sends a PDF. Neither is something mpv will
-put on a display, so both become JPEGs at the door and nothing downstream —
-the library, playlists, the standby screen, the preview — ever learns a new
-format.
+A phone takes HEIC: one photograph, in a container nothing on this board can
+read. It becomes a JPEG at the door and is an ordinary image from then on.
 
-The conversions need heif-convert, pdftoppm and Pillow. Each is skipped
-individually where its tool is missing, so this still says something useful on
-a machine that has only some of them.
+Documents are deliberately not converted here — see test_documents.py.
 
     python3 tests/test_ingest.py
 """
@@ -54,10 +50,12 @@ def main() -> int:
     for name in ("a.heic", "a.HEIF", "a.pdf", "a.txt", "a.md"):
         check(f"{name} may be uploaded", media.is_allowed(name))
     check("an executable still may not", not media.is_allowed("a.sh"))
-    for name in ("a.heic", "a.pdf", "a.txt"):
-        check(f"{name} is marked for conversion", ingest.needs_conversion(name))
-    check("a jpeg is left alone", not ingest.needs_conversion("a.jpg"))
-    check("a video is left alone", not ingest.needs_conversion("a.mp4"))
+    # A HEIC is one photograph in a container nothing here reads, so it is
+    # converted. Documents are many pages and stay whole — documents.py
+    # rasterises them at playback instead.
+    check("a HEIC is converted on arrival", ingest.needs_conversion("a.heic"))
+    for name in ("a.pdf", "a.txt", "a.jpg", "a.mp4"):
+        check(f"{name} is left alone", not ingest.needs_conversion(name))
 
     have = ingest.tools()
     print(f"\ntools here: {have}")
@@ -81,67 +79,6 @@ def main() -> int:
                   str(sized(produced[0])))
         # The original must go, or the library shows a file that cannot play.
         check("the original is removed", not heic.exists())
-
-    print("\nPDF")
-    if not (have["pdf"] and have["text"]):
-        print("  (skipping — no pdftoppm or Pillow here)")
-    else:
-        from PIL import Image, ImageDraw
-        pages = []
-        for i in range(3):
-            im = Image.new("RGB", (1240, 1754), (255, 255, 255))
-            ImageDraw.Draw(im).text((80, 80), f"PAGE {i + 1}", fill=(0, 0, 0))
-            pages.append(im)
-        pdf = WORK / "notice.pdf"
-        pages[0].save(pdf, "PDF", save_all=True, append_images=pages[1:])
-        produced, problem = ingest.convert(pdf)
-        check("a PDF converts", not problem, problem)
-        # Every page, not just the first: half a notice on a wall with no clue
-        # why is worse than refusing it.
-        check("every page becomes an image", len(produced) == 3,
-              str([p.name for p in produced]))
-        check("the original is removed", not pdf.exists())
-        if produced:
-            size = sized(produced[0])
-            # Scaled to the display's height. Fitting the width instead makes a
-            # portrait A4 ~2700px tall — taller than the screen it is going on.
-            check(f"a portrait page fits the screen {size}",
-                  size and size[0] <= 1920 and size[1] <= 1080, str(size))
-            check("pages are in order",
-                  [p.name for p in produced] == sorted(p.name for p in produced))
-
-    print("\ntext")
-    if not have["text"]:
-        print("  (skipping — no Pillow here)")
-    else:
-        txt = WORK / "notice.txt"
-        txt.write_text("Fire exit is via the rear door.\n\n" + ("word " * 900))
-        produced, problem = ingest.convert(txt)
-        check("text converts", not problem and produced, problem)
-        check("long text paginates", len(produced) > 1,
-              str([p.name for p in produced]))
-        check("pages are display-sized",
-              all(sized(p) == (ingest.PAGE_W, ingest.PAGE_H) for p in produced))
-        check("the original is removed", not txt.exists())
-
-        empty = WORK / "empty.txt"
-        empty.write_text("")
-        produced, problem = ingest.convert(empty)
-        check("an empty file still makes a page", not problem and produced, problem)
-
-    print("\nwhen a tool is missing")
-    real = shutil.which
-    shutil.which = lambda _n: None
-    ingest._ffmpeg_has_heif.__defaults__ = None
-    missing = WORK / "x.pdf"
-    missing.write_bytes(b"%PDF-1.4 not really")
-    produced, problem = ingest.convert(missing)
-    shutil.which = real
-    # The upload is kept and the reason is actionable, rather than a silent
-    # failure or a lost file.
-    check("it refuses rather than losing the file", missing.exists())
-    check("...and names the package to install", "poppler-utils" in problem, problem)
-    check("...and produces nothing", not produced)
 
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     shutil.rmtree(TMP, ignore_errors=True)

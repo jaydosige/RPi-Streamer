@@ -30,8 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
-from . import (airplay, config, display, favourites, guest, media, mpvipc,
-               playlists, preview, sources, syncplay)
+from . import (airplay, config, display, documents, favourites, guest,
+               media, mpvipc, playlists, preview, sources, syncplay)
 
 log = logging.getLogger(__name__)
 
@@ -531,6 +531,49 @@ class Player:
             refresh=int(refresh) if refresh else None,
         )
 
+    def _document_command(self, cfg: config.Config, path: Path) -> List[str]:
+        """Show a document by handing mpv its pages as a playlist.
+
+        Rasterised at playback rather than at upload, so the library keeps one
+        entry per document instead of one per page. The playlist is what makes
+        paging free: next, previous and jump-to-page are mpv commands over the
+        socket that is already open, and mpv reports which entry it is on, so
+        "page 4 of 12" needs no bookkeeping on this side.
+        """
+        pages, problem = documents.pages(path)
+        if problem:
+            raise RuntimeError(problem)
+        if not pages:
+            raise RuntimeError(f"{path.name} has no pages to show")
+        # inf holds each page until somebody turns it, which is what a document
+        # is for. A dwell turns it into a slideshow instead.
+        dwell = "inf" if cfg.document_dwell_s <= 0 else str(cfg.document_dwell_s)
+        cmd = [c for c in self._mpv_base(cfg, 10)
+               if not c.startswith("--image-display-duration=")]
+        cmd.append(f"--image-display-duration={dwell}")
+        if cfg.loop:
+            cmd.append("--loop-playlist=inf")
+        cmd.append("--")
+        cmd += [str(p) for p in pages]
+        return cmd
+
+    def turn_page(self, to: str = "next") -> Dict[str, Any]:
+        """Move through the document on screen. "next", "prev", or a number."""
+        sock = str(mpv_socket())
+        if to == "next":
+            mpvipc.command(sock, "playlist-next", "force")
+        elif to in ("prev", "previous"):
+            mpvipc.command(sock, "playlist-prev", "force")
+        else:
+            try:
+                index = max(1, int(to))
+            except (TypeError, ValueError):
+                raise ValueError(f"not a page: {to}")
+            mpvipc.command(sock, "set_property", "playlist-pos", index - 1)
+        state = mpvipc.query(sock, ["playlist-pos-1", "playlist-count"])
+        return {"page": state.get("playlist-pos-1"),
+                "pages": state.get("playlist-count")}
+
     def _local_command(self, cfg: config.Config, selection: str) -> List[str]:
         # A named playlist wins over a single file or the whole folder, and
         # brings its own loop/shuffle/dwell settings with it.
@@ -925,6 +968,11 @@ class Player:
         if mode == MODE_LOCAL:
             if not shutil.which("mpv"):
                 raise RuntimeError("mpv not installed")
+            if target and documents.is_document(target):
+                resolved = media.resolve(target)
+                if resolved is None:
+                    raise RuntimeError(f"no such document: {target}")
+                return self._document_command(cfg, resolved)
             return self._local_command(cfg, target)
         if mode == MODE_WEB:
             if not target:
