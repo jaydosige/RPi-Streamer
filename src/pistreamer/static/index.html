@@ -310,6 +310,35 @@
   .chip.err { background: rgba(229, 84, 75, .14); color: #f2a29c; border-color: transparent; }
   .chip[title] { cursor: help; }
 
+  /* Preview. Sized by aspect-ratio rather than a fixed height so a 4:3 or
+     vertical source is not letterboxed into a 16:9 hole. */
+  .preview-frame {
+    position: relative; width: 100%; aspect-ratio: 16 / 9;
+    background: #000; border: 1px solid var(--line); border-radius: 10px;
+    overflow: hidden; display: flex; align-items: center; justify-content: center;
+  }
+  .preview-frame img {
+    width: 100%; height: 100%; object-fit: contain; display: block;
+  }
+  .preview-frame .placeholder {
+    color: var(--muted); font-size: 13.5px; text-align: center;
+    padding: 20px; max-width: 42ch; line-height: 1.5;
+  }
+  .preview-frame.stale img { opacity: .45; transition: opacity var(--slow) var(--ease); }
+  .preview-age {
+    position: absolute; right: 8px; bottom: 8px;
+    background: rgba(0,0,0,.6); color: #cfd6e4; border-radius: 6px;
+    padding: 3px 7px; font-size: 11px; font-family: var(--mono);
+  }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button {
+    background: var(--panel-3); color: var(--muted); border: 0;
+    padding: 7px 13px; font-size: 13px; font-weight: 600; cursor: pointer;
+    font-family: inherit;
+  }
+  .seg button + button { border-left: 1px solid var(--line); }
+  .seg button.on { background: var(--accent); color: #fff; }
+
   label.field { display: block; margin-bottom: 13px; }
   label.field .lbl { display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }
   input[type=text]:focus, input[type=number]:focus, select:focus,
@@ -634,6 +663,21 @@
         <button class="btn danger" id="btnStop">Stop output</button>
       </div>
     </div>
+    <div class="card" id="previewCard">
+      <h2>Preview</h2>
+      <div class="row" style="margin-bottom:12px">
+        <span class="seg" id="previewRates">
+          <button data-rate="off">Off</button>
+          <button data-rate="slow">Slow</button>
+          <button data-rate="fast">Fast</button>
+        </span>
+        <span class="host" id="previewNote"></span>
+      </div>
+      <div class="preview-frame" id="previewFrame">
+        <div class="placeholder" id="previewPlaceholder">Preview is off.</div>
+      </div>
+    </div>
+
     <div class="cols">
       <div class="card">
         <h2>Stream</h2>
@@ -1577,6 +1621,9 @@ document.querySelectorAll("nav button").forEach((btn) => {
     btn.classList.add("active");
     $("tab-" + btn.dataset.tab).classList.add("active");
     const tab = btn.dataset.tab;
+    // Returning to Now Playing resumes capture; leaving it lets the request
+    // age out on the node a few seconds later.
+    if (tab === "now") previewTick();
     if (tab === "media") {
       loadMedia(); loadPlaylists(); loadSchedule(); loadGuest();
       // Rejoin a conversion that was started before this tab was last left.
@@ -3977,6 +4024,125 @@ async function loadAccess() {
   $("btnRunSetup").onclick = () => openWizard();
 }
 
+// ---------- preview ----------
+//
+// The node captures only while somebody is asking, and each request for a
+// frame is what says so. That has two consequences worth knowing: leaving this
+// page stops capture within a few seconds without anything being pressed, and
+// the choice below is about what you want to watch rather than about protecting
+// the node from you.
+//
+// Frames are fetched one at a time, each request issued only when the previous
+// one has landed. A fixed interval would queue requests up behind a slow one
+// and the preview would fall progressively further behind real time.
+
+let PREVIEW_RATE = localStorage.getItem("previewRate") || "off";
+let PREVIEW_TIMER = null;
+let PREVIEW_BUSY = false;
+let PREVIEW_URL = null;
+
+function previewIntervalMs() {
+  return PREVIEW_RATE === "fast" ? 1000 : PREVIEW_RATE === "slow" ? 5000 : 0;
+}
+
+function setPreviewRate(rate) {
+  PREVIEW_RATE = rate;
+  try { localStorage.setItem("previewRate", rate); } catch (_) { /* private mode */ }
+  document.querySelectorAll("#previewRates button").forEach((b) =>
+    b.classList.toggle("on", b.dataset.rate === rate));
+  if (PREVIEW_TIMER) { clearTimeout(PREVIEW_TIMER); PREVIEW_TIMER = null; }
+  if (rate === "off") {
+    // Tell the node now rather than letting the request age out, so capture
+    // stops the moment the button is pressed.
+    fetch("/api/preview/stop", { method: "POST" }).catch(() => {});
+    showPreviewPlaceholder("Preview is off.");
+    $("previewNote").textContent = "";
+    return;
+  }
+  previewTick();
+}
+
+function showPreviewPlaceholder(text) {
+  const frame = $("previewFrame");
+  if (!frame) return;
+  if (PREVIEW_URL) { URL.revokeObjectURL(PREVIEW_URL); PREVIEW_URL = null; }
+  frame.classList.remove("stale");
+  frame.innerHTML = `<div class="placeholder">${esc(text)}</div>`;
+}
+
+async function previewTick() {
+  if (PREVIEW_RATE === "off" || PREVIEW_BUSY) return;
+  // Nothing to look at while the gate is up or another tab is showing.
+  if (activeTab() !== "now" || document.hidden) {
+    PREVIEW_TIMER = setTimeout(previewTick, 1000);
+    return;
+  }
+  PREVIEW_BUSY = true;
+  try {
+    const res = await fetch(`/api/preview?rate=${encodeURIComponent(PREVIEW_RATE)}`,
+                            { cache: "no-store" });
+    if (res.status === 409) {
+      // This source cannot be captured; the node says why.
+      let why = "This source cannot be previewed.";
+      try { why = (await res.json()).detail || why; } catch (_) {}
+      showPreviewPlaceholder(why);
+      $("previewNote").textContent = "";
+    } else if (res.status === 404) {
+      showPreviewPlaceholder("Waiting for the first frame…");
+    } else if (res.status === 503) {
+      /* a torn frame; keep the one on screen and try again */
+    } else if (res.ok) {
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const frame = $("previewFrame");
+      let img = frame.querySelector("img");
+      if (!img) { frame.innerHTML = ""; img = document.createElement("img"); frame.appendChild(img); }
+      img.onload = () => { if (PREVIEW_URL) URL.revokeObjectURL(PREVIEW_URL); PREVIEW_URL = url; };
+      img.src = url;
+      frame.classList.remove("stale");
+      $("previewNote").textContent =
+        `${(blob.size / 1024).toFixed(0)} KB per frame · ` +
+        (PREVIEW_RATE === "fast" ? "about once a second" : "every 5 seconds");
+    } else {
+      showPreviewPlaceholder("Preview unavailable.");
+    }
+  } catch (_) {
+    // The node went away; dim what is there rather than clearing it, so a
+    // blip does not look like the output stopping.
+    const frame = $("previewFrame");
+    if (frame && frame.querySelector("img")) frame.classList.add("stale");
+  } finally {
+    PREVIEW_BUSY = false;
+    if (PREVIEW_RATE !== "off") {
+      PREVIEW_TIMER = setTimeout(previewTick, previewIntervalMs());
+    }
+  }
+}
+
+document.querySelectorAll("#previewRates button").forEach((b) => {
+  b.onclick = () => setPreviewRate(b.dataset.rate);
+});
+
+// A hidden tab is not a viewer. Without this a laptop lid closed on the Now
+// Playing tab keeps a node capturing all night.
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && PREVIEW_RATE !== "off") {
+    fetch("/api/preview/stop", { method: "POST" }).catch(() => {});
+  } else if (!document.hidden && PREVIEW_RATE !== "off") {
+    previewTick();
+  }
+});
+
+async function loadPreviewState() {
+  try {
+    const st = await api("/api/preview/state");
+    if (!st.tmpfs) {
+      $("previewNote").textContent =
+        "frames are being written to the SD card — no tmpfs was found";
+    }
+  } catch (_) { /* best effort */ }
+}
+
 // ---------- favourites, web pages and streams ----------
 
 const FAV_KIND_LABEL = { web: "page", stream: "stream" };
@@ -4297,6 +4463,8 @@ async function netAction(what, into, box) {
 
 // Ask what we are before drawing anything: a locked node should show its login
 // rather than a console full of "unreachable".
+setPreviewRate(PREVIEW_RATE);
+loadPreviewState();
 checkAuth().then(() => {
   poll();
   pollTimer = setInterval(poll, 2000);

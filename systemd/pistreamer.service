@@ -45,6 +45,12 @@ RestartSec=3
 KillMode=control-group
 TimeoutStopSec=20
 
+# /run/pistreamer, on tmpfs, created and torn down with the unit. Preview
+# frames go here rather than the state directory: a JPEG a second on the SD
+# card is gigabytes of writes a day, and flash wears out on writes.
+RuntimeDirectory=pistreamer
+RuntimeDirectoryMode=0755
+
 # Modest hardening. Not a sandbox — the service legitimately touches
 # /dev/dri, /dev/snd and the media directory.
 NoNewPrivileges=yes

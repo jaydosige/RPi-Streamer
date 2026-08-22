@@ -226,6 +226,22 @@ def main() -> int:
           plain.post("/api/config",
                      json={"stream_cache_s": 99}).status_code == 400)
 
+    print("\nthe preview is behind the login")
+    # It shows whatever is on the screen, so it is operator information — it
+    # must not be reachable by the room the way guest sharing is.
+    auth.set_password("jayden", "a decent passphrase")
+    config.update(auth_enabled=True, setup_complete=True)
+    locked = TestClient(app)
+    check("a stranger cannot see the preview",
+          locked.get("/api/preview").status_code == 401)
+    check("...nor its state", locked.get("/api/preview/state").status_code == 401)
+    check("...nor stop someone else's",
+          locked.post("/api/preview/stop").status_code == 401)
+    check("guest sharing is still open beside it",
+          locked.get("/s/tok/status").status_code != 401)
+    auth.disable()
+    config.update(auth_enabled=False)
+
     print(f"\n{len(PASS)} passed, {len(FAIL)} failed")
     shutil.rmtree(TMP, ignore_errors=True)
     if FAIL:

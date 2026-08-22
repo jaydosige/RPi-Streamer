@@ -446,6 +446,15 @@ class Runner:
                 raise PipelineError("could not link tee -> display sink")
             self._build_snapshot_branch(pipeline, tee, snapshot_path,
                                         int(spec.get("snapshot_interval_s", 3)))
+        preview_path = spec.get("preview_path")
+        if preview_path and tee is not None:
+            # Its own branch rather than a faster lastframe: standby holds the
+            # last frame full-screen and wants full resolution, while a preview
+            # wants to be small and frequent. One branch cannot be both.
+            self._build_preview_branch(
+                pipeline, tee, preview_path,
+                str(spec.get("preview_rate_path") or ""),
+                int(spec.get("preview_width", 640)))
         else:
             if not elements[-1].link(sink):
                 raise PipelineError("could not link video chain -> sink")
@@ -508,6 +517,78 @@ class Runner:
                 raise PipelineError(f"snapshot branch: {a.get_name()} -> {b.get_name()}")
         if not tee.link(queue):
             raise PipelineError("could not link tee -> snapshot branch")
+
+    def _build_preview_branch(self, pipeline, tee, path: str, rate_path: str,
+                              width: int) -> None:
+        """tee -> leaky queue -> scale down -> JPEG -> one file, overwritten.
+
+        Separate from the snapshot branch and gated independently, because the
+        two want opposite things: the snapshot is full-size and rare, this is
+        small and as often as somebody is actually looking.
+
+        The gate closure reads `self._preview_interval` on every buffer, and a
+        timer re-reads it from a file, so the rate follows demand without the
+        pipeline being rebuilt. Rebuilding it would mean a black frame every
+        time somebody opened the preview, which is a strange way to reassure
+        them that watching costs nothing.
+        """
+        self._preview_interval = 0.0   # 0 = nobody watching, drop everything
+        self._preview_rate_path = rate_path
+        self._last_preview = 0.0
+
+        queue = make("queue", "prevq")
+        set_prop(queue, "leaky", LEAKY_DOWNSTREAM)
+        set_prop(queue, "max-size-buffers", 1)
+        set_prop(queue, "max-size-time", 0)
+        set_prop(queue, "max-size-bytes", 0)
+
+        def gate(_pad, info):
+            interval = self._preview_interval
+            if interval <= 0:
+                return Gst.PadProbeReturn.DROP
+            now = time.monotonic()
+            if now - self._last_preview < interval:
+                return Gst.PadProbeReturn.DROP
+            self._last_preview = now
+            return Gst.PadProbeReturn.OK
+
+        queue.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, gate)
+
+        convert = make("videoconvert", "prevconvert")
+        scale = make("videoscale", "prevscale")
+        # Nearest neighbour: this is a thumbnail, and the cheapest scaler is
+        # the right one when the output is 640 pixels wide.
+        set_prop(scale, "method", 0)
+        caps = make("capsfilter", "prevcaps")
+        # Height is left free so any aspect ratio is preserved.
+        set_prop(caps, "caps",
+                 Gst.Caps.from_string(f"video/x-raw,width={int(width)}"))
+        enc = make("jpegenc", "prevenc")
+        set_prop(enc, "quality", 70)
+        sink = make("multifilesink", "prevsink")
+        set_prop(sink, "location", path)
+        set_prop(sink, "sync", False)
+        set_prop(sink, "async", False)
+        if sink.find_property("post-messages") is not None:
+            set_prop(sink, "post-messages", False)
+
+        chain = [queue, convert, scale, caps, enc, sink]
+        for element in chain:
+            pipeline.add(element)
+        for a, b in zip(chain, chain[1:]):
+            if not a.link(b):
+                raise PipelineError(f"preview branch: {a.get_name()} -> {b.get_name()}")
+        if not tee.link(queue):
+            raise PipelineError("could not link tee -> preview branch")
+
+    def _poll_preview_rate(self) -> bool:
+        """Follow the rate the service is asking for. Absent file means off."""
+        try:
+            with open(self._preview_rate_path, "r", encoding="utf-8") as fh:
+                self._preview_interval = max(0.0, float(fh.read(32).strip() or 0))
+        except (OSError, ValueError):
+            self._preview_interval = 0.0
+        return True
 
     def _build_audio_chain(self, pipeline):
         spec = self.spec
@@ -973,6 +1054,9 @@ class Runner:
             # that is already being identified when its pipeline restarts comes
             # up with the caption instead of half a second without it.
             self._poll_overlay()
+        if getattr(self, "_preview_rate_path", ""):
+            GLib.timeout_add(OVERLAY_POLL_MS, self._poll_preview_rate)
+            self._poll_preview_rate()
         if self._image_overlay is not None:
             GLib.timeout_add(OVERLAY_POLL_MS, self._poll_image_overlay)
             # Same for the guest panel: sharing that was open before a source

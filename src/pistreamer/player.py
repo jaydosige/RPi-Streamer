@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
 from . import (airplay, config, display, favourites, guest, media, mpvipc,
-               playlists, sources, syncplay)
+               playlists, preview, sources, syncplay)
 
 log = logging.getLogger(__name__)
 
@@ -663,6 +663,12 @@ class Player:
             # gets auto-loaded as an extra track. Play only what we asked for.
             "--audio-file-auto=no",
             "--sub-auto=no",
+            # Preview frames go out over whatever Wi-Fi the GUI is reached on.
+            # mpv writes a screenshot at the video's own size — there is no
+            # scale option for it — so quality is the only lever on how big
+            # they land, and 70 is indistinguishable in a thumbnail.
+            "--screenshot-format=jpg",
+            "--screenshot-jpeg-quality=70",
             f"--image-display-duration={image_duration}",
             # The identify caption, applied at birth rather than pushed in
             # afterwards. The IPC push still happens (see _sync_overlay) so a
@@ -750,6 +756,12 @@ class Player:
             "url_address": cfg.ndi_url_address,
             "snapshot_path": str(snapshot_path()) if cfg.snapshot_enabled else None,
             "snapshot_interval_s": cfg.snapshot_interval_s,
+            # Always wired up; it captures nothing until somebody is watching,
+            # and building it lazily would mean a pipeline restart — a black
+            # frame — the first time anyone opened the preview.
+            "preview_path": str(preview.frame_path()),
+            "preview_rate_path": str(preview.rate_path()),
+            "preview_width": preview.WIDTH,
             "overlay_file": str(overlay_path()),
             "image_overlay_file": str(guest.overlay_png_path()),
         }
@@ -1360,6 +1372,30 @@ class Player:
             f"{time.strftime('%H:%M:%S')} · released on the beat "
             f"({(time.time() - at) * 1000:+.1f}ms)"
         )
+
+    def capture_preview(self) -> bool:
+        """Take one preview frame from an mpv-backed source.
+
+        The GStreamer runner captures on its own, from a branch of the pipeline
+        it is already running. mpv has no such branch, but it will take a
+        screenshot on request over the IPC socket that is already open for
+        seeking and speed nudges, so a preview costs one round trip and only
+        when a frame is actually wanted.
+
+        `video` rather than the default: it captures the decoded frame without
+        subtitles or OSD, so the identify caption and the guest QR panel do not
+        end up baked into the preview.
+        """
+        if self._status.mode not in (MODE_LOCAL, MODE_STREAM):
+            return False
+        try:
+            result = mpvipc.command(
+                str(mpv_socket()), "screenshot-to-file",
+                str(preview.frame_path()), "video", timeout=3.0)
+        except Exception as exc:  # noqa: BLE001 - a missed frame is not news
+            log.debug("preview capture failed: %s", exc)
+            return False
+        return bool(result) and result.get("error") in (None, "success")
 
     def sync_position(self) -> Optional[float]:
         """This node's playhead, asked for fresh rather than from the cache."""

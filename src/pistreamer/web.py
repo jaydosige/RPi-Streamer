@@ -15,13 +15,14 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Union
 
 from fastapi import Body, FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, Field
 
 from . import (airplay, auth, cluster, config, diagnose, display, favourites,
-               guest, media, ndiconfig, network, playlists, pushjob,
+               guest, media, ndiconfig, network, playlists, preview,
+               pushjob,
                schedule as schedule_mod, sources, syncplay, system, transcode,
                updates)
 from .player import (MODE_AIRPLAY, MODE_IDLE, MODE_LOCAL, MODE_NDI,
@@ -531,6 +532,66 @@ async def get_snapshot() -> FileResponse:
     if not path.is_file():
         raise HTTPException(404, "no snapshot captured yet")
     return FileResponse(path, media_type="image/jpeg")
+
+
+# ----------------------------------------------------------------------
+# Preview
+#
+# Capture follows demand: asking for a frame is what keeps capture running, and
+# when nobody has asked for a few seconds it stops on its own. So a browser
+# that navigates away, sleeps or is closed costs nothing without anybody having
+# to remember a toggle.
+# ----------------------------------------------------------------------
+
+
+@app.get("/api/preview")
+async def get_preview(rate: str = preview.DEFAULT_RATE) -> Response:
+    """One preview frame, and a standing request for the next.
+
+    The GET is the heartbeat. Making it a separate call would mean a browser
+    that died between the two left capture running until it timed out.
+    """
+    mode = player.status().get("mode", "")
+    supported, reason = preview.supports(mode)
+    if not supported:
+        preview.release()
+        raise HTTPException(409, reason)
+
+    preview.request(rate)
+    # mpv has no capture branch of its own, so ask it for a frame now. The
+    # GStreamer runner is already producing them off its own pipeline.
+    await asyncio.get_running_loop().run_in_executor(None, player.capture_preview)
+
+    path = preview.frame_path()
+    if not path.is_file():
+        raise HTTPException(404, "no preview frame captured yet")
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise HTTPException(503, f"could not read the preview: {exc}") from exc
+    # multifilesink rewrites in place, so a read can land mid-write. A torn
+    # JPEG renders as a grey band in the browser; skipping it shows the
+    # previous frame for another beat instead, which nobody notices.
+    if not (data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9"):
+        raise HTTPException(503, "frame was being written; try again")
+    return Response(
+        content=data, media_type="image/jpeg",
+        # Frames share a URL and change constantly. Without this a browser
+        # shows the first one for ever and the preview looks frozen.
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
+@app.get("/api/preview/state")
+async def get_preview_state() -> Dict[str, Any]:
+    return preview.summary(player.status().get("mode", ""))
+
+
+@app.post("/api/preview/stop")
+async def post_preview_stop() -> Dict[str, Any]:
+    """Give up the preview at once rather than waiting for it to age out."""
+    preview.release()
+    return preview.summary(player.status().get("mode", ""))
 
 
 @app.get("/api/diagnose")
