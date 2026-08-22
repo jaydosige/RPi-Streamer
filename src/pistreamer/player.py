@@ -70,6 +70,12 @@ _AIRPLAY_LISTEN_TIMEOUT = 10.0
 # and restarting it will do exactly the same thing.
 _AIRPLAY_FAST_FAIL = 3.0
 _AIRPLAY_FAST_FAIL_LIMIT = 3
+# Same for the browser. Chromium refusing its ozone platform dies in well
+# under a second and will do so identically for ever; restarting it every few
+# seconds for the rest of the evening helps nobody and buries the one line
+# that says why.
+_WEB_FAST_FAIL = 3.0
+_WEB_FAST_FAIL_LIMIT = 3
 # Supervisor tick. Fast enough that a segment change is not visibly late —
 # at 1s a playlist transition could sit black for most of a second.
 _TICK = 0.25
@@ -397,6 +403,8 @@ class Player:
         # Consecutive AirPlay receivers that died before they could work.
         self._airplay_fast_fails = 0
         self._airplay_stuck = False
+        self._web_fast_fails = 0
+        self._web_stuck = False
         # What has actually been pushed into the running mpv, so the poller can
         # tell a change from a repeat.
         self._mpv_caption: Optional[str] = None
@@ -538,8 +546,22 @@ class Player:
             "--check-for-update-interval=31536000",
             "--autoplay-policy=no-user-gesture-required",
             f"--user-data-dir={config.STATE_DIR / 'chromium'}",
-            "--ozone-platform=drm",
         ]
+        # Chromium needs something to draw onto. Debian builds it with the
+        # x11, wayland and headless ozone backends and NOT drm, so asking for
+        # drm is fatal — "Invalid ozone platform: drm" before a single frame,
+        # on repeat, which is what a node doing nothing but restarting a
+        # browser looks like from the outside.
+        #
+        # There is no X or Wayland on this box, so one is supplied: cage is a
+        # kiosk compositor that puts exactly one window full screen straight
+        # onto KMS. Direct drm is kept for a build that does have it.
+        wrapper: List[str] = []
+        if shutil.which("cage"):
+            wrapper = ["cage", "--"]
+            cmd.append("--ozone-platform=wayland")
+        else:
+            cmd.append("--ozone-platform=drm")
         if cfg.web_interactive:
             # Ozone's DRM backend reads /dev/input directly — the service is in
             # the `input` group for exactly this — so a keyboard, mouse or
@@ -559,7 +581,27 @@ class Player:
         # Everything after this is a positional argument, never a switch.
         cmd.append("--")
         cmd.append(url)
-        return cmd
+        return wrapper + cmd
+
+    def browser_plan(self, cfg: config.Config) -> Dict[str, Any]:
+        """How a web page would be put on screen, and whether it can be."""
+        browser = next((b for b in ("chromium-browser", "chromium",
+                                    "chromium-browser-stable")
+                        if shutil.which(b)), None)
+        cage = shutil.which("cage")
+        if browser is None:
+            return {"ok": False, "browser": None, "compositor": None,
+                    "reason": "chromium is not installed"}
+        if cage:
+            return {"ok": True, "browser": browser, "compositor": "cage",
+                    "reason": ""}
+        return {
+            "ok": False, "browser": browser, "compositor": None,
+            "reason": ("chromium has nothing to draw onto. Debian builds it "
+                       "without the DRM backend, and there is no desktop here, "
+                       "so it needs a kiosk compositor: "
+                       "'sudo apt install cage'."),
+        }
 
     def _stream_command(self, cfg: config.Config, url: str) -> List[str]:
         """Play a live stream — HLS, DASH, UDP/RTP multicast, RTSP, SRT.
@@ -1054,6 +1096,13 @@ class Player:
 
         env = dict(os.environ)
         env.setdefault("GST_DEBUG", "1")
+        # cage is a Wayland compositor and refuses to start without somewhere
+        # to put its socket. A system service gets no XDG_RUNTIME_DIR, so it is
+        # pointed at the unit's own RuntimeDirectory — which is on tmpfs, owned
+        # by this user, and created and removed with the service.
+        if cmd and cmd[0] == "cage":
+            env.setdefault("XDG_RUNTIME_DIR", str(config.runtime_dir()))
+            env.setdefault("WLR_BACKENDS", "drm")
 
         proc = subprocess.Popen(  # noqa: S603 - argv list, never shell=True
             cmd,
@@ -1483,6 +1532,32 @@ class Player:
         return (f"the AirPlay receiver would not stay up ({detail}). "
                 "Fix that and press Start receiving again.")
 
+    def _web_exit_reason(self, proc: subprocess.Popen) -> str:
+        """Did the browser die of its configuration rather than bad luck?
+
+        `player exited with code -6` is true and useless. Chromium puts the
+        real reason on its own output, which has already been read, so hand
+        that over — and after a few of these, stop. The node in the bundle that
+        prompted this had restarted the same fatal eleven times in four
+        minutes, with the one line that explained it scrolled off the top.
+        """
+        ran_for = time.time() - (self._status.since or time.time())
+        if ran_for >= _WEB_FAST_FAIL:
+            self._web_fast_fails = 0
+            return ""
+        self._web_fast_fails += 1
+        if self._web_fast_fails < _WEB_FAST_FAIL_LIMIT:
+            return ""
+        self._web_stuck = True
+        fatal = [l for l in list(self._logs)[-12:]
+                 if "FATAL" in l or "Invalid ozone platform" in l]
+        if any("Invalid ozone platform" in l for l in fatal):
+            # By far the most likely one, and unguessable from the exit code.
+            return self.browser_plan(config.load())["reason"] or (
+                "chromium has no backend it can draw with here")
+        detail = fatal[-1][-160:] if fatal else f"it exited with {proc.returncode}"
+        return f"the browser would not stay up ({detail})."
+
     def _check_airplay_startup(self) -> None:
         """A receiver that is up but not listening is not working.
 
@@ -1653,10 +1728,19 @@ class Player:
                         self._status.running = False
                         self._proc = None
                         return
+                if mode == MODE_WEB and not self._fallback:
+                    reason = self._web_exit_reason(proc)
+                    if reason:
+                        self._status.last_error = reason
+                        self._status.running = False
+                        self._proc = None
+                        return
             self._status.running = False
             self._proc = None
 
             if mode == MODE_AIRPLAY and self._airplay_stuck:
+                return
+            if mode == MODE_WEB and self._web_stuck:
                 return
 
             if mode == MODE_IDLE:

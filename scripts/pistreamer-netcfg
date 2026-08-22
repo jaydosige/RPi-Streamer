@@ -364,26 +364,47 @@ def act_hostname(req):
 
 
 def act_install_chromium(_req):
-    """Install the browser the web page source needs.
+    """Install what the web page source needs: a browser AND a compositor.
+
+    Both, because either alone is useless here. Debian builds chromium without
+    the DRM ozone backend, so on a box with no desktop it has nothing to draw
+    onto and dies at startup; cage is a kiosk compositor that gives it one.
 
     No package name crosses the boundary — the action itself is the whole
     request. The thing writing it is a web GUI on an event network, and
     "install this package for me" with a name attached is a remote root shell
     with extra steps.
     """
-    if shutil.which("chromium") or shutil.which("chromium-browser"):
-        return True, {"already": True}, "chromium is already installed"
+    have_browser = bool(shutil.which("chromium") or shutil.which("chromium-browser"))
+    have_cage = bool(shutil.which("cage"))
+    if have_browser and have_cage:
+        return True, {"already": True}, "chromium and cage are already installed"
+
     env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
     code, _out, err = subprocess_env(["apt-get", "update"], env, 300)
     if code != 0:
         return False, {}, f"apt-get update failed: {err[:200]}"
-    for package in ("chromium", "chromium-browser"):
+
+    wanted = []
+    if not have_browser:
+        wanted.append("chromium")
+    if not have_cage:
+        wanted.append("cage")
+    code, _out, err = subprocess_env(
+        ["apt-get", "install", "-y", "--no-install-recommends"] + wanted, env, 1800)
+    if code != 0 and not have_browser:
+        # Older archives call it chromium-browser.
         code, _out, err = subprocess_env(
-            ["apt-get", "install", "-y", "--no-install-recommends", package],
-            env, 1800)
-        if code == 0 and (shutil.which("chromium") or shutil.which("chromium-browser")):
-            return True, {"package": package}, f"installed {package}"
-    return False, {}, f"could not install chromium: {err[:200]}"
+            ["apt-get", "install", "-y", "--no-install-recommends",
+             "chromium-browser"] + ([] if have_cage else ["cage"]), env, 1800)
+
+    have_browser = bool(shutil.which("chromium") or shutil.which("chromium-browser"))
+    have_cage = bool(shutil.which("cage"))
+    if have_browser and have_cage:
+        return True, {"packages": wanted}, "installed " + " and ".join(wanted)
+    missing = [n for n, ok in (("chromium", have_browser), ("cage", have_cage))
+               if not ok]
+    return False, {}, f"could not install {', '.join(missing)}: {err[:200]}"
 
 
 def subprocess_env(args, env, timeout):

@@ -4254,7 +4254,8 @@ async function loadBrowserState() {
           ? "keyboard, mouse and touch reach the page"
           : "input reaches the page; gestures are disabled")
       : "input devices are NOT readable — the service is not in the 'input' group";
-    box.innerHTML = `<span class="host">Browser: ${esc(b.command)} &middot; ${
+    box.innerHTML = `<span class="host">Browser: ${esc(b.command)}${
+      b.compositor ? " under " + esc(b.compositor) : ""} &middot; ${
       esc(touch)}</span>`;
     if (BROWSER_POLL) { clearInterval(BROWSER_POLL); BROWSER_POLL = null; }
     return;
@@ -4268,11 +4269,12 @@ async function loadBrowserState() {
   }
   const failed = b.last && b.last.ok === false ? b.last.message : "";
   box.innerHTML = `
-    <div class="banner warn">Chromium is not installed, so web pages cannot be
-      shown yet.</div>
+    <div class="banner warn">${esc(b.reason ||
+      "Web pages cannot be shown yet.")}</div>
     ${failed ? `<div class="banner">${esc(failed)}</div>` : ""}
     <button class="btn primary" id="btnInstallBrowser"${
-      b.can_install ? "" : " disabled"}>Install chromium</button>
+      b.can_install ? "" : " disabled"}>${
+      b.browser_present ? "Install the missing piece" : "Install chromium"}</button>
     ${b.can_install ? "" : `<span class="host">the root helper is not installed
       — re-run install.sh</span>`}`;
   const btn = $("btnInstallBrowser");

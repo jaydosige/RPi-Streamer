@@ -10,7 +10,11 @@ User=pistreamer
 Group=pistreamer
 # video/render: DRM master and V4L2 hardware decode.
 # audio: ALSA. dialout is not needed.
-SupplementaryGroups=video render audio tty input
+# systemd-journal so the support bundle can include this service's own log.
+# Without it the most useful section of a diagnostic bundle reads "No journal
+# files were opened due to insufficient permissions", which was exactly what
+# the first real bundle came back with.
+SupplementaryGroups=video render audio tty input systemd-journal
 
 WorkingDirectory=/opt/pistreamer
 Environment=PYTHONUNBUFFERED=1

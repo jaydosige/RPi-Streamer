@@ -77,8 +77,14 @@ ok "Base packages ready"
 # cannot show a dashboard until somebody SSHes in is worse than a slightly
 # bigger image. Optional like uxplay: its absence is not a failed install, and
 # the GUI offers to add it later.
-if apt_install chromium 2>/dev/null || apt_install chromium-browser 2>/dev/null; then
-  ok "Web page source available (chromium)"
+# cage is what chromium draws onto. Debian builds chromium with the x11,
+# wayland and headless ozone backends and NOT drm, so on a box with no desktop
+# it has no way to reach the screen at all — "Invalid ozone platform: drm",
+# fatal, on repeat. cage is a kiosk compositor that puts one window full screen
+# straight onto KMS, and is about a hundred kilobytes.
+if apt_install chromium cage 2>/dev/null \
+   || apt_install chromium-browser cage 2>/dev/null; then
+  ok "Web page source available (chromium under cage)"
 else
   warn "chromium is not in this distribution's archive, so the web page source"
   warn "will be unavailable until it is installed. The GUI has a button for it."

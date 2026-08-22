@@ -1007,11 +1007,11 @@ async def play_shader(body: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
 
 
 def _browser_ready() -> tuple[bool, str]:
-    if next((b for b in ("chromium-browser", "chromium",
-                         "chromium-browser-stable") if shutil.which(b)), None):
+    plan = player.browser_plan(config.load())
+    if plan["ok"]:
         return True, ""
-    return False, ("a shader is drawn by the browser, which is not installed "
-                   "yet — the Web page card has a button for it")
+    return False, (f"a shader is drawn by the browser, which cannot run here "
+                   f"yet: {plan['reason']}")
 
 
 @app.get("/api/web/browser")
@@ -1023,12 +1023,17 @@ async def get_browser() -> Dict[str, Any]:
     backend cannot do that however well it runs on a desktop. Same lesson as
     the encoder that was listed but could not encode.
     """
-    found = next((b for b in ("chromium-browser", "chromium",
-                              "chromium-browser-stable") if shutil.which(b)), None)
     last = network.result()
     cfg = config.load()
+    plan = player.browser_plan(cfg)
+    found = plan["browser"]
     return {
-        "installed": bool(found),
+        # Installed is not the same as usable: without a compositor chromium
+        # has nothing to draw onto here and dies at startup.
+        "installed": bool(plan["ok"]),
+        "browser_present": bool(found),
+        "compositor": plan["compositor"],
+        "reason": plan["reason"],
         "command": found or "",
         "can_install": network.available()[0],
         "busy": network.busy(),

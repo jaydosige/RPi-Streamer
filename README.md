@@ -474,16 +474,17 @@ and AirPlay are one-way by definition.
 Two things worth checking on the node itself, because neither can be checked
 from anywhere else:
 
-```bash
-# Does this chromium have the DRM backend at all? Web mode needs it — there is
-# no X or Wayland under it. A build without it fails whatever the input does.
-chromium --ozone-platform=drm --headless --dump-dom about:blank >/dev/null && echo ok
+Debian's chromium has no DRM backend, so web mode runs it under **cage**, a
+kiosk compositor that puts one window straight onto KMS. Input reaches the page
+through cage the same way. If a touchscreen is ignored, check the service can
+see it at all:
 
-# Are the input devices actually visible to the service?
+```bash
 sudo -u pistreamer ls -l /dev/input/
 ```
 
-The GUI reports the second of these beside the browser name.
+The GUI reports that beside the browser name, along with which compositor is
+in use.
 
 ## Backing a node up
 
@@ -582,9 +583,13 @@ none for the sink to set. Either connect a display, or run headless by adding
 `/boot/firmware/cmdline.txt` and rebooting. The node says this outright rather
 than looping silently.
 
-**A web page or shader says chromium is not installed.** Sources → Web page has
-a button for it, or `sudo apt install chromium`. Shaders need it too — they are
-drawn by the browser.
+**A web page or shader will not show, and the log repeats `Invalid ozone
+platform: drm`.** Chromium has nothing to draw onto. Debian builds it with the
+x11, wayland and headless backends and *not* drm, and there is no desktop on
+this box, so it needs a kiosk compositor: `sudo apt install cage` (the button
+in Sources → Web page installs both). Web mode then runs
+`cage -- chromium --ozone-platform=wayland`. The node stops retrying after a
+few instant failures and says this outright rather than restarting for ever.
 
 **A conversion fails with `frame= 0 ... Conversion failed!`.** The Pi's V4L2
 H.264 encoder is present in ffmpeg but frequently unusable on current
