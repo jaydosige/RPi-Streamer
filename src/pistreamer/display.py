@@ -86,7 +86,12 @@ def list_connectors() -> List[Connector]:
             connected = status_file.read_text().strip() == "connected"
         except OSError:
             continue
-        modes = _parse_modes(entry / "modes") if connected else []
+        # Read the modes whatever the status says. A connector forced on from
+        # cmdline.txt (video=HDMI-A-1:1920x1080@60e, for a node running with
+        # nothing plugged in) lists modes the kernel will happily set, and
+        # discarding them because sysfs called it disconnected is what made
+        # that workaround appear not to work.
+        modes = _parse_modes(entry / "modes")
         out.append(
             Connector(
                 name=match.group("name"),
