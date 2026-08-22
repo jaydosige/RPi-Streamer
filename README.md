@@ -451,6 +451,40 @@ after 30 minutes, and a failed join restores the hotspot rather than leaving
 the node unreachable. First time you use it, do so on a node you can also reach
 over ethernet or with a keyboard.
 
+## Touchscreens, keyboards and mice
+
+A web page **is** interactive, and already was. Chromium is driven straight
+onto DRM by its ozone backend, which reads `/dev/input` itself, and the service
+runs with `SupplementaryGroups=... input` so it can. A keyboard, mouse or
+touchscreen plugged into the node reaches the page with nothing else to set up.
+
+Sources → Web page has a switch for it. On adds `--touch-events=enabled`, which
+matters for a panel that enumerates a moment after Chromium starts and would
+otherwise be missed for the life of the session — a screen that looks right and
+ignores every tap. Off takes away pinch and scrollbars so a passer-by cannot
+scroll the page by accident.
+
+Off is **not a lock**. Nothing in Chromium ignores evdev on command; a keyboard
+still works. A screen nobody can touch is one with nothing plugged into it.
+
+The other sources are not interactive and cannot easily be made so: mpv is
+started with `--no-terminal` and its DRM output takes no evdev input, and NDI
+and AirPlay are one-way by definition.
+
+Two things worth checking on the node itself, because neither can be checked
+from anywhere else:
+
+```bash
+# Does this chromium have the DRM backend at all? Web mode needs it — there is
+# no X or Wayland under it. A build without it fails whatever the input does.
+chromium --ozone-platform=drm --headless --dump-dom about:blank >/dev/null && echo ok
+
+# Are the input devices actually visible to the service?
+sudo -u pistreamer ls -l /dev/input/
+```
+
+The GUI reports the second of these beside the browser name.
+
 ## Backing a node up
 
 **System → Settings backup.** One small file with playlists, the schedule,

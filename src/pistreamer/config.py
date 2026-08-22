@@ -35,6 +35,13 @@ class Config:
     local_file: str = ""
     # URL to display in web mode (e.g. "http://example.com")
     web_url: str = ""
+    # Let a keyboard, mouse or touchscreen reach the page. Input works because
+    # the service is in the `input` group and Chromium's DRM backend reads
+    # evdev directly; this only decides whether it is encouraged or discouraged.
+    # Turning it off is not a lock — nothing in Chromium ignores evdev on
+    # command — it hides the pointer and disables the gestures that navigate
+    # away, which is enough to stop a passer-by, not a determined one.
+    web_interactive: bool = True
     # Live stream to play in stream mode: HLS/DASH over http(s), or a
     # udp://, rtp://, rtsp://, srt:// address.
     stream_url: str = ""

@@ -778,7 +778,12 @@
         <button class="btn primary" id="btnPlayWeb">Show page</button>
         <button class="btn" id="btnSaveWeb">Save as favourite</button>
       </div>
-      <div id="browserState" style="margin-top:12px"></div>
+      <div class="checkline" style="margin-top:12px">
+        <input type="checkbox" id="cfgWebInteractive">
+        <label for="cfgWebInteractive">Let a keyboard, mouse or touchscreen use
+          the page</label>
+      </div>
+      <div id="browserState" style="margin-top:8px"></div>
     </div>
 
     <div class="card">
@@ -1676,6 +1681,7 @@ const CONFIG_FIELDS = {
   cluster_group: "cfgClusterGroup",
   cluster_key: "cfgClusterKey",
   cluster_sync_strength: "cfgSyncStrength",
+  web_interactive: "cfgWebInteractive",
   stream_cache_s: "cfgStreamCache",
   stream_low_latency: "cfgStreamLowLatency",
   connector: "cfgConnector",
@@ -3263,6 +3269,7 @@ async function loadNdiNetwork() {
   setField("cfgDiscoveryServer", c.ndi_discovery_server);
   setField("cfgUrlAddress", c.ndi_url_address);
   setField("webUrl", c.web_url);
+  setField("cfgWebInteractive", c.web_interactive);
   setField("streamUrl", c.stream_url);
   setField("cfgStreamCache", c.stream_cache_s);
   setField("cfgStreamLowLatency", c.stream_low_latency);
@@ -4239,7 +4246,16 @@ async function loadBrowserState() {
   catch (_) { box.innerHTML = ""; return; }
 
   if (b.installed && !b.busy) {
-    box.innerHTML = `<span class="host">Browser: ${esc(b.command)}</span>`;
+    // Whether a keyboard, mouse or touchscreen can reach the page depends on
+    // the service being in the `input` group, which is not obvious from
+    // anywhere else.
+    const touch = b.input_group
+      ? (b.interactive
+          ? "keyboard, mouse and touch reach the page"
+          : "input reaches the page; gestures are disabled")
+      : "input devices are NOT readable — the service is not in the 'input' group";
+    box.innerHTML = `<span class="host">Browser: ${esc(b.command)} &middot; ${
+      esc(touch)}</span>`;
     if (BROWSER_POLL) { clearInterval(BROWSER_POLL); BROWSER_POLL = null; }
     return;
   }
@@ -4626,6 +4642,15 @@ async function saveFavourite(url, kind) {
     loadFavourites();
   } catch (err) { toast(err.message, true); }
 }
+
+$("cfgWebInteractive").onchange = async () => {
+  try {
+    await post("/api/config", { web_interactive: $("cfgWebInteractive").checked });
+    toast("Saved — it applies to the next page you show");
+    loadBrowserState();
+  } catch (err) { toast(err.message, true); }
+  clearDirty("cfgWebInteractive");
+};
 
 $("btnSaveWeb").onclick = () => saveFavourite($("webUrl").value.trim(), "web");
 $("btnSaveStream").onclick = () => saveFavourite($("streamUrl").value.trim(), "stream");

@@ -540,6 +540,20 @@ class Player:
             f"--user-data-dir={config.STATE_DIR / 'chromium'}",
             "--ozone-platform=drm",
         ]
+        if cfg.web_interactive:
+            # Ozone's DRM backend reads /dev/input directly — the service is in
+            # the `input` group for exactly this — so a keyboard, mouse or
+            # touchscreen already reaches the page. These only make touch
+            # dependable: without them Chromium decides at startup whether a
+            # touchscreen exists, and a panel that enumerates late is missed,
+            # leaving a screen that looks right and ignores every tap.
+            cmd.append("--touch-events=enabled")
+        else:
+            # Nothing in Chromium ignores evdev on command, so this only takes
+            # away the gestures that scroll and zoom a page by accident. A
+            # keyboard and mouse still work. It is a discouragement, not a lock
+            # — a kiosk nobody can touch needs the input devices unplugged.
+            cmd += ["--disable-pinch", "--hide-scrollbars"]
         if mode:
             cmd.append(f"--window-size={mode.width},{mode.height}")
         # Everything after this is a positional argument, never a switch.

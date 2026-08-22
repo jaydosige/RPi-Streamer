@@ -1016,17 +1016,36 @@ def _browser_ready() -> tuple[bool, str]:
 
 @app.get("/api/web/browser")
 async def get_browser() -> Dict[str, Any]:
-    """Is the browser the web page source needs actually here?"""
+    """Is the browser the web page source needs actually here, and usable?
+
+    Installed is not the same as working: web mode drives Chromium straight
+    onto DRM with no X or Wayland under it, and a build without the ozone DRM
+    backend cannot do that however well it runs on a desktop. Same lesson as
+    the encoder that was listed but could not encode.
+    """
     found = next((b for b in ("chromium-browser", "chromium",
                               "chromium-browser-stable") if shutil.which(b)), None)
     last = network.result()
+    cfg = config.load()
     return {
         "installed": bool(found),
         "command": found or "",
         "can_install": network.available()[0],
         "busy": network.busy(),
+        "interactive": cfg.web_interactive,
+        "input_group": "input" in _own_groups(),
         "last": last if last.get("action") == "install-chromium" else {},
     }
+
+
+def _own_groups() -> List[str]:
+    """The groups this process is in — `input` is what lets a page be touched."""
+    try:
+        import grp
+
+        return [grp.getgrgid(gid).gr_name for gid in os.getgroups()]
+    except Exception:  # noqa: BLE001
+        return []
 
 
 @app.post("/api/web/browser")
