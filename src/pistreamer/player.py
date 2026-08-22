@@ -371,6 +371,9 @@ class Player:
         self._segments: List[dict] = []
         self._segment_idx = 0
         self._segment_deadline: Optional[float] = None
+        # Which backend the current segment is using, so the next one knows
+        # whether the process on screen can be reused.
+        self._segment_backend = ""
         self._segment_loop = True
         # Set while a synchronised session owns playback, so the supervisor
         # does not treat a prepared-and-paused player as a crash to restart.
@@ -667,6 +670,10 @@ class Player:
             # mpv writes a screenshot at the video's own size — there is no
             # scale option for it — so quality is the only lever on how big
             # they land, and 70 is indistinguishable in a thumbnail.
+            # mpv opens the next playlist entry while the current one is
+            # ending. Only helps the one-mpv path; the sequencer below reuses
+            # the same process instead.
+            "--prefetch-playlist=yes",
             "--screenshot-format=jpg",
             "--screenshot-jpeg-quality=70",
             f"--image-display-duration={image_duration}",
@@ -822,12 +829,35 @@ class Player:
         if segment["type"] == "ndi":
             return self._runner_command(cfg, segment["target"])
         cmd = self._mpv_base(cfg, segment["duration"] or 10)
-        # A duration on a video means cut it short; images are handled by
-        # --image-display-duration above.
-        if segment["duration"] and not segment["image"]:
-            cmd.append(f"--length={segment['duration']}")
-        cmd += ["--", segment["path"]]
+        # Stay alive when the file ends instead of exiting, so the next segment
+        # is a loadfile into this process rather than a new one. Spawning mpv
+        # and handing it DRM is what the black frame between items actually
+        # was; decoding the first frame is the cheap part.
+        # A duration is enforced by _segment_deadline rather than --length,
+        # because --length is a launch option and cannot be set per loadfile.
+        cmd += ["--idle=yes", "--", segment["path"]]
         return cmd
+
+    def _load_into_running_mpv(self, segment: dict) -> bool:
+        """Hand the next file to the mpv already on screen. False if it cannot.
+
+        Only for file segments following a file segment. NDI needs the
+        GStreamer runner, so a playlist that mixes the two still swaps
+        processes at those boundaries — that is a different backend, not
+        avoidable churn.
+        """
+        if segment["type"] != "file" or self._segment_backend != "mpv":
+            return False
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return False
+        sock = str(mpv_socket())
+        # Set before the load so a still is held for its own time rather than
+        # the previous segment's.
+        mpvipc.command(sock, "set_property", "image-display-duration",
+                       segment["duration"] or 10)
+        reply = mpvipc.command(sock, "loadfile", segment["path"], "replace")
+        return bool(reply) and reply.get("error") == "success"
 
     def _start_segment(self, cfg: config.Config, idx: int) -> None:
         """Play segment `idx`, wrapping round if the playlist loops."""
@@ -842,18 +872,21 @@ class Player:
             idx = 0
         self._segment_idx = idx
         segment = self._segments[idx]
-        self._terminate()
         label = segment["target"] or segment.get("path", "")
         log.info(
             "playlist segment %d/%d: %s %s",
             idx + 1, len(self._segments), segment["type"], label,
         )
         self._status.target = f"{label} ({idx + 1}/{len(self._segments)})"
-        self._spawn_command(self._segment_command(cfg, segment), f"segment {idx + 1}")
-        # An NDI segment never ends by itself, and a video cut short by
-        # --length still exits on its own, so only timed segments need a
-        # deadline. A little slack keeps us from cutting a file off early.
-        if segment["type"] == "ndi" or segment["image"]:
+        if not self._load_into_running_mpv(segment):
+            self._terminate()
+            self._spawn_command(self._segment_command(cfg, segment),
+                                f"segment {idx + 1}")
+            self._segment_backend = "mpv" if segment["type"] == "file" else "ndi"
+        # An NDI segment never ends by itself, and a duration is now enforced
+        # here rather than by --length, so anything with one gets a deadline.
+        # A little slack keeps us from cutting a file off early.
+        if segment["type"] == "ndi" or segment["image"] or segment["duration"]:
             self._segment_deadline = time.monotonic() + (segment["duration"] or 30)
         else:
             self._segment_deadline = None
@@ -1586,6 +1619,15 @@ class Player:
                 # A timed segment ends on the clock, not on process exit.
                 if self._segments and self._segment_deadline is not None:
                     if time.monotonic() >= self._segment_deadline:
+                        self._start_segment(cfg, self._segment_idx + 1)
+                        return
+                # A segment of natural length used to end by the process
+                # exiting. A reused mpv goes idle instead, so that is now what
+                # "this item finished" looks like.
+                if (self._segments and self._segment_deadline is None
+                        and self._segment_backend == "mpv"):
+                    idle = mpvipc.query(str(mpv_socket()), ["idle-active"])
+                    if idle.get("idle-active") is True:
                         self._start_segment(cfg, self._segment_idx + 1)
                         return
                 if self._fallback:
