@@ -71,7 +71,6 @@ def main() -> int:
     (config.MEDIA_DIR / "one.mp4").unlink()
     check("a file deleted after saving is skipped at play time",
           len(playlists.resolved_files("Doors Open")) == 1)
-    check("m3u written for mpv", playlists.write_m3u("Doors Open") is not None)
     check("delete works", playlists.delete("Doors Open"))
     check("delete twice is False", not playlists.delete("Doors Open"))
 

@@ -8,6 +8,7 @@ mid-write cannot leave a truncated config on the SD card.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -18,6 +19,8 @@ from typing import Any, Dict
 CONFIG_PATH = Path(os.environ.get("PISTREAMER_CONFIG", "/etc/pistreamer/config.json"))
 MEDIA_DIR = Path(os.environ.get("PISTREAMER_MEDIA", "/var/lib/pistreamer/media"))
 STATE_DIR = Path(os.environ.get("PISTREAMER_STATE", "/var/lib/pistreamer"))
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -154,10 +157,6 @@ class Config:
     # the page, which is what a document is usually for; anything above 0
     # makes it a slideshow.
     document_dwell_s: int = 0
-
-    # Fall back to shelling out to gst-launch-1.0 instead of the instrumented
-    # runner. Loses all stream telemetry; kept as an escape hatch.
-    use_gst_launch: bool = False
 
     # --- system ---
     device_name: str = "pistreamer"
@@ -339,6 +338,62 @@ def update(**kwargs: Any) -> Config:
 # resort — which works, and wears the card.
 _RUNTIME_CANDIDATES = ("/run/pistreamer", "/dev/shm/pistreamer")
 _runtime_cache: Path | None = None
+
+
+def write_atomic(path: Path, payload: str, mode: int = 0o644) -> None:
+    """Write a file so a power cut cannot leave half of one.
+
+    Temp file in the same directory, fsync, rename. Nine modules were carrying
+    their own copy of this — playlists, favourites, the schedule, guest, auth,
+    network, ndiconfig, updates and this one — which is nine places for the
+    fsync to be forgotten. It is here because config is the one module every
+    store already imports.
+
+    `mode` is 0600 for anything holding a credential.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}-")
+    try:
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(payload)
+            fh.flush()
+            # Without this the rename can land before the contents do, which
+            # is how a clean-looking file comes back empty after a power cut.
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def write_json(path: Path, data: Any, mode: int = 0o644, **dumps: Any) -> None:
+    """Serialise and write atomically. sort_keys so diffs stay readable."""
+    dumps.setdefault("indent", 2)
+    dumps.setdefault("sort_keys", True)
+    write_atomic(path, json.dumps(data, **dumps) + "\n", mode)
+
+
+def read_json(path: Path, default: Any) -> Any:
+    """Read JSON, or return `default` for anything at all going wrong.
+
+    A store that refuses to load because its file is corrupt takes the node
+    down with it; starting empty and saying so in the log does not. The type of
+    `default` is also the type check — a dict store handed a list gets its
+    default back rather than a confusing failure three calls later.
+    """
+    if not path.exists():
+        return default
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        log.warning("%s is unreadable (%s); starting empty", path.name, exc)
+        return default
+    if default is not None and not isinstance(data, type(default)):
+        log.warning("%s is not a %s; ignoring it", path.name, type(default).__name__)
+        return default
+    return data
 
 
 def runtime_dir() -> Path:

@@ -17,6 +17,7 @@ Needs Playwright and Chromium. Skips cleanly without them.
 import asyncio
 import json
 import os
+import pathlib
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,14 @@ try:
     from playwright.async_api import async_playwright
 except ImportError:
     print("skipping: playwright is not installed")
+    raise SystemExit(0)
+
+if not pathlib.Path(os.environ.get("PISTREAMER_CHROMIUM",
+                                   "/opt/pw-browsers/chromium")).exists():
+    # Installed as a library but with no browser to drive — on a dev machine
+    # playwright keeps its browsers elsewhere. Not having one is a reason to
+    # skip, not to fail: nothing about the product is broken.
+    print("skipping: no chromium for playwright at PISTREAMER_CHROMIUM")
     raise SystemExit(0)
 
 SRC = Path(__file__).resolve().parents[1] / "src"

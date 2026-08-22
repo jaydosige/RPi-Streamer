@@ -33,9 +33,7 @@ import hashlib
 import hmac
 import json
 import logging
-import os
 import secrets
-import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -80,19 +78,7 @@ def sessions_path() -> Path:
 
 def _write_private(path: Path, payload: str) -> None:
     """Write 0600, atomically. Both files here are credentials."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}-")
-    try:
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+    config.write_atomic(path, payload, mode=0o600)
 
 
 def hash_password(password: str, salt: Optional[bytes] = None,

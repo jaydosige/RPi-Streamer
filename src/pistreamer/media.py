@@ -250,11 +250,6 @@ def _probe_uncached(path: Path) -> tuple[Optional[float], Optional[VideoInfo]]:
     )
 
 
-def _probe_duration(path: Path) -> Optional[float]:
-    """Best-effort duration via ffprobe. Returns None if unavailable."""
-    return probe_file(path)[0]
-
-
 def assess(info: Optional[VideoInfo],
            hw_codecs: Optional[set] = None) -> dict:
     """Judge how well a video will play on this node, and why.

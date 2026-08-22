@@ -14,11 +14,8 @@ trade, and the alternative surprises people far more often.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
-import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass, field
@@ -75,32 +72,11 @@ def store_path() -> Path:
 
 
 def _load_raw() -> List[dict]:
-    path = store_path()
-    if not path.exists():
-        return []
-    try:
-        data = json.loads(path.read_text())
-        return data if isinstance(data, list) else []
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("schedule.json unreadable (%s); starting empty", exc)
-        return []
+    return config.read_json(store_path(), [])
 
 
 def _save_raw(data: List[dict]) -> None:
-    path = store_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2) + "\n"
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".schedule-")
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+    config.write_json(store_path(), data, sort_keys=False)
 
 
 def all_cues() -> List[Cue]:

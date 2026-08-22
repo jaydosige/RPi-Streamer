@@ -21,8 +21,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from pydantic import BaseModel, Field
 
-from . import (airplay, auth, cluster, config, diagnose, display, documents,
-               favourites, guest, ingest, media, ndiconfig, network, playlists,
+from . import (airplay, auth, backup, cluster, config, diagnose, display,
+               documents, favourites, guest, ingest, media, ndiconfig, network, playlists,
                preview, pushjob, schedule as schedule_mod, shaders, sources,
                support, syncplay, system, transcode, updates)
 from .player import (MODE_AIRPLAY, MODE_IDLE, MODE_LOCAL, MODE_NDI,
@@ -592,6 +592,57 @@ async def post_preview_stop() -> Dict[str, Any]:
     """Give up the preview at once rather than waiting for it to age out."""
     preview.release()
     return preview.summary(player.status().get("mode", ""))
+
+
+# ----------------------------------------------------------------------
+# Settings backup
+# ----------------------------------------------------------------------
+
+
+@app.get("/api/backup")
+async def get_backup(download: bool = True) -> Response:
+    """Everything a person typed into this node, as one file.
+
+    Media is deliberately not in it: a library is gigabytes and already has a
+    way between nodes in /api/cluster/push. A backup too big to keep is one
+    nobody keeps.
+    """
+    data = backup.build()
+    if not download:
+        return JSONResponse(backup.summary())
+    name = backup.filename(config.load().device_name)
+    return Response(
+        content=backup.to_bytes(data),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
+
+
+@app.get("/api/backup/summary")
+async def get_backup_summary() -> Dict[str, Any]:
+    return backup.summary()
+
+
+@app.post("/api/backup/restore")
+async def post_backup_restore(request: Request,
+                              keep_identity: bool = True) -> Dict[str, Any]:
+    """Apply a settings file. The body is the file itself.
+
+    Sections are applied independently, so a playlist naming a file this node
+    has not got does not stop the schedule being restored.
+    """
+    try:
+        data = json.loads(await request.body())
+    except ValueError as exc:
+        raise HTTPException(400, f"that is not a settings file: {exc}") from exc
+    try:
+        report = backup.restore(data, keep_identity=keep_identity)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    # Anything that changes the pipeline needs the player restarted to take
+    # effect, and a restore changes a great deal of it.
+    player.restart()
+    return {**report, "restarted": True}
 
 
 @app.get("/api/support")

@@ -23,6 +23,13 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path as _Path
+
+if not _Path("/proc").is_dir():
+    # Stray-process detection walks /proc by design — it is how a player that
+    # outlived its supervisor is found. Without one there is nothing to test.
+    print("skipping: this test reads /proc, which this system does not have")
+    raise SystemExit(0)
 import sys
 import tempfile
 import time

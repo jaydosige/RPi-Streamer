@@ -1414,6 +1414,31 @@
     </div>
 
     <div class="card">
+      <h2>Settings backup</h2>
+      <div class="note" style="margin-bottom:12px">
+        Playlists, the schedule, favourites, shaders and every setting, as one
+        small file. Media is not in it &mdash; a library is gigabytes and moves
+        between nodes with <em>Send files to the group</em> instead.
+      </div>
+      <div id="backupSummary" class="host" style="margin-bottom:12px"></div>
+      <div class="risk">
+        <b>This file contains the group key.</b> Anyone holding it can command
+        your nodes. It does not contain the console password.
+      </div>
+      <div class="row">
+        <a class="btn primary" id="btnBackup" href="/api/backup" download>Download</a>
+        <input type="file" id="restoreFile" accept="application/json,.json" hidden>
+        <button class="btn" id="btnRestore">Restore from a file</button>
+      </div>
+      <div class="checkline" style="margin-top:10px">
+        <input type="checkbox" id="restoreKeepName" checked>
+        <label for="restoreKeepName">Keep this node&rsquo;s own name and login
+          setting</label>
+      </div>
+      <div id="restoreResult"></div>
+    </div>
+
+    <div class="card">
       <h2>Support bundle</h2>
       <div class="note" style="margin-bottom:12px">
         One file with everything needed to diagnose this node: the player log,
@@ -1735,7 +1760,7 @@ document.querySelectorAll("nav button").forEach((btn) => {
       }).catch(() => {});
     }
     if (tab === "output") { loadConnectors(); loadAudioDevices(); loadPerf(); }
-    if (tab === "system") { loadAccess(); loadWizNetwork("sysNetwork"); loadTelemetry(); loadOverclock(); loadUpdate(); }
+    if (tab === "system") { loadAccess(); loadBackupSummary(); loadWizNetwork("sysNetwork"); loadTelemetry(); loadOverclock(); loadUpdate(); }
     if (tab === "ndi") { loadNdiNetwork(); loadAirplay(); loadFavourites(); loadBrowserState(); loadShaders(); }
     if (tab === "nodes") loadNodes();
   };
@@ -1992,9 +2017,7 @@ function renderStream(st, p) {
   }
   if (!st || st.fps === undefined) {
     grid.innerHTML = `<div class="empty">Waiting for the first frame…</div>`;
-    note.textContent = STATE.config.use_gst_launch
-      ? "Stream statistics are unavailable on the gst-launch fallback path."
-      : "";
+    note.textContent = "";
     return;
   }
 
@@ -2845,7 +2868,6 @@ const PERF_FIELDS = {
   cfgStandbyFile: ["standby_file", "str"],
   cfgSnapshot: ["snapshot_enabled", "check"],
   cfgSnapshotInterval: ["snapshot_interval_s", "int"],
-  cfgUseGstLaunch: ["use_gst_launch", "check"],
 };
 let VIDEO_FORMATS = ["auto", "BGRx", "RGBx", "BGRA", "RGB16", "NV12", "UYVY", "I420"];
 let CAPS = null;
@@ -2926,7 +2948,7 @@ $("btnResetPerf").onclick = async () => {
       convert_threads: 0, queue_leaky: "downstream", queue_max_buffers: 0,
       ndi_max_queue: 10, ndi_connect_timeout_ms: 10000, ndi_timeout_ms: 5000,
       idle_mode: "black", standby_file: "", snapshot_enabled: true,
-      snapshot_interval_s: 3, use_gst_launch: false,
+      snapshot_interval_s: 3,
     });
     toast("Defaults restored");
     await poll(); loadPerf();
@@ -3202,7 +3224,6 @@ function renderVersions() {
     ["OS", v.os], ["Kernel", v.kernel], ["Firmware", v.firmware],
     ["pi-streamer", v.pistreamer], ["GStreamer", v.gstreamer],
     ["NDI SDK", shortVersion(v.ndi_sdk)], ["mpv", shortVersion(v.mpv)],
-    ["Pipeline", STATE && STATE.config.use_gst_launch ? "gst-launch (fallback)" : "instrumented runner"],
   ]);
 }
 
@@ -4071,6 +4092,55 @@ $("btnPlayWeb").onclick = async () => {
 setInterval(() => {
   if (activeTab() === "media" && GUEST && GUEST.open) loadGuest();
 }, 15000);
+
+// ---------- settings backup ----------
+
+async function loadBackupSummary() {
+  const box = $("backupSummary");
+  if (!box) return;
+  try {
+    const b = await api("/api/backup/summary");
+    box.textContent = `${b.playlists} playlist(s) · ${b.schedule} cue(s) · ` +
+      `${b.favourites} favourite(s) · ${b.shaders} shader(s)`;
+  } catch (_) { box.textContent = ""; }
+}
+
+$("btnRestore").onclick = () => $("restoreFile").click();
+
+$("restoreFile").onchange = async () => {
+  const file = $("restoreFile").files[0];
+  if (!file) return;
+  if (!confirm(`Restore settings from ${file.name}?\n\n` +
+               `Playlists, cues, favourites and shaders with the same names ` +
+               `will be overwritten, and playback restarts.`)) {
+    $("restoreFile").value = "";
+    return;
+  }
+  try {
+    const text = await file.text();
+    const keep = $("restoreKeepName").checked;
+    const res = await fetch(`/api/backup/restore?keep_identity=${keep}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: text,
+    });
+    const r = await res.json();
+    if (!res.ok) throw new Error(r.detail || "restore failed");
+    $("restoreResult").innerHTML = `
+      <div class="banner" style="background:#1b2a1f;border-color:#274a2f;color:#a8dcb5">
+        Restored ${r.config} setting(s), ${r.playlists} playlist(s),
+        ${r.schedule} cue(s), ${r.favourites} favourite(s),
+        ${r.shaders} shader(s).
+      </div>
+      ${(r.skipped || []).length ? `<div class="banner warn">Skipped:<br>${
+        r.skipped.map(esc).join("<br>")}</div>` : ""}`;
+    toast("Settings restored");
+    loadBackupSummary(); poll();
+  } catch (err) {
+    $("restoreResult").innerHTML = `<div class="banner">${esc(err.message)}</div>`;
+  }
+  $("restoreFile").value = "";
+};
 
 // ---------- access ----------
 

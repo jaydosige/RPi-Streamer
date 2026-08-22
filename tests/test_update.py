@@ -23,6 +23,12 @@ import os
 import subprocess
 import sys
 import pathlib
+
+if not os.access("/etc/systemd/system", os.W_OK):
+    # The helper unit lives in /etc/systemd/system and this checks for it by
+    # creating one. Without write access there is nothing to check.
+    print("skipping: /etc/systemd/system is not writable here")
+    raise SystemExit(0)
 import tempfile
 import time
 from pathlib import Path

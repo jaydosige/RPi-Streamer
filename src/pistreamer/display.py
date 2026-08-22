@@ -167,27 +167,6 @@ def _card_dir_for(connector_name: str) -> Optional[Path]:
     return None
 
 
-def drm_card_for(connector_name: str) -> Optional[str]:
-    """Return the /dev/dri/cardN device node that owns a given connector.
-
-    Useful for mpv (--drm-device) and for diagnostics. NOT for kmssink — see
-    drm_driver_for.
-    """
-    card = _card_dir_for(connector_name)
-    return f"/dev/dri/{card.name}" if card else None
-
-
-# The driver names kmssink itself probes for, from gstkmssink.c. We use this
-# as a whitelist: if what we detect is not on it, drmOpen would reject the
-# name anyway, so we stay quiet and let kmssink run its own probe.
-KNOWN_DRM_DRIVERS = frozenset(
-    {
-        "i915", "nouveau", "radeon", "amdgpu", "omapdrm", "exynos", "tilcdc",
-        "msm", "sti", "imx-drm", "rockchip", "atmel-hlcdc", "mediatek",
-        "meson", "sun4i-drm", "vc4", "stm", "rcar-du", "vkms", "v3d",
-    }
-)
-
 
 def drm_driver_for(connector_name: str) -> Optional[str]:
     """Return the DRM driver name for a connector, e.g. "vc4", or None.

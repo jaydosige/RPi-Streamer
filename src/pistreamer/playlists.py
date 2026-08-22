@@ -19,12 +19,9 @@ segments on read, so old files keep working.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import random
 import re
-import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -97,32 +94,11 @@ def valid_name(name: str) -> bool:
 
 
 def _load_raw() -> Dict[str, dict]:
-    path = store_path()
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text())
-        return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("playlists.json unreadable (%s); starting empty", exc)
-        return {}
+    return config.read_json(store_path(), {})
 
 
 def _save_raw(data: Dict[str, dict]) -> None:
-    path = store_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2, sort_keys=True) + "\n"
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".playlists-")
-    try:
-        with os.fdopen(fd, "w") as fh:
-            fh.write(payload)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    except BaseException:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-        raise
+    config.write_json(store_path(), data)
 
 
 def all_playlists() -> List[Playlist]:
@@ -145,7 +121,16 @@ def get(name: str) -> Optional[Playlist]:
     return next((p for p in all_playlists() if p.name == name), None)
 
 
-def save(playlist: Playlist) -> Playlist:
+def save(playlist: Playlist, require_media: bool = True) -> Playlist:
+    """Store a playlist.
+
+    `require_media` is off only for a settings restore. Media travels
+    separately — a library is gigabytes and moves with /api/cluster/push — so a
+    node restored from a backup has its playlists before it has its files, and
+    rejecting them then would throw away the settings at exactly the moment
+    they were being recovered. The playback path already copes with a file that
+    has gone; this check is a typo guard for the editor, not an invariant.
+    """
     if not valid_name(playlist.name):
         raise ValueError("playlist names may use letters, numbers, spaces, _ and - only")
     playlist.items = normalise_items(playlist.items, playlist.image_duration)
@@ -155,7 +140,7 @@ def save(playlist: Playlist) -> Playlist:
     missing = [
         i["target"] for i in playlist.items
         if i["type"] == "file" and media.resolve(i["target"]) is None
-    ]
+    ] if require_media else []
     if missing:
         raise ValueError(f"not in the media library: {', '.join(missing)}")
     nameless = [i for i in playlist.items if i["type"] == "ndi" and not i["target"]]
@@ -226,12 +211,3 @@ def resolved_files(name: str) -> List[str]:
     return [s["path"] for s in resolved_segments(name) if s["type"] == "file"]
 
 
-def write_m3u(name: str) -> Optional[Path]:
-    """Write the playlist for mpv to read. Returns the file path."""
-    paths = resolved_files(name)
-    if not paths:
-        return None
-    out = config.STATE_DIR / "current-playlist.m3u"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("\n".join(paths) + "\n")
-    return out

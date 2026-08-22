@@ -406,100 +406,6 @@ class Player:
     # Command construction
     # ------------------------------------------------------------------
 
-    def _ndi_command(self, cfg: config.Config, source: str) -> List[str]:
-        conn = display.pick_connector(cfg.connector)
-        conn_name = conn.name if conn else ""
-        conn_id = _connector_id(conn_name)
-
-        latency_ns = max(0, cfg.ndi_latency_ms) * 1_000_000
-
-        sink = ["kmssink", "force-modesetting=true"]
-        if conn_id is not None:
-            sink.append(f"connector-id={conn_id}")
-        # driver-name, not bus-id, and not a device path. kmssink passes
-        # bus-id to drmOpen(NULL, bus_id) as a *bus* identifier; a
-        # /dev/dri/cardN path there fails with "Could not open DRM module".
-        # If we cannot identify the driver, say nothing and let kmssink probe
-        # its built-in list.
-        driver = display.drm_driver_for(conn_name) if conn_name else None
-        if driver:
-            sink.append(f"driver-name={driver}")
-
-        video_chain = [
-            "queue",
-            f"max-size-time={latency_ns}",
-            "max-size-bytes=0",
-            "max-size-buffers=0",
-            "leaky=downstream",
-            "!",
-            "videoconvert",
-        ]
-        flip = _flip_method(cfg.rotation)
-        if flip:
-            video_chain += ["!", "videoflip", f"method={flip}"]
-
-        # Scale to a mode the connector actually advertises and pin the pixel
-        # format. kmssink only sets a mode that matches the frame size
-        # exactly, and allocates its mode-setting buffer at that size, so an
-        # arbitrary sender resolution fails with "failed to allocate buffer
-        # object for mode setting". add-borders keeps the aspect ratio and
-        # pillar/letterboxes the rest.
-        mode = display.target_mode(conn, cfg.video_mode)
-        caps = "video/x-raw,format=BGRx"
-        if mode:
-            caps += f",width={mode.width},height={mode.height}"
-        video_chain += ["!", "videoscale", "add-borders=true", "!", caps, "!"] + sink
-
-        cmd: List[str] = [
-            "gst-launch-1.0",
-            "-q",
-            "ndisrc",
-            f"ndi-name={_gst_quote(source)}",
-            f"bandwidth={_bandwidth_value(cfg.ndi_bandwidth)}",
-            # Surface a dead sender as a pipeline error instead of hanging
-            # silently; the supervisor then retries with backoff.
-            "connect-timeout=10000",
-            "timeout=5000",
-            f"timestamp-mode={cfg.ndi_timestamp_mode}",
-            f"receiver-ndi-name={_gst_quote(cfg.device_name or 'pistreamer')}",
-            "!",
-            "ndisrcdemux",
-            "name=demux",
-            "demux.video",
-            "!",
-        ] + video_chain
-
-        if cfg.audio_enabled:
-            # provide-clock=false is load-bearing. An audio sink is the
-            # pipeline's preferred clock provider by default, and that clock
-            # only advances while audio is actually being consumed by the
-            # card. If the sender has no audio, or HDMI audio is not really
-            # playing, the clock stalls — and the video sink, which syncs to
-            # it, renders exactly one frame and then waits forever.
-            # async=false keeps a sulking audio sink out of preroll too.
-            audio_sink = [
-                "alsasink",
-                "sync=false",
-                "provide-clock=false",
-                "async=false",
-            ]
-            if cfg.audio_device:
-                audio_sink.append(f"device={cfg.audio_device}")
-            cmd += [
-                "demux.audio",
-                "!",
-                "queue",
-                "leaky=downstream",
-                f"max-size-time={latency_ns}",
-                "!",
-                "audioconvert",
-                "!",
-                "audioresample",
-                "!",
-            ] + audio_sink
-
-        return cmd
-
     def _airplay_command(self, cfg: config.Config) -> List[str]:
         """Run uxplay against the same display the other backends use.
 
@@ -951,8 +857,6 @@ class Player:
                 f"and rebooting."
             )
         if mode == MODE_IDLE:
-            if cfg.use_gst_launch:
-                raise RuntimeError("standby screen requires the instrumented runner")
             ok, reason = sources.gstreamer_available()
             if not ok:
                 raise RuntimeError(reason)
@@ -960,10 +864,6 @@ class Player:
         if mode == MODE_NDI:
             if not target:
                 raise RuntimeError("no NDI source selected")
-            if cfg.use_gst_launch:
-                if not shutil.which("gst-launch-1.0"):
-                    raise RuntimeError("gst-launch-1.0 not installed")
-                return self._ndi_command(cfg, target)
             return self._runner_command(cfg, target)
         if mode == MODE_LOCAL:
             if not shutil.which("mpv"):

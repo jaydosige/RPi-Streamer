@@ -57,7 +57,6 @@ def main() -> int:
             "video_mode", "rotation", "ndi_bandwidth", "ndi_timestamp_mode",
             "ndi_color_format", "sink_sync", "sink_qos", "scale_method",
             "video_format", "queue_leaky", "idle_mode", "standby_file",
-            "snapshot_enabled", "use_gst_launch",
         }
         check("config exposes every documented key", required <= keys,
               f"missing: {sorted(required - keys)}")

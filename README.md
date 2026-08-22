@@ -16,16 +16,33 @@ Built for Live Wire Event Solutions. Reference platform: Pi 4B (4GB or 8GB),
 - Receives AirPlay: an iPhone, iPad or Mac mirrors onto the node from the
   ordinary picker, with an optional pairing code
 - Plays or loops local video files, uploadable through the browser
+- Plays a **live stream** by address — HLS and DASH over http(s), or
+  `udp://`, `rtp://`, `rtsp://`, `srt://` from an encoder on the LAN
+- Shows a **web page** full screen — a dashboard, a scoreboard, a running order
+- Shows **documents**: a PDF stays one entry in the library and is paged
+  through on screen, with arrow keys or a page number. Plain text too
+- Accepts **HEIC** from a phone, converting it on arrival
+- Runs a **GLSL shader** you write in the GUI, with a live preview beside the
+  code — Shadertoy conventions, so anything from there pastes straight in
+- **Favourites**: any page or stream saved under the name you actually call it
 - Takes a photo or video from anyone in the room, from a QR code the operator
   can switch on and off
+- **Previews the output in the browser**, so you can see what is on the screen
+  without being in front of it
 - Drives HDMI through DRM/KMS — no X, no Wayland, no desktop
 - Restores the last source on boot, and reconnects on its own when a sender
   drops and comes back
-- Web GUI at `http://<hostname>.local/` — six tabs: **Now playing** (what is on
-  screen and whether the node is healthy), **Sources** (AirPlay and NDI),
-  **Media** (library, playlists, guest sharing, running order), **Nodes** (the
-  group), **Output** (display, audio, performance) and **System** (telemetry,
-  identity, power). Built for a phone in a dark room as much as a laptop
+- Optional **login** for the console. Guest sharing stays open either way —
+  the QR code is the guest's credential
+- **Backs its settings up** to one small file, and restores them onto a fresh
+  card
+- Produces a **support bundle**: everything needed to diagnose the node,
+  secrets redacted, in one file you can send to somebody
+- Web GUI at `http://<hostname>.local/` — one page: a dashboard that is always
+  on screen (what is playing, a preview of it, and whether the node is
+  healthy), over tiles that expand into **Now playing**, **Sources**,
+  **Media**, **Nodes**, **Output** and **System**. Built for a phone in a dark
+  room as much as a laptop
 
 ## Architecture
 
@@ -399,6 +416,68 @@ button that fails for most of the room. If you need a phone or laptop screen on
 the wall, the right answer is AirPlay/Miracast receiving, which belongs as
 another playback mode next to NDI and local rather than as a web page.
 
+## First boot, and locking the console
+
+The GUI opens on a four-step wizard the first time: how to reach the node, what
+to call it, its network, and an optional password. "Show on the screen" puts
+the node's name and address on the display it is plugged into, which is how you
+tell which of six boxes you are talking to.
+
+The login is **off unless you switch it on**. Setting a password does not lock
+anything; `auth_enabled` does. That way updating a node mid-job never starts
+demanding a password nobody has to hand.
+
+Two things are deliberately outside it:
+
+- **Guest sharing is never behind the login.** The QR code is the guest's
+  credential and the whole point is that a stranger can use it.
+- **Nodes authenticate to each other with the group key**, not a session, so a
+  group keeps working when the console is locked.
+
+Forgotten the password? Delete `/var/lib/pistreamer/auth.json` over SSH and the
+login turns itself off. Anyone who can do that already has the SD card.
+
+### Wi-Fi and the setup hotspot
+
+Hostname and Wi-Fi go through a root helper (`pistreamer-netcfg`), because the
+service runs with `NoNewPrivileges` and a read-only `/etc` and cannot do either
+itself. The GUI can scan, join a network, or start an access point for a node
+that is not on a network at all.
+
+**The hotspot takes the wireless interface.** Starting one on a node you are
+reaching over Wi-Fi will drop you — join `pistreamer-setup` and open
+`http://10.42.0.1` to carry on. It puts the previous network back on its own
+after 30 minutes, and a failed join restores the hotspot rather than leaving
+the node unreachable. First time you use it, do so on a node you can also reach
+over ethernet or with a keyboard.
+
+## Backing a node up
+
+**System → Settings backup.** One small file with playlists, the schedule,
+favourites, shaders and every setting. Media is not in it — a library is
+gigabytes and already moves between nodes with *Send files to the group*.
+
+Restoring onto a freshly flashed card brings everything back before the media
+has arrived; playlists naming files the node has not got yet are kept, not
+rejected. By default the node keeps its own name and login setting, so a spare
+does not come up believing it is the machine it replaced.
+
+The file contains the group key, because a node that cannot rejoin its group
+has not been restored. It does **not** contain the console password. Treat it
+as a credential.
+
+## When something is wrong: the support bundle
+
+**System → Support bundle → Download.** One file with the player log, the
+systemd journal — which is where a service that restarts in a loop leaves its
+evidence, and which nothing else in the GUI can reach — versions, capabilities,
+telemetry, media, cluster state and the settings.
+
+The group key, password hash and Wi-Fi passphrase are redacted, so it is safe
+to attach to a message. Sections that fail are recorded in place rather than
+losing the bundle: half of one from a misbehaving node is worth more than an
+exception.
+
 ## Troubleshooting
 
 **No NDI sources listed.** Check `gst-inspect-1.0 ndisrc` loads. If it does,
@@ -462,6 +541,23 @@ is applied by a root path-activated unit. Run `install.sh` again to install
 `pistreamer-overclock.path`, then check `systemctl status
 pistreamer-overclock.path` shows it active.
 
+**Nothing plays, and the log repeats "failed to set pipeline to PLAYING".**
+Nothing is plugged into HDMI, so the connector advertises no modes and there is
+none for the sink to set. Either connect a display, or run headless by adding
+`video=HDMI-A-1:1920x1080@60e` to the end of the single line in
+`/boot/firmware/cmdline.txt` and rebooting. The node says this outright rather
+than looping silently.
+
+**A web page or shader says chromium is not installed.** Sources → Web page has
+a button for it, or `sudo apt install chromium`. Shaders need it too — they are
+drawn by the browser.
+
+**A conversion fails with `frame= 0 ... Conversion failed!`.** The Pi's V4L2
+H.264 encoder is present in ffmpeg but frequently unusable on current
+Raspberry Pi OS. The node now tests an encoder before choosing it and falls
+back to software, so this should not recur; if it does, the support bundle has
+the real ffmpeg error in it.
+
 ## Several nodes together
 
 Nodes announce themselves on UDP 47600 every two seconds and appear in each
@@ -518,27 +614,47 @@ loudly if it sees one.
 
 ## Testing
 
-None of this needs a Pi:
+None of this needs a Pi. Run the lot:
 
 ```bash
-python3 tests/test_smoke.py        # API contract, config, uploads, degradation
-python3 tests/test_features.py     # playlist segments, validation, schedule cues
-python3 tests/test_teardown.py     # nothing outlives its segment (real processes)
-python3 tests/test_diagnose.py     # network-vs-Pi verdicts
-python3 tests/test_cluster.py      # beacons, group auth, sync maths, push progress
-python3 tests/test_cluster_live.py # two real nodes: discovery, auth, file push
-python3 tests/test_overlay.py      # the identify caption and the guest QR
-                                   # actually render — needs working python3-gi
-python3 tests/test_gui.py          # real browser: the poll must not overwrite
-                                   # what you are typing, and progress bars move
-python3 tests/test_update.py       # updates, against real git repositories
-python3 tests/test_guest.py        # guest sharing: what the room can and
-                                   # cannot do, and the QR decodes
-python3 tests/test_airplay.py     # AirPlay, against a real uxplay process
-python3 tests/test_mpvoverlay.py  # the caption and the guest QR on the mpv
-                                  # side, by screenshotting a real mpv under
-                                  # Xvfb and decoding the code out of it
+./run-tests.sh              # everything; exits non-zero if anything failed
+./run-tests.sh cluster doc  # only files whose name matches
+./run-tests.sh -q           # one line per file
+```
 
+Tests that need something the machine has not got — GStreamer, mpv, a real
+`/proc`, a writable `/etc` — skip themselves and are listed at the end. A test
+that cannot run is not a failure, but it is not evidence either.
+
+Roughly what each covers:
+
+| file | what it is for |
+| --- | --- |
+| `test_smoke` | API contract, config, uploads, degradation |
+| `test_features` | playlist segments, validation, schedule cues |
+| `test_cluster` | beacons, group auth, sync maths, push progress |
+| `test_cluster_live` | two real nodes: discovery, auth, file push |
+| `test_access` | the login, and what it must never lock out |
+| `test_backup` | settings off one node and onto a blank one |
+| `test_support` | the diagnostic bundle, and that it leaks no secrets |
+| `test_preview` | capture follows demand, and stops when nobody looks |
+| `test_documents` | a PDF stays one entry and pages at playback |
+| `test_ingest` | HEIC becomes a JPEG at the door |
+| `test_shaders` | GLSL renders, and a broken one says why |
+| `test_playback_quality` | what will play well, and re-encoding what will not |
+| `test_status_render` | the status panel survives every backend's stats |
+| `test_gapless` | playlist items reuse the running mpv |
+| `test_nodisplay` | a node with no cable says so |
+| `test_netjoin` | joining Wi-Fi from the hotspot, and getting back |
+| `test_guest` | what the room can and cannot do, and the QR decodes |
+| `test_airplay` | AirPlay, against a real uxplay process |
+| `test_teardown` | nothing outlives its segment (real processes) |
+| `test_diagnose` | network-vs-Pi verdicts |
+| `test_overlay`, `test_mpvoverlay` | the caption and QR actually render |
+| `test_gui` | a real browser: the poll must not overwrite what you type |
+| `test_update` | updates, against real git repositories |
+
+```bash
 python -m pistreamer.runner --self-test             # the real video chain
 python -m pistreamer.runner --self-test-compressed  # decoder selection
 python -m pistreamer.runner --list-decoders         # what this box can decode
@@ -559,13 +675,23 @@ scripts/
   30-app.sh                 user, venv, polkit, systemd
   40-tune-boot.sh           config.txt / cmdline.txt, journald, service trim
   pistreamer-overclock      root helper: status | --from-request | <preset>
+  pistreamer-netcfg         root helper: hostname, Wi-Fi, hotspot, packages
   pistreamer-tuning         boot-time governor and scheduler tuning
+run-tests.sh                the suite; non-zero if anything failed
 src/pistreamer/
-  config.py                 atomic JSON config store
+  config.py                 atomic JSON config store, and the atomic
+                            write/read every other store uses
   display.py                DRM connector + mode discovery from sysfs
   sources.py                NDI discovery (GstDeviceMonitor, CLI fallback)
   ndiconfig.py              ndi-config.v1.json: adapters, IPs, discovery server
-  media.py                  local media library, path-traversal safe
+  media.py                  local media library, path-traversal safe, and
+                            whether a file will decode in hardware
+  ingest.py                 HEIC becomes a JPEG on arrival
+  documents.py              a PDF stays one entry; pages rendered at playback
+  transcode.py              re-encoding what will not play well
+  favourites.py             saved pages and streams
+  shaders.py                GLSL stored as files, drawn by the browser
+  preview.py                output frames, captured only while somebody looks
   playlists.py              named playlists of file/NDI segments
   schedule.py               time-of-day cues
   player.py                 the state machine, supervisor and sequencer
@@ -577,14 +703,26 @@ src/pistreamer/
   airplay.py                AirPlay receiving: uxplay's command line, and
                             reading a session out of its output
   guest.py                  guest sharing sessions, tokens, QR
+  auth.py                   the operator login: hashing, sessions, throttling
+  network.py                asking the root helper for Wi-Fi and hostname
+  backup.py                 settings off one node and onto another
+  support.py                the diagnostic bundle, with secrets redacted
+  cluster.py                signed UDP beacons, peer registry, node-to-node calls
+  syncplay.py               synchronised playback: aligned starts, drift
+                            correction, and how hard to correct
+  pushjob.py                copying a playlist to the other nodes, with progress
   updates.py                the app half of GUI-driven updates
   web.py                    FastAPI app
   static/index.html         the GUI, single file, no build step
   static/guest.html         the guest upload page, separate on purpose
+  static/shader.html        the WebGL runner — the screen and the editor
+                            preview use this same page
 systemd/
   pistreamer.service            the app (NoNewPrivileges=yes)
   pistreamer-overclock.path     watches for an overclock request
   pistreamer-overclock.service  root oneshot that applies a preset
+  pistreamer-netcfg.path        watches for a network/hostname request
+  pistreamer-netcfg.service     root oneshot that applies it
   pistreamer-tuning.service     boot-time tuning
 ```
 
