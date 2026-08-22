@@ -1677,10 +1677,21 @@ function activeTab() {
 async function poll() {
   try {
     STATE = await api("/api/status");
-    renderStatus();
   } catch (err) {
     $("statusDot").className = "dot err";
     $("statusText").textContent = "unreachable";
+    STATE = null;
+  }
+  // Deliberately outside the fetch. Drawing and reaching the node are
+  // different failures, and folding them together reported a missing property
+  // as the node being off the network.
+  if (STATE) {
+    try {
+      renderStatus();
+    } catch (err) {
+      console.error("renderStatus failed", err);
+      $("statusText").textContent = "display error";
+    }
   }
   try {
     const logs = await api("/api/logs");
@@ -1760,6 +1771,7 @@ function renderStatus() {
       dot.className = "dot on";
       txt.textContent = p.mode === "ndi" ? "receiving NDI"
         : p.mode === "web" ? "showing a web page"
+        : p.mode === "stream" ? "playing a stream"
         : p.mode === "airplay"
           ? ((STATE.airplay || {}).mirroring ? "AirPlay mirroring" : "AirPlay waiting")
           : "playing local";
@@ -1786,6 +1798,9 @@ function renderStatus() {
   } else if (p.mode === "web") {
     label = p.target || "(no address set)";
     mode = "web page"; chip = p.running ? "live" : "";
+  } else if (p.mode === "stream") {
+    label = p.target || c.stream_url || "(no address set)";
+    mode = "stream"; chip = p.running ? "live" : "";
   } else if (p.mode === "airplay") {
     const a = STATE.airplay || {};
     label = a.mirroring
@@ -1909,25 +1924,35 @@ function renderStream(st, p) {
   }
 
   const H = SPARKS;
-  const stale = st.since_last_frame !== null && st.since_last_frame > 2;
+  // mpv and the GStreamer runner report different subsets of one vocabulary:
+  // mpv has no frame counters, no arrival rate and no queue at all. Every
+  // field here therefore has to survive being missing. `!== null` did not —
+  // undefined sailed past it and threw on .toFixed, which poll() caught and
+  // reported as the node being unreachable.
+  const has = (v) => v !== null && v !== undefined;
+  const fmt = (v, f) => (has(v) ? f(v) : "—");
+  const fps1 = (v) => v.toFixed(1) + "<small> fps</small>";
+  const count = (v) => v.toLocaleString();
+
+  const stale = has(st.since_last_frame) && st.since_last_frame > 2;
   const res = (st.width && st.height) ? `${st.width}×${st.height}` : "—";
+  const shown = has(st.rendered) ? st.rendered : st.frames_total;
   const tiles = [
-    ["Arriving", st.arrival_fps !== null && st.arrival_fps !== undefined
-      ? st.arrival_fps.toFixed(1) + "<small> fps</small>" : "—",
+    ["Arriving", fmt(st.arrival_fps, fps1),
       { sub: st.declared_fps ? `sender declares ${st.declared_fps}` : "from the network" }],
-    ["On screen", st.fps !== null ? st.fps.toFixed(1) + "<small> fps</small>" : "—",
-      { sub: st.arrival_fps ? `of ${st.arrival_fps.toFixed(1)} arriving` : null,
+    ["On screen", fmt(st.fps, fps1),
+      { sub: has(st.arrival_fps) ? `of ${st.arrival_fps.toFixed(1)} arriving` : null,
         spark: H.fps, sparkId: "s-fps" }],
     ["Resolution", res, { sub: st.format || null }],
-    ["To display", st.render_mbps !== null ? st.render_mbps + "<small> Mbps</small>" : "—",
+    ["To display", fmt(st.render_mbps, (v) => v + "<small> Mbps</small>"),
       { sub: "after conversion" }],
-    ["Frames shown", st.rendered !== null && st.rendered !== undefined ? st.rendered.toLocaleString() : st.frames_total.toLocaleString(), {}],
-    ["Frames dropped", st.dropped !== null && st.dropped !== undefined ? st.dropped.toLocaleString() : "—",
+    ["Frames shown", fmt(shown, count), {}],
+    ["Frames dropped", fmt(st.dropped, count),
       { sub: st.qos_events ? st.qos_events + " QoS events" : null }],
-    ["Queue overruns", (st.queue_overruns || 0).toLocaleString(),
+    ["Queue overruns", fmt(st.queue_overruns, count),
       { sub: st.queue_overruns ? "the Pi fell behind" : "display path keeping up" }],
-    ["Last frame", st.since_last_frame !== null ? st.since_last_frame.toFixed(1) + "<small> s ago</small>" : "—",
-      { sub: st.time_to_first_frame !== null ? `first frame in ${st.time_to_first_frame}s` : null }],
+    ["Last frame", fmt(st.since_last_frame, (v) => v.toFixed(1) + "<small> s ago</small>"),
+      { sub: has(st.time_to_first_frame) ? `first frame in ${st.time_to_first_frame}s` : null }],
   ];
   grid.innerHTML = tiles.map(([k, v, o]) => tile(k, v, o)).join("");
   paintSparks(grid, { "s-fps": { values: H.fps || [], color: "var(--series-fps)" } });
