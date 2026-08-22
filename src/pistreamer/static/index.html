@@ -75,29 +75,47 @@
   }
   .dot.err { background: var(--bad); box-shadow: 0 0 0 3px rgba(229,84,75,.15); }
 
+  /* The dashboard: always on screen, above the tiles. What is playing, what
+     it looks like, and whether the node is well. */
+  #dash { padding: 20px 16px 0; max-width: 1180px; margin: 0 auto; }
+  .dash-grid {
+    display: grid; gap: 14px;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  @media (max-width: 760px) { .dash-grid { grid-template-columns: 1fr; } }
+
+  /* Tiles. Not tabs any more, but the same buttons and the same data-tab, so
+     the switching underneath is unchanged. */
   nav {
-    display: flex; gap: 2px; padding: 0 12px; background: var(--panel);
-    border-bottom: 1px solid var(--line); overflow-x: auto;
-    position: sticky; top: 53px; z-index: 19;
-    scrollbar-width: none; -webkit-overflow-scrolling: touch;
-    /* Fades the last tab out at the edge instead of chopping it in half, so a
-       phone shows there is more to scroll to. */
-    -webkit-mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 24px), transparent 100%);
-            mask-image: linear-gradient(90deg, #000 0, #000 calc(100% - 24px), transparent 100%);
+    display: grid; gap: 10px; padding: 16px;
+    grid-template-columns: repeat(auto-fit, minmax(165px, 1fr));
+    max-width: 1180px; margin: 0 auto;
   }
-  nav::-webkit-scrollbar { display: none; }
   nav button {
-    background: none; border: none; color: var(--muted);
-    padding: 12px 14px; min-height: 44px;
-    font: inherit; font-size: 14px; cursor: pointer;
-    border-bottom: 2px solid transparent; white-space: nowrap;
-    transition: color var(--fast) var(--ease), background var(--fast) var(--ease);
+    display: flex; flex-direction: column; align-items: flex-start; gap: 2px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    color: var(--text); padding: 14px 15px; min-height: 44px;
+    font: inherit; text-align: left; cursor: pointer;
+    transition: border-color var(--fast) var(--ease),
+                background var(--fast) var(--ease),
+                transform var(--fast) var(--ease);
   }
-  nav button:hover { color: var(--text); background: var(--panel-2); }
-  nav button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-  nav button.active { color: var(--text); border-bottom-color: var(--accent); }
-  /* Something is waiting on this tab. A dot rather than a count: the number
-     of commits is not what you need to know from the nav. */
+  nav button i { font-style: normal; font-size: 21px; line-height: 1.1; }
+  nav button b { font-size: 15px; font-weight: 650; letter-spacing: -.2px; }
+  nav button span { font-size: 12.5px; color: var(--muted); }
+  nav button:hover { background: var(--panel-2); }
+  nav button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  nav button.active {
+    border-color: var(--accent); background: var(--accent-wash);
+  }
+  /* The open tile points at its own panel, so it is obvious which of six
+     things the wall of settings below belongs to. */
+  nav button.active::before {
+    content: ""; position: absolute; margin-top: -27px; margin-left: -15px;
+    width: 3px; height: 100%; background: var(--accent);
+    border-radius: 0 2px 2px 0;
+  }
+  nav button.active { position: relative; }
   nav button.flag::after {
     content: ""; display: inline-block; width: 6px; height: 6px;
     border-radius: 50%; background: var(--accent); margin-left: 7px;
@@ -634,23 +652,11 @@
   <span class="pill"><span class="dot" id="statusDot"></span><span id="statusText">connecting</span></span>
 </header>
 
-<nav>
-  <button data-tab="now" class="active">Now playing</button>
-  <button data-tab="ndi">Sources</button>
-  <button data-tab="media">Media</button>
-  <button data-tab="nodes">Nodes</button>
-  <button data-tab="output">Output</button>
-  <button data-tab="system">System</button>
-</nav>
-
-<main>
-  <!-- NOW PLAYING -->
-  <section id="tab-now" class="active">
-    <div id="playerError"></div>
-    <div class="card" id="verdictCard" style="display:none">
-      <h2>Diagnosis</h2>
-      <div id="verdict"></div>
-    </div>
+<!-- Always on screen: what is playing, what it looks like, and whether the
+     node is healthy. Everything else is a tile away. -->
+<div id="dash">
+  <div id="playerError"></div>
+  <div class="dash-grid">
     <div class="card hero">
       <div class="hero-head">
         <span class="chip" id="nowMode">idle</span>
@@ -662,10 +668,10 @@
         <button class="btn primary" id="btnRestart">Restart pipeline</button>
         <button class="btn danger" id="btnStop">Stop output</button>
       </div>
+      <div class="grid" id="healthGrid" style="margin-top:16px"></div>
     </div>
     <div class="card" id="previewCard">
-      <h2>Preview</h2>
-      <div class="row" style="margin-bottom:12px">
+      <div class="row" style="margin-bottom:10px">
         <span class="seg" id="previewRates">
           <button data-rate="off">Off</button>
           <button data-rate="slow">Slow</button>
@@ -677,16 +683,30 @@
         <div class="placeholder" id="previewPlaceholder">Preview is off.</div>
       </div>
     </div>
+  </div>
+  <div class="card" id="verdictCard" style="display:none">
+    <h2>Diagnosis</h2>
+    <div id="verdict"></div>
+  </div>
+</div>
 
+<nav>
+  <button data-tab="now"><i>▶️</i><b>Now playing</b><span>stream detail and log</span></button>
+  <button data-tab="ndi"><i>📡</i><b>Sources</b><span>NDI, web, streams, AirPlay</span></button>
+  <button data-tab="media"><i>🎬</i><b>Media</b><span>library, playlists, schedule</span></button>
+  <button data-tab="nodes"><i>🌐</i><b>Nodes</b><span>the group and sync</span></button>
+  <button data-tab="output"><i>📺</i><b>Output</b><span>display, audio, pipeline</span></button>
+  <button data-tab="system"><i>⚙️</i><b>System</b><span>access, network, updates</span></button>
+</nav>
+
+<main>
+  <!-- NOW PLAYING -->
+  <section id="tab-now">
     <div class="cols">
       <div class="card">
         <h2>Stream</h2>
         <div class="grid" id="streamGrid"></div>
         <div class="host" id="streamNote" style="margin-top:10px"></div>
-      </div>
-      <div class="card">
-        <h2>Health</h2>
-        <div class="grid" id="healthGrid"></div>
       </div>
       <div class="card wide">
         <h2>Pipeline log</h2>
@@ -730,6 +750,7 @@
         <button class="btn primary" id="btnPlayWeb">Show page</button>
         <button class="btn" id="btnSaveWeb">Save as favourite</button>
       </div>
+      <div id="browserState" style="margin-top:12px"></div>
     </div>
 
     <div class="card">
@@ -1616,10 +1637,18 @@ function fmtDuration(sec) {
 
 document.querySelectorAll("nav button").forEach((btn) => {
   btn.onclick = () => {
+    // Clicking the tile that is already open closes it, leaving the dashboard
+    // and the tiles. One panel at a time either way.
+    const reopening = btn.classList.contains("active");
     document.querySelectorAll("nav button").forEach((b) => b.classList.remove("active"));
     document.querySelectorAll("main section").forEach((s) => s.classList.remove("active"));
+    if (reopening) {
+      try { localStorage.removeItem("openTile"); } catch (_) {}
+      return;
+    }
     btn.classList.add("active");
     $("tab-" + btn.dataset.tab).classList.add("active");
+    try { localStorage.setItem("openTile", btn.dataset.tab); } catch (_) {}
     const tab = btn.dataset.tab;
     // Returning to Now Playing resumes capture; leaving it lets the request
     // age out on the node a few seconds later.
@@ -1633,14 +1662,14 @@ document.querySelectorAll("nav button").forEach((btn) => {
     }
     if (tab === "output") { loadConnectors(); loadAudioDevices(); loadPerf(); }
     if (tab === "system") { loadAccess(); loadWizNetwork("sysNetwork"); loadTelemetry(); loadOverclock(); loadUpdate(); }
-    if (tab === "ndi") { loadNdiNetwork(); loadAirplay(); loadFavourites(); }
+    if (tab === "ndi") { loadNdiNetwork(); loadAirplay(); loadFavourites(); loadBrowserState(); }
     if (tab === "nodes") loadNodes();
   };
 });
 
 function activeTab() {
   const b = document.querySelector("nav button.active");
-  return b ? b.dataset.tab : "now";
+  return b ? b.dataset.tab : "";   // "" = tiles only, nothing expanded
 }
 
 // ---------- status polling ----------
@@ -4024,6 +4053,54 @@ async function loadAccess() {
   $("btnRunSetup").onclick = () => openWizard();
 }
 
+// ---------- the browser the web page source needs ----------
+//
+// Chromium is a few hundred megabytes and only web mode wants it, so it is
+// optional at install time. That leaves this: a node that says it cannot show
+// a page, and a button rather than an instruction to go and SSH in.
+
+let BROWSER_POLL = null;
+
+async function loadBrowserState() {
+  const box = $("browserState");
+  if (!box) return;
+  let b;
+  try { b = await api("/api/web/browser"); }
+  catch (_) { box.innerHTML = ""; return; }
+
+  if (b.installed && !b.busy) {
+    box.innerHTML = `<span class="host">Browser: ${esc(b.command)}</span>`;
+    if (BROWSER_POLL) { clearInterval(BROWSER_POLL); BROWSER_POLL = null; }
+    return;
+  }
+  if (b.busy) {
+    box.innerHTML = `<div class="banner warn">Installing chromium — a few
+      hundred megabytes, so give it a few minutes. It is safe to leave this
+      page.</div>`;
+    if (!BROWSER_POLL) BROWSER_POLL = setInterval(loadBrowserState, 5000);
+    return;
+  }
+  const failed = b.last && b.last.ok === false ? b.last.message : "";
+  box.innerHTML = `
+    <div class="banner warn">Chromium is not installed, so web pages cannot be
+      shown yet.</div>
+    ${failed ? `<div class="banner">${esc(failed)}</div>` : ""}
+    <button class="btn primary" id="btnInstallBrowser"${
+      b.can_install ? "" : " disabled"}>Install chromium</button>
+    ${b.can_install ? "" : `<span class="host">the root helper is not installed
+      — re-run install.sh</span>`}`;
+  const btn = $("btnInstallBrowser");
+  if (btn) btn.onclick = async () => {
+    btn.disabled = true;
+    try {
+      const r = await post("/api/web/browser", {});
+      toast(r.note || "Installing chromium");
+      loadBrowserState();
+    } catch (err) { toast(err.message, true); btn.disabled = false; }
+  };
+  if (BROWSER_POLL) { clearInterval(BROWSER_POLL); BROWSER_POLL = null; }
+}
+
 // ---------- preview ----------
 //
 // The node captures only while somebody is asking, and each request for a
@@ -4072,8 +4149,9 @@ function showPreviewPlaceholder(text) {
 
 async function previewTick() {
   if (PREVIEW_RATE === "off" || PREVIEW_BUSY) return;
-  // Nothing to look at while the gate is up or another tab is showing.
-  if (activeTab() !== "now" || document.hidden) {
+  // The preview is part of the dashboard now, so the only reason to stop is
+  // the browser itself being hidden.
+  if (document.hidden) {
     PREVIEW_TIMER = setTimeout(previewTick, 1000);
     return;
   }
@@ -4463,6 +4541,15 @@ async function netAction(what, into, box) {
 
 // Ask what we are before drawing anything: a locked node should show its login
 // rather than a console full of "unreachable".
+// Come back to the panel that was open, so a refresh mid-task does not dump
+// you back at the tiles.
+(() => {
+  let want = null;
+  try { want = localStorage.getItem("openTile"); } catch (_) {}
+  const tile = want && document.querySelector(`nav button[data-tab="${want}"]`);
+  if (tile) tile.click();
+})();
+
 setPreviewRate(PREVIEW_RATE);
 loadPreviewState();
 checkAuth().then(() => {

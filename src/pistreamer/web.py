@@ -824,6 +824,35 @@ async def play_web(body: PlayWeb) -> Dict[str, Any]:
     return status
 
 
+@app.get("/api/web/browser")
+async def get_browser() -> Dict[str, Any]:
+    """Is the browser the web page source needs actually here?"""
+    found = next((b for b in ("chromium-browser", "chromium",
+                              "chromium-browser-stable") if shutil.which(b)), None)
+    last = network.result()
+    return {
+        "installed": bool(found),
+        "command": found or "",
+        "can_install": network.available()[0],
+        "busy": network.busy(),
+        "last": last if last.get("action") == "install-chromium" else {},
+    }
+
+
+@app.post("/api/web/browser")
+async def post_browser() -> Dict[str, Any]:
+    """Ask the root helper to install it. Takes no package name, deliberately."""
+    if shutil.which("chromium") or shutil.which("chromium-browser"):
+        return {"installed": True, "note": "chromium is already installed"}
+    try:
+        network.submit("install-chromium")
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"installing": True,
+            "note": "Installing chromium — this downloads a few hundred "
+                    "megabytes and takes a few minutes."}
+
+
 @app.post("/api/play/stream")
 async def play_stream(body: PlayStream) -> Dict[str, Any]:
     """Play a live stream: HLS/DASH over http(s), or udp/rtp/rtsp/srt."""

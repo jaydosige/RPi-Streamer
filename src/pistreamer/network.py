@@ -28,7 +28,8 @@ from . import config
 
 log = logging.getLogger(__name__)
 
-ACTIONS = ("scan", "join", "hotspot-on", "hotspot-off", "hostname")
+ACTIONS = ("scan", "join", "hotspot-on", "hotspot-off", "hostname",
+           "install-chromium")
 HELPER = Path("/opt/pistreamer/bin/pistreamer-netcfg")
 
 # How long a caller should wait for the helper before deciding it is not there.

@@ -363,8 +363,44 @@ def act_hostname(req):
     return True, {"hostname": clean}, f"hostname set to {clean}"
 
 
+def act_install_chromium(_req):
+    """Install the browser the web page source needs.
+
+    No package name crosses the boundary — the action itself is the whole
+    request. The thing writing it is a web GUI on an event network, and
+    "install this package for me" with a name attached is a remote root shell
+    with extra steps.
+    """
+    if shutil.which("chromium") or shutil.which("chromium-browser"):
+        return True, {"already": True}, "chromium is already installed"
+    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+    code, _out, err = subprocess_env(["apt-get", "update"], env, 300)
+    if code != 0:
+        return False, {}, f"apt-get update failed: {err[:200]}"
+    for package in ("chromium", "chromium-browser"):
+        code, _out, err = subprocess_env(
+            ["apt-get", "install", "-y", "--no-install-recommends", package],
+            env, 1800)
+        if code == 0 and (shutil.which("chromium") or shutil.which("chromium-browser")):
+            return True, {"package": package}, f"installed {package}"
+    return False, {}, f"could not install chromium: {err[:200]}"
+
+
+def subprocess_env(args, env, timeout):
+    """run() with an environment. apt needs DEBIAN_FRONTEND to stay silent."""
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True,
+                              timeout=timeout, env=env)
+        return proc.returncode, (proc.stdout or "").strip(), (proc.stderr or "").strip()
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{args[0]} timed out"
+    except OSError as exc:
+        return 127, "", str(exc)
+
+
 ACTIONS = {
     "scan": act_scan,
+    "install-chromium": act_install_chromium,
     "join": act_join,
     "hotspot-on": act_hotspot_on,
     "hotspot-off": act_hotspot_off,

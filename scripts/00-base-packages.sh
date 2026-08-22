@@ -67,6 +67,18 @@ ok "Base packages ready"
 # it simply is not there, and that is not a reason to fail an install: the node
 # works perfectly well without AirPlay, and the GUI already says so with the
 # command to fix it. Hence the || rather than set -e taking the whole run down.
+# --- Web page source -------------------------------------------------------
+# Chromium is ~400 MB installed and only web mode needs it, but a node that
+# cannot show a dashboard until somebody SSHes in is worse than a slightly
+# bigger image. Optional like uxplay: its absence is not a failed install, and
+# the GUI offers to add it later.
+if apt_install chromium 2>/dev/null || apt_install chromium-browser 2>/dev/null; then
+  ok "Web page source available (chromium)"
+else
+  warn "chromium is not in this distribution's archive, so the web page source"
+  warn "will be unavailable until it is installed. The GUI has a button for it."
+fi
+
 if apt_install uxplay 2>/dev/null; then
   ok "AirPlay receiving available (uxplay $(uxplay -v 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1))"
 else
