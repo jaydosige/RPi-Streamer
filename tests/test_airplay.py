@@ -474,10 +474,18 @@ def main() -> int:  # noqa: C901 - a test script, read top to bottom
         if HAVE_UXPLAY and HAVE_DNSSD:
             r = client.post("/api/play/airplay")
             check("POST /api/play/airplay -> 200", r.status_code == 200, r.text)
-            check("...and the node is in AirPlay mode",
-                  config.load().mode == "airplay", config.load().mode)
+            # Arming AirPlay deliberately does NOT take the screen: whatever is
+            # playing stays up until a device actually connects.
+            check("...and the node is armed rather than switched over",
+                  config.load().airplay_enabled is True, config.load().mode)
+            check("...leaving the current playback alone",
+                  config.load().mode != "airplay", config.load().mode)
+            r = client.get("/api/airplay")
+            check("...and the API reports it ready", r.json()["ready"] is True, r.text)
             client.post("/api/stop")
             check("stopping leaves idle", config.load().mode == "idle")
+            check("stopping disarms AirPlay too",
+                  config.load().airplay_enabled is False)
         else:
             r = client.post("/api/play/airplay")
             check("it refuses clearly when it cannot", r.status_code == 409, r.text)

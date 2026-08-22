@@ -23,13 +23,15 @@ STATE_DIR = Path(os.environ.get("PISTREAMER_STATE", "/var/lib/pistreamer"))
 @dataclass
 class Config:
     # --- what to play ---
-    # mode: "idle" | "ndi" | "local"
+    # mode: "idle" | "ndi" | "local" | "web"
     mode: str = "idle"
     # NDI source name exactly as advertised on the network,
     # e.g. "STUDIO-PC (OBS)"
     ndi_source: str = ""
     # Filename (not path) inside MEDIA_DIR, or "" for the whole folder
     local_file: str = ""
+    # URL to display in web mode (e.g. "http://example.com")
+    web_url: str = ""
     loop: bool = True
     # Restore the above on boot rather than starting idle
     autostart: bool = True
@@ -225,6 +227,13 @@ class Config:
     # Correct playback drift against the leader while a synchronised playlist
     # runs. Off still gives a synchronised *start*, just no correction after it.
     cluster_drift_correct: bool = True
+    # How hard to pull a drifting node back: "gentle" | "normal" | "firm" |
+    # "lock". See syncplay.STRENGTHS. A speed nudge alone cannot fix a node
+    # whose decode runs at a slightly different rate — it only cancels the
+    # error rather than closing it — so the firmer profiles also seek sooner
+    # and give up on nudging faster. Set per node: the one with the speakers on
+    # it can stay gentle while the video wall around it locks.
+    cluster_sync_strength: str = "normal"
     # Show the node name and IP over the picture. Toggled from the GUI across
     # the whole group; persisted so a reboot mid-show comes back identified.
     identify: bool = False

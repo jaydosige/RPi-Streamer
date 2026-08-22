@@ -36,23 +36,101 @@ from typing import Any, Dict, List, Optional
 
 log = logging.getLogger(__name__)
 
-# Below this we are as good as locked; leave it alone. A frame at 50fps is 20ms,
-# and chasing smaller errors than that just means never settling.
-IN_SYNC_S = 0.020
-# Above this a seek is the only way back; below it, ride the speed nudge.
-# A quarter second is roughly where a viewer stops reading it as "soft" and
-# starts seeing two different pictures.
-SEEK_ABOVE_S = 0.25
-# Playback speed used while catching up. 2% is inaudible on speech and music
-# and closes a 100ms error in five seconds.
-NUDGE = 0.02
-# How long to hold a nudge before re-evaluating. Long enough for the correction
-# to actually take effect, short enough to not overshoot.
-NUDGE_HOLD_S = 1.0
 # Slack between "everyone is ready" and the agreed start instant. It has to
 # cover the slowest node's scheduling jitter and the one-way trip of the start
 # command; 750ms is generous on a wired LAN and still feels immediate.
 START_SLACK_S = 0.75
+
+
+@dataclass(frozen=True)
+class Strength:
+    """How hard a follower works to stay locked to the leader.
+
+    There is no single right answer here, which is why it is a setting rather
+    than a tuned constant. Two panels of a video wall side by side make a 100ms
+    error obvious, so that job wants correction hard enough to be worth a
+    visible seek. A room of speakers playing the same music wants the opposite:
+    a 5% speed change is audible and a seek is far worse than the drift it
+    fixes. The same node does both jobs on different days.
+
+    Fields:
+      in_sync_s      below this, stop correcting — chasing noise never settles
+      seek_above_s   above this, only a seek gets us back
+      max_nudge      largest speed change allowed, as a fraction of 1.0
+      hold_s         how long a nudge is left to take effect before re-deciding
+      close_over_s   time a nudge aims to take to close the whole gap
+      pulse_interval_s how often the leader publishes its playhead
+      give_up_after_s  nudging for this long without reaching sync escalates to
+                       a seek; 0 never escalates
+    """
+
+    name: str
+    label: str
+    in_sync_s: float
+    seek_above_s: float
+    max_nudge: float
+    hold_s: float
+    close_over_s: float
+    pulse_interval_s: float
+    give_up_after_s: float
+    note: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name, "label": self.label, "note": self.note,
+            "in_sync_ms": round(self.in_sync_s * 1000),
+            "seek_above_ms": round(self.seek_above_s * 1000),
+            "max_nudge_percent": round(self.max_nudge * 100, 1),
+            "pulse_interval_s": self.pulse_interval_s,
+        }
+
+
+STRENGTHS: Dict[str, Strength] = {
+    "gentle": Strength(
+        "gentle", "Gentle", in_sync_s=0.040, seek_above_s=0.60, max_nudge=0.010,
+        hold_s=2.0, close_over_s=8.0, pulse_interval_s=3.0, give_up_after_s=0.0,
+        note="Never audibly changes speed and almost never seeks. For music and "
+             "speech, where a correction is worse than the drift.",
+    ),
+    "normal": Strength(
+        "normal", "Normal", in_sync_s=0.020, seek_above_s=0.25, max_nudge=0.020,
+        hold_s=1.0, close_over_s=4.0, pulse_interval_s=2.0, give_up_after_s=30.0,
+        note="Corrections stay invisible on picture and inaudible on speech. "
+             "The right default for most content.",
+    ),
+    "firm": Strength(
+        "firm", "Firm", in_sync_s=0.015, seek_above_s=0.12, max_nudge=0.050,
+        hold_s=0.75, close_over_s=2.0, pulse_interval_s=1.0, give_up_after_s=15.0,
+        note="Pulls harder and seeks sooner. Occasional audible speed change on "
+             "music. For a video wall where panels are seen side by side.",
+    ),
+    "lock": Strength(
+        "lock", "Lock", in_sync_s=0.010, seek_above_s=0.06, max_nudge=0.100,
+        hold_s=0.5, close_over_s=1.0, pulse_interval_s=0.5, give_up_after_s=8.0,
+        note="Tightest hold available: frame-accurate, at the cost of visible "
+             "seeks and audible speed changes. For silent picture-critical walls.",
+    ),
+}
+DEFAULT_STRENGTH = "normal"
+
+
+def profile(name: Any = None) -> Strength:
+    """Resolve a strength by name, falling back to the default.
+
+    Unknown names fall back rather than raising: a config file carried over
+    from a newer version should not stop a node playing.
+    """
+    if isinstance(name, Strength):
+        return name
+    return STRENGTHS.get(str(name or DEFAULT_STRENGTH), STRENGTHS[DEFAULT_STRENGTH])
+
+
+# The default profile's numbers, kept as module constants because they are the
+# shape of the problem rather than one profile's opinion of it.
+IN_SYNC_S = STRENGTHS[DEFAULT_STRENGTH].in_sync_s
+SEEK_ABOVE_S = STRENGTHS[DEFAULT_STRENGTH].seek_above_s
+NUDGE = STRENGTHS[DEFAULT_STRENGTH].max_nudge
+NUDGE_HOLD_S = STRENGTHS[DEFAULT_STRENGTH].hold_s
 
 
 @dataclass
@@ -96,8 +174,19 @@ def expected_position(pulse: Dict[str, Any], now: float) -> Optional[float]:
 
 
 def decide(pulse: Dict[str, Any], own_position: Optional[float], now: float,
-           nudging_until: float = 0.0) -> Correction:
-    """Compare our playhead with the leader's and say what to do about it."""
+           nudging_until: float = 0.0, strength: Any = None,
+           correcting_since: float = 0.0) -> Correction:
+    """Compare our playhead with the leader's and say what to do about it.
+
+    `correcting_since` is when this node last went out of sync and has been
+    trying to get back ever since — 0 if it is not currently correcting. It
+    exists because a nudge can be *exactly* cancelled out: a node whose decode
+    runs half a percent slow, fed a half-percent speed-up, sits at a constant
+    drift forever, correcting the whole time and never arriving. Speed alone
+    cannot fix a rate difference, only an offset. So once a profile has given
+    the nudge long enough, it stops asking politely and seeks.
+    """
+    s = profile(strength)
     target = expected_position(pulse, now)
     if target is None:
         return Correction("hold", 0.0, reason="no usable pulse")
@@ -105,20 +194,35 @@ def decide(pulse: Dict[str, Any], own_position: Optional[float], now: float,
         return Correction("hold", 0.0, reason="no local position yet")
 
     drift = own_position - target
+    out = abs(drift)
+    way = "ahead" if drift > 0 else "behind"
 
-    if abs(drift) > SEEK_ABOVE_S:
+    if out > s.seek_above_s:
         return Correction("seek", drift, speed=1.0, seek_to=target,
                           reason=f"{drift * 1000:.0f}ms out — seeking")
-    if abs(drift) <= IN_SYNC_S:
+    if out <= s.in_sync_s:
         # Returning to 1.0 explicitly matters: a node that reaches sync while
         # nudging would otherwise sail straight past it.
         return Correction("hold", drift, speed=1.0, reason="in sync")
+    if (s.give_up_after_s and correcting_since
+            and now - correcting_since > s.give_up_after_s):
+        return Correction(
+            "seek", drift, speed=1.0, seek_to=target,
+            reason=f"{drift * 1000:.0f}ms {way} after "
+                   f"{now - correcting_since:.0f}s of nudging — seeking",
+        )
     if now < nudging_until:
         return Correction("hold", drift, reason="nudge in progress")
-    # Ahead of the leader -> play slower to let them catch up, and vice versa.
-    speed = 1.0 - NUDGE if drift > 0 else 1.0 + NUDGE
+    # Proportional rather than a flat step: aim to close the whole gap over the
+    # profile's window, and cap it at what the profile will tolerate. A flat
+    # nudge has to be sized for the worst case, which makes it overshoot the
+    # common one and oscillate; scaling it means a large error is corrected
+    # hard and a small one is barely touched.
+    rate = min(out / s.close_over_s, s.max_nudge)
+    speed = 1.0 - rate if drift > 0 else 1.0 + rate
     return Correction("nudge", drift, speed=round(speed, 4),
-                      reason=f"{drift * 1000:.0f}ms {'ahead' if drift > 0 else 'behind'}")
+                      reason=f"{drift * 1000:.0f}ms {way} — {rate * 100:.1f}% for "
+                             f"{s.hold_s:g}s")
 
 
 def start_instant(offsets: Dict[str, Optional[float]], now: Optional[float] = None,
@@ -164,6 +268,11 @@ class Conductor:
         self._stop = None
         self._state: Dict[str, Any] = {"running": False}
         self._lock = None
+        # How hard followers will be asked to hold. The leader only needs it for
+        # the pulse rate — the corrections themselves are each follower's own
+        # decision, made against its own config, because a node may legitimately
+        # be set gentler than the group (the one with the speakers on it).
+        self._strength = profile(DEFAULT_STRENGTH)
 
     # The threading objects are created lazily so the pure-logic parts of this
     # module stay importable in contexts that never run a session.
@@ -180,11 +289,12 @@ class Conductor:
             return dict(self._state)
 
     def start(self, items: List[Dict[str, Any]], targets: List[Any],
-              loop: bool = True) -> Dict[str, Any]:
+              loop: bool = True, strength: Any = None) -> Dict[str, Any]:
         import threading
         self._ensure()
         if not items:
             raise ValueError("nothing to play")
+        self._strength = profile(strength)
         if self._thread is not None and self._thread.is_alive():
             self.stop()
         self._stop.clear()
@@ -200,6 +310,7 @@ class Conductor:
                 "index": 0, "loop": loop,
                 "nodes": [getattr(t, "name", "?") for t in targets],
                 "started_at": None, "last": {},
+                "strength": self._strength.to_dict(),
             }
         self._thread = threading.Thread(
             target=self._run, args=(items, targets, loop, session),
@@ -359,7 +470,7 @@ class Conductor:
                     })
                 except Exception:  # noqa: BLE001 - a missed pulse is not fatal
                     pass
-            if self._stop.wait(2.0):
+            if self._stop.wait(self._strength.pulse_interval_s):
                 return
 
 

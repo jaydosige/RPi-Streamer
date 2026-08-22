@@ -303,6 +303,12 @@
   }
   .chip.live { background: var(--accent-wash); color: #9dc0ff; border-color: transparent; }
   .chip.standby { background: rgba(250, 178, 25, .12); color: #f0cf95; border-color: transparent; }
+  /* Playback verdict on a media row. Cursor is a help cursor because the badge
+     is a one-word summary and the reasons live in its tooltip. */
+  .chip.ok { background: rgba(60, 190, 120, .12); color: #86dcab; border-color: transparent; }
+  .chip.warn { background: rgba(250, 178, 25, .12); color: #f0cf95; border-color: transparent; }
+  .chip.err { background: rgba(229, 84, 75, .14); color: #f2a29c; border-color: transparent; }
+  .chip[title] { cursor: help; }
 
   label.field { display: block; margin-bottom: 13px; }
   label.field .lbl { display: block; font-size: 13px; color: var(--muted); margin-bottom: 5px; }
@@ -516,11 +522,26 @@
       <h2>AirPlay</h2>
       <div class="note" style="margin-bottom:12px">
         An iPhone, iPad or Mac mirrors onto this node from the AirPlay picker.
-        Receiving takes the screen, so it is a source like any other &mdash;
-        starting it stops whatever is playing, and the screen stays black until
-        somebody actually connects.
+        Making the node ready leaves whatever is playing on the screen &mdash;
+        the mirror only takes over once somebody actually connects.
       </div>
       <div id="airplayBody"></div>
+    </div>
+
+    <div class="card">
+      <h2>Web page</h2>
+      <div class="note" style="margin-bottom:12px">
+        Show a web page full screen &mdash; a dashboard, a scoreboard, a running
+        order. The page is loaded in a kiosk browser and takes the screen like
+        any other source.
+      </div>
+      <label class="field">
+        <span class="lbl">Address &mdash; must start with <code>http://</code> or <code>https://</code></span>
+        <input type="text" id="webUrl" placeholder="https://example.com/dashboard">
+      </label>
+      <div class="row">
+        <button class="btn primary" id="btnPlayWeb">Show page</button>
+      </div>
     </div>
 
     <div class="card">
@@ -600,7 +621,15 @@
         <span class="host" id="uploadNote"></span>
       </div>
       <div id="uploadProgress"></div>
+      <div id="transcodeProgress"></div>
       <ul class="list" id="mediaList"></ul>
+      <div class="note" style="margin-top:12px">
+        The badge on each video says how it will decode. <b>Hardware</b> plays on
+        the Pi's own video block and is what you want. <b>Software</b> means the
+        CPU has to decode every frame, which on a Pi 4 is where stutter, dropped
+        frames and audio drift come from &mdash; Optimise re-encodes it to
+        1080p H.264, which the hardware can take. Hover a badge for the reason.
+      </div>
     </div>
     <div class="card" id="guestCard">
       <h2>Guest sharing</h2>
@@ -801,6 +830,18 @@
         With this off you still get a synchronised start for every item, just no
         correction afterwards &mdash; which is enough for short clips and avoids
         any chance of a visible correction mid-item.
+      </div>
+      <label class="field" style="margin-top:13px">
+        <span class="lbl">How hard to pull a drifting node back</span>
+        <select id="cfgSyncStrength"></select>
+      </label>
+      <div class="note" id="syncStrengthNote"></div>
+      <div class="note" style="margin-top:8px">
+        Set per node, not per group: the node with the speakers on it can stay
+        gentle while the wall around it locks. A speed nudge alone cannot fix a
+        node whose decode runs at a slightly different rate &mdash; it cancels
+        the error rather than closing it &mdash; so the firmer settings also
+        give up on nudging sooner and take a visible seek instead.
       </div>
       <button class="btn" id="btnSaveCluster" style="margin-top:8px">Save group settings</button>
     </div>
@@ -1266,6 +1307,7 @@ const CONFIG_FIELDS = {
   cluster_extra_ips: "cfgClusterExtraIps",
   cluster_group: "cfgClusterGroup",
   cluster_key: "cfgClusterKey",
+  cluster_sync_strength: "cfgSyncStrength",
   connector: "cfgConnector",
   device_name: "cfgHostname",
   ndi_adapter_ips: "cfgAdapterIps",
@@ -1292,6 +1334,14 @@ const post = async (path, data) => {
   }
   return reply;
 };
+
+// For anything interpolated into markup, and required for attributes: probe
+// reasons carry quotes and the ×/dimensions strings are built from file data.
+function esc(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
 
 function fmtBytes(n) {
   if (n === null || n === undefined) return "—";
@@ -1321,7 +1371,13 @@ document.querySelectorAll("nav button").forEach((btn) => {
     btn.classList.add("active");
     $("tab-" + btn.dataset.tab).classList.add("active");
     const tab = btn.dataset.tab;
-    if (tab === "media") { loadMedia(); loadPlaylists(); loadSchedule(); loadGuest(); }
+    if (tab === "media") {
+      loadMedia(); loadPlaylists(); loadSchedule(); loadGuest();
+      // Rejoin a conversion that was started before this tab was last left.
+      api("/api/transcode").then((t) => {
+        if (t.job && t.job.running) watchTranscode();
+      }).catch(() => {});
+    }
     if (tab === "output") { loadConnectors(); loadAudioDevices(); loadPerf(); }
     if (tab === "system") { loadTelemetry(); loadOverclock(); loadUpdate(); }
     if (tab === "ndi") { loadNdiNetwork(); loadAirplay(); }
@@ -1421,6 +1477,7 @@ function renderStatus() {
     else {
       dot.className = "dot on";
       txt.textContent = p.mode === "ndi" ? "receiving NDI"
+        : p.mode === "web" ? "showing a web page"
         : p.mode === "airplay"
           ? ((STATE.airplay || {}).mirroring ? "AirPlay mirroring" : "AirPlay waiting")
           : "playing local";
@@ -1444,6 +1501,9 @@ function renderStatus() {
     label = p.target || "Whole media folder";
     mode = c.local_playlist ? `playlist · ${c.local_playlist}` : "local media";
     chip = p.running ? "live" : "";
+  } else if (p.mode === "web") {
+    label = p.target || "(no address set)";
+    mode = "web page"; chip = p.running ? "live" : "";
   } else if (p.mode === "airplay") {
     const a = STATE.airplay || {};
     label = a.mirroring
@@ -1960,6 +2020,7 @@ async function loadNodes() {
     setField("cfgClusterKey", cfg.cluster_key);
     setField("cfgClusterExtraIps", cfg.cluster_extra_ips);
     setField("cfgClusterDrift", cfg.cluster_drift_correct);
+    renderSyncStrength(cfg.cluster_sync_strength);
   }
   const sel = $("syncPlaylist");
   const keep = sel.value;
@@ -1972,6 +2033,28 @@ async function loadNodes() {
     if (keep) sel.value = keep;
   } catch (_) { /* best effort */ }
 }
+
+// The options come from the node rather than being hardcoded here: the
+// thresholds are the node's to define, and a GUI that disagreed with them would
+// be describing a correction that is not the one being applied.
+function renderSyncStrength(current) {
+  const sel = $("cfgSyncStrength");
+  if (!sel || !CLUSTER || !CLUSTER.sync_strengths) return;
+  if (!fieldHeld("cfgSyncStrength")) {
+    sel.innerHTML = CLUSTER.sync_strengths.map((s) =>
+      `<option value="${esc(s.name)}"${s.name === current ? " selected" : ""}>${
+        esc(s.label)} — locks within ${s.in_sync_ms}ms, seeks past ${
+        s.seek_above_ms}ms</option>`).join("");
+  }
+  const chosen = CLUSTER.sync_strengths.find((s) => s.name === sel.value);
+  const note = $("syncStrengthNote");
+  if (note && chosen) {
+    note.textContent = `${chosen.note} Speed changes up to ${
+      chosen.max_nudge_percent}%, leader reports every ${chosen.pulse_interval_s}s.`;
+  }
+}
+
+$("cfgSyncStrength").onchange = () => renderSyncStrength($("cfgSyncStrength").value);
 
 $("cfgIdentify").onchange = async () => {
   try {
@@ -1989,7 +2072,7 @@ $("cfgIdentify").onchange = async () => {
 // the node actually has.
 $("btnNodesRefresh").onclick = () => {
   clearDirty("cfgClusterEnabled", "cfgClusterGroup", "cfgClusterKey",
-             "cfgClusterExtraIps", "cfgClusterDrift");
+             "cfgClusterExtraIps", "cfgClusterDrift", "cfgSyncStrength");
   loadNodes();
 };
 
@@ -2128,9 +2211,11 @@ $("btnSaveCluster").onclick = async () => {
       cluster_key: $("cfgClusterKey").value,
       cluster_extra_ips: $("cfgClusterExtraIps").value.trim(),
       cluster_drift_correct: $("cfgClusterDrift").checked,
+      cluster_sync_strength: $("cfgSyncStrength").value,
     });
     toast("Group settings saved — restart the service if you changed the group or key");
   } catch (e) { toast(e.message, true); }
+  clearDirty("cfgSyncStrength");
   loadNodes();
 };
 
@@ -2774,6 +2859,7 @@ async function loadNdiNetwork() {
   setField("cfgExtraIps", c.ndi_extra_ips);
   setField("cfgDiscoveryServer", c.ndi_discovery_server);
   setField("cfgUrlAddress", c.ndi_url_address);
+  setField("webUrl", c.web_url);
   try {
     const caps = await api("/api/capabilities");
     const nc = caps.ndi_config || {};
@@ -2877,9 +2963,38 @@ async function playNdi(name) {
 
 // ---------- media ----------
 
+// How a file's playback verdict is shown. The badge answers "will this play",
+// and its tooltip answers "why not" — the reasons are too long for the row but
+// are the whole point, so they must be one hover away rather than gone.
+const PLAYBACK_BADGE = {
+  good: ["ok", "Hardware", "Decodes on the Pi's video block — plays smoothly."],
+  fair: ["warn", "Scaled", "Decodes in hardware but is bigger than the output."],
+  poor: ["err", "Software", "No hardware decode path — expect stutter and drift."],
+  unknown: ["", "Unchecked", "Could not be probed."],
+};
+
+function playbackBadge(f) {
+  if (f.kind !== "video" || !f.playback) return "";
+  const [cls, label, fallback] = PLAYBACK_BADGE[f.playback.verdict] || PLAYBACK_BADGE.unknown;
+  const why = (f.playback.reasons || []).join(" · ") || f.playback.summary || fallback;
+  return `<span class="chip ${cls}" title="${esc(why)}">${label}</span>`;
+}
+
+function videoSummary(f) {
+  const v = f.video;
+  if (!v || !v.codec) return "";
+  const bits = [v.codec.toUpperCase()];
+  if (v.width && v.height) bits.push(`${v.width}×${v.height}`);
+  if (v.fps) bits.push(`${v.fps.toFixed(v.fps % 1 ? 2 : 0)}fps`);
+  if (v.bit_rate) bits.push(`${(v.bit_rate / 1e6).toFixed(1)} Mbps`);
+  return " · " + bits.join(" ");
+}
+
 async function loadMedia() {
   try {
-    const data = await api("/api/media");
+    // probe=1 costs an ffprobe per file, which is why the rest of the GUI does
+    // not ask for it. Here it is the entire point of the list.
+    const data = await api("/api/media?probe=1");
     const current = STATE && STATE.player.mode === "local" ? STATE.player.target : null;
     if (!data.files.length) {
       $("mediaList").innerHTML =
@@ -2889,12 +3004,20 @@ async function loadMedia() {
     $("mediaList").innerHTML = data.files.map((f) => `
       <li class="${f.name === current ? "playing" : ""}">
         <div class="meta">
-          <div class="name">${f.name}</div>
-          <div class="sub">${f.kind} · ${fmtBytes(f.size)}</div>
+          <div class="name">${esc(f.name)} ${playbackBadge(f)}</div>
+          <div class="sub">${f.kind} · ${fmtBytes(f.size)}${videoSummary(f)}</div>
         </div>
+        ${f.playback && f.playback.transcode
+          ? `<button class="btn small" data-conv="${encodeURIComponent(f.name)}"
+               title="Re-encode to 1080p H.264, which this Pi decodes in hardware">Optimise</button>`
+          : ""}
         <button class="btn small accent" data-play="${encodeURIComponent(f.name)}">Play</button>
         <button class="btn danger" data-del="${encodeURIComponent(f.name)}">Delete</button>
       </li>`).join("");
+
+    $("mediaList").querySelectorAll("button[data-conv]").forEach((b) => {
+      b.onclick = () => startTranscode(decodeURIComponent(b.dataset.conv));
+    });
 
     $("mediaList").querySelectorAll("button[data-play]").forEach((b) => {
       b.onclick = async () => {
@@ -2934,10 +3057,11 @@ async function loadMedia() {
 
 let AIRPLAY = null;
 
-function airplayLiveHtml(live, on) {
-  const state = !on ? ["", "Off"]
-    : live.mirroring ? ["on", `${live.client || "A device"} is mirroring`]
-    : ["", "Waiting for a device"];
+function airplayLiveHtml(live, on, ready) {
+  const state = live.mirroring ? ["on", `${live.client || "A device"} is mirroring`]
+    : on ? ["", "Waiting for a device"]
+    : ready ? ["on", "Ready to receive — pick this node on your device"]
+    : ["", "Off"];
   return `
     <div class="ap-state">
       <span class="dot ${state[0]}"></span>
@@ -2957,10 +3081,13 @@ function renderAirplayLive() {
   const box = $("airplayLive");
   if (!box || !AIRPLAY) return;
   const on = STATE && STATE.player ? STATE.player.mode === "airplay" : AIRPLAY.on;
-  box.innerHTML = airplayLiveHtml((STATE && STATE.airplay) || {}, on);
+  // "Armed but not yet mirroring" is its own state: the node keeps playing what
+  // it was playing, so player.mode is still "local" and cannot report this.
+  const ready = STATE && STATE.config ? !!STATE.config.airplay_enabled : !!AIRPLAY.ready;
+  box.innerHTML = airplayLiveHtml((STATE && STATE.airplay) || {}, on, ready);
   const start = $("btnAirplayStart"), stop = $("btnAirplayStop");
-  if (start) start.style.display = on ? "none" : "";
-  if (stop) stop.style.display = on ? "" : "none";
+  if (start) start.style.display = (on || ready) ? "none" : "";
+  if (stop) stop.style.display = (on || ready) ? "" : "none";
 }
 
 async function loadAirplay() {
@@ -3021,7 +3148,7 @@ async function loadAirplay() {
   $("btnAirplayStart").onclick = async () => {
     try {
       await post("/api/play/airplay");
-      toast("AirPlay is receiving \u2014 pick this node on your device");
+      toast("Ready to receive \u2014 pick this node on your device");
       poll(); loadAirplay();
     } catch (err) { toast(err.message, true); }
   };
@@ -3337,6 +3464,76 @@ $("btnUploadCancel").onclick = () => {
   if (UPLOAD) UPLOAD.abort();
 };
 
+// ---------- transcoding ----------
+//
+// Encoding on a Pi is minutes, not seconds, and the tab can be left at any
+// point — so the job lives on the node and this only ever polls it. Coming back
+// to the tab mid-encode picks the running job back up rather than showing
+// nothing, which is the difference between "it is still going" and "did I
+// actually press it?".
+
+let TRANSCODE_POLL = null;
+
+async function startTranscode(name) {
+  let info;
+  try {
+    info = await api("/api/transcode");
+  } catch (err) { toast(err.message, true); return; }
+  if (!info.available) {
+    toast(info.reason || "This node cannot transcode", true);
+    return;
+  }
+  const slow = info.hardware
+    ? "The Pi's hardware encoder will be used, so expect roughly realtime."
+    : "No hardware encoder here, so this runs on the CPU and can take " +
+      "several times the length of the video.";
+  if (!confirm(`Re-encode ${name} to 1080p H.264?\n\n${slow}\n\n` +
+               `The original is kept — the new file is added alongside it.`)) return;
+  try {
+    await post("/api/transcode", { name, replace: false });
+    toast("Converting " + name);
+    watchTranscode();
+  } catch (err) { toast(err.message, true); }
+}
+
+function watchTranscode() {
+  if (TRANSCODE_POLL) clearInterval(TRANSCODE_POLL);
+  const tick = async () => {
+    let job;
+    try { job = (await api("/api/transcode")).job; } catch (_) { return; }
+    renderTranscode(job);
+    if (!job || (!job.running && job.done)) {
+      clearInterval(TRANSCODE_POLL); TRANSCODE_POLL = null;
+      loadMedia();
+    }
+  };
+  TRANSCODE_POLL = setInterval(tick, 1500);
+  tick();
+}
+
+function renderTranscode(job) {
+  const box = $("transcodeProgress");
+  if (!box) return;
+  if (!job || (!job.running && !job.done)) { box.innerHTML = ""; return; }
+  const id = "xcode";
+  if (!$("prog-" + id)) {
+    box.innerHTML = progressRow(id, `Converting ${esc(job.name)} → ${esc(job.output || "")}`);
+  }
+  if (job.running) {
+    const bits = [];
+    if (job.speed) bits.push(`${job.speed}× realtime`);
+    if (job.eta_s) bits.push(`${fmtDuration(job.eta_s)} left`);
+    bits.push(job.hardware ? "hardware encoder" : "CPU encoder");
+    // Duration is unknown for a file ffprobe could not measure; pass 0 so the
+    // bar goes indeterminate rather than sitting at a fake 0%.
+    setProgress(id, job.position || 0, job.duration || 0, 0, bits.join(" · "));
+  } else if (job.done) {
+    if (job.cancelled) finishProgress(id, false, "cancelled");
+    else if (job.error) finishProgress(id, false, job.error);
+    else finishProgress(id, true, `${job.output} · ${fmtDuration(job.elapsed_s)}`);
+  }
+}
+
 $("btnPlayAll").onclick = async () => {
   try {
     await post("/api/play/local", { file: "", loop: true });
@@ -3472,6 +3669,16 @@ $("btnScan").onclick = () => scanNdi(true);
 $("btnManualNdi").onclick = () => {
   const name = $("manualNdi").value.trim();
   if (name) playNdi(name);
+};
+
+$("btnPlayWeb").onclick = async () => {
+  const url = $("webUrl").value.trim();
+  if (!url) return;
+  try {
+    await post("/api/play/web", { url });
+    toast("Showing the page");
+    poll();
+  } catch (err) { toast(err.message, true); }
 };
 
 // Only while the card is on screen and the door is actually open: re-rendering

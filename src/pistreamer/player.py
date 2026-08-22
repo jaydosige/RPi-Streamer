@@ -25,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
@@ -37,10 +38,11 @@ log = logging.getLogger(__name__)
 MODE_IDLE = "idle"
 MODE_NDI = "ndi"
 MODE_LOCAL = "local"
+MODE_WEB = "web"
 # Receiving an AirPlay mirror. A mode, not a background service, because the
 # session takes the display and the display has exactly one owner.
 MODE_AIRPLAY = "airplay"
-VALID_MODES = {MODE_IDLE, MODE_NDI, MODE_LOCAL, MODE_AIRPLAY}
+VALID_MODES = {MODE_IDLE, MODE_NDI, MODE_LOCAL, MODE_WEB, MODE_AIRPLAY}
 
 # Backoff schedule for automatic restarts, in seconds.
 _BACKOFF = [1, 2, 5, 10, 15, 30]
@@ -71,7 +73,7 @@ _TICK = 0.25
 # clean up strays: a player that outlived its supervisor keeps its audio going
 # and mixes with the next one, which is heard as two tracks at once.
 _PLAYER_SIGNATURES = ("pistreamer.runner", "mpv --no-config", "gst-launch-1.0",
-                      "uxplay")
+                      "uxplay", "chromium")
 
 
 def _stray_players(exclude_pid: Optional[int] = None) -> List[int]:
@@ -371,6 +373,11 @@ class Player:
         # While a speed nudge is settling, leave it alone rather than stacking
         # corrections on top of each other.
         self._nudging_until = 0.0
+        # When this node last went out of sync and started trying to get back.
+        # 0 means it is not currently correcting. Nudging that never arrives is
+        # invisible without this: every individual pulse looks like it is doing
+        # the right thing.
+        self._correcting_since = 0.0
         # The synchronised session this node is taking part in, and the one it
         # has been pulled out of by hand.
         self._sync_session = ""
@@ -539,6 +546,48 @@ class Player:
             cmd.append("--loop-playlist=inf")
         cmd.append("--")
         cmd += files
+        return cmd
+
+    def _web_command(self, cfg: config.Config, url: str) -> List[str]:
+        """Run a kiosk browser on the display the other backends use.
+
+        The URL is validated to http/https before it reaches argv: a value
+        beginning with "-" would otherwise be read by Chromium as a flag, which
+        turns "type a URL in the GUI" into "pass arbitrary switches to the
+        browser".
+        """
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise RuntimeError("the address must start with http:// or https://")
+        if not parsed.netloc:
+            raise RuntimeError(f"not a usable web address: {url}")
+
+        browser = next(
+            (b for b in ("chromium-browser", "chromium", "chromium-browser-stable")
+             if shutil.which(b)),
+            None,
+        )
+        if browser is None:
+            raise RuntimeError("no chromium browser installed (apt install chromium-browser)")
+
+        conn = display.pick_connector(cfg.connector)
+        mode = display.target_mode(conn, cfg.video_mode)
+        cmd = [
+            browser,
+            "--kiosk",
+            "--noerrdialogs",
+            "--disable-infobars",
+            "--disable-session-crashed-bubble",
+            "--check-for-update-interval=31536000",
+            "--autoplay-policy=no-user-gesture-required",
+            f"--user-data-dir={config.STATE_DIR / 'chromium'}",
+            "--ozone-platform=drm",
+        ]
+        if mode:
+            cmd.append(f"--window-size={mode.width},{mode.height}")
+        # Everything after this is a positional argument, never a switch.
+        cmd.append("--")
+        cmd.append(url)
         return cmd
 
     def _mpv_base(self, cfg: config.Config, image_duration: int) -> List[str]:
@@ -767,6 +816,10 @@ class Player:
             if not shutil.which("mpv"):
                 raise RuntimeError("mpv not installed")
             return self._local_command(cfg, target)
+        if mode == MODE_WEB:
+            if not target:
+                raise RuntimeError("no web address given")
+            return self._web_command(cfg, target)
         if mode == MODE_AIRPLAY:
             # Checked before spawning, not after: with no Avahi, uxplay prints
             # one line and exits, and a supervisor reads that as a crash worth
@@ -1066,6 +1119,7 @@ class Player:
                 self._sync_declined = self._sync_session
             self._sync_active = False
             self._nudging_until = 0.0
+            self._correcting_since = 0.0
             try:
                 if mode == MODE_LOCAL and cfg_playlist_needs_sequencer():
                     cfg = config.load()
@@ -1170,6 +1224,11 @@ class Player:
             self._fallback = False
             self._sync_active = True
             self._sync_session = session
+            # Each item is its own correction problem: carrying the previous
+            # one's clock over would escalate to a seek moments into a file
+            # that has not had a chance to drift yet.
+            self._nudging_until = 0.0
+            self._correcting_since = 0.0
             # A still image has no playhead and no natural end, so the conductor
             # decides when it comes down — every node at the same instant.
             # Letting each node time out on its own dwell counter instead means
@@ -1253,9 +1312,13 @@ class Player:
     def apply_pulse(self, pulse: Dict[str, Any]) -> Dict[str, Any]:
         """Act on the leader's position report: hold, nudge or seek."""
         own = self.sync_position()
+        now = time.time()
+        strength = syncplay.profile(config.load().cluster_sync_strength)
         with self._lock:
             nudging_until = self._nudging_until
-        decision = syncplay.decide(pulse, own, time.time(), nudging_until)
+            correcting_since = self._correcting_since
+        decision = syncplay.decide(pulse, own, now, nudging_until, strength,
+                                   correcting_since)
         sock = str(mpv_socket())
         if decision.action == "seek" and decision.seek_to is not None:
             # exact, not keyframe: a keyframe seek can land a second away, which
@@ -1264,16 +1327,31 @@ class Player:
             mpvipc.command(sock, "set_property", "speed", 1.0)
             with self._lock:
                 self._nudging_until = 0.0
+                # A seek lands us on the leader, so the correction is over —
+                # and the escalation clock has to be cleared with it or the
+                # next pulse escalates again immediately.
+                self._correcting_since = 0.0
         elif decision.action == "nudge":
             mpvipc.command(sock, "set_property", "speed", decision.speed)
             with self._lock:
-                self._nudging_until = time.time() + syncplay.NUDGE_HOLD_S
+                self._nudging_until = now + strength.hold_s
+                self._correcting_since = self._correcting_since or now
         elif decision.reason == "in sync":
             mpvipc.command(sock, "set_property", "speed", 1.0)
             with self._lock:
                 self._nudging_until = 0.0
+                self._correcting_since = 0.0
+        elif decision.reason == "nudge in progress":
+            # Still out, still riding a nudge: the clock keeps running. This is
+            # the branch that lets "correcting forever" be noticed at all.
+            with self._lock:
+                self._correcting_since = self._correcting_since or now
         out = decision.to_dict()
         out["position"] = own
+        out["strength"] = strength.name
+        with self._lock:
+            out["correcting_for"] = (round(now - self._correcting_since, 1)
+                                     if self._correcting_since else 0.0)
         return out
 
     # ------------------------------------------------------------------

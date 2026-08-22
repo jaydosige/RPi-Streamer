@@ -225,6 +225,48 @@ check("...without overshooting into a seek",
       all(abs(h) < syncplay.SEEK_ABOVE_S for h in history),
       f"worst {max(abs(h) for h in history) * 1000:.0f}ms")
 
+print("\ncorrection strength")
+check("an unknown strength falls back rather than raising",
+      syncplay.profile("nonsense").name == "normal")
+check("the default matches the module constants",
+      syncplay.profile(None).seek_above_s == syncplay.SEEK_ABOVE_S)
+check("firmer profiles seek sooner than gentler ones",
+      syncplay.profile("lock").seek_above_s
+      < syncplay.profile("firm").seek_above_s
+      < syncplay.profile("normal").seek_above_s
+      < syncplay.profile("gentle").seek_above_s)
+check("...and are allowed a bigger speed change",
+      syncplay.profile("lock").max_nudge > syncplay.profile("gentle").max_nudge)
+
+# The whole point of the setting: the same drift is treated differently.
+mid = {"item": "clip.mp4", "pos": 10.0, "at": NOW}
+check("150ms is a nudge on normal but a seek on firm",
+      syncplay.decide(mid, 10.15, NOW, strength="normal").action == "nudge"
+      and syncplay.decide(mid, 10.15, NOW, strength="firm").action == "seek",
+      f'normal={syncplay.decide(mid, 10.15, NOW, strength="normal").action} '
+      f'firm={syncplay.decide(mid, 10.15, NOW, strength="firm").action}')
+check("a bigger error is corrected harder than a small one",
+      abs(1 - syncplay.decide(mid, 10.20, NOW, strength="gentle").speed)
+      >= abs(1 - syncplay.decide(mid, 10.05, NOW, strength="gentle").speed))
+check("the nudge is capped at the profile's limit",
+      abs(1 - syncplay.decide(mid, 10.20, NOW, strength="normal").speed)
+      <= syncplay.profile("normal").max_nudge + 1e-9,
+      str(syncplay.decide(mid, 10.20, NOW, strength="normal").to_dict()))
+
+# A node whose decode runs at a different *rate* cannot be fixed by speed
+# alone: the nudge cancels the error instead of closing it. Escalation is the
+# only thing that gets such a node back, so it has to actually fire.
+stuck = syncplay.decide(mid, 10.10, NOW, strength="firm",
+                        correcting_since=NOW - 60)
+check("nudging that never arrives escalates to a seek",
+      stuck.action == "seek", str(stuck.to_dict()))
+check("...but not before the profile's patience runs out",
+      syncplay.decide(mid, 10.10, NOW, strength="firm",
+                      correcting_since=NOW - 1).action == "nudge")
+check("gentle never escalates, however long it takes",
+      syncplay.decide(mid, 10.10, NOW, strength="gentle",
+                      correcting_since=NOW - 3600).action == "nudge")
+
 print("\nsummary reporting")
 summary = syncplay.summarise([
     {"name": "A", "ok": True, "offset_ms": 1.0},

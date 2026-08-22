@@ -22,8 +22,8 @@ from pydantic import BaseModel, Field
 
 from . import (airplay, cluster, config, diagnose, display, guest, media,
                ndiconfig, playlists, pushjob, schedule as schedule_mod, sources,
-               syncplay, system, updates)
-from .player import (MODE_AIRPLAY, MODE_IDLE, MODE_LOCAL, MODE_NDI,
+               syncplay, system, transcode, updates)
+from .player import (MODE_AIRPLAY, MODE_IDLE, MODE_LOCAL, MODE_NDI, MODE_WEB,
                      identify_text, player)
 from .telemetry import telemetry
 
@@ -156,8 +156,8 @@ async def lifespan(app: FastAPI):
     if cfg.schedule_enabled:
         schedule_mod.scheduler.start()
     if cfg.autostart and cfg.mode != MODE_IDLE:
-        target = "" if cfg.mode == MODE_AIRPLAY else (
-            cfg.ndi_source if cfg.mode == MODE_NDI else cfg.local_file)
+        target = {MODE_AIRPLAY: "", MODE_NDI: cfg.ndi_source,
+                  MODE_WEB: cfg.web_url}.get(cfg.mode, cfg.local_file)
         log.info("autostarting mode=%s target=%s", cfg.mode, target)
         player.apply(cfg.mode, target)
     yield
@@ -231,6 +231,11 @@ def apply_cue_action(action: str, target: str) -> None:
     elif action == "folder":
         config.update(mode=MODE_LOCAL, local_playlist="", local_file="")
         player.apply(MODE_LOCAL, "")
+    elif action == "web":
+        if not target:
+            raise ValueError("a web cue needs an address")
+        config.update(mode=MODE_WEB, web_url=target)
+        player.apply(MODE_WEB, target)
     elif action == "airplay":
         ok, reason = airplay.available()
         if not ok:
@@ -262,6 +267,10 @@ class PlayNdi(BaseModel):
 class PlayLocal(BaseModel):
     file: str = ""
     loop: bool = True
+
+
+class PlayWeb(BaseModel):
+    url: str = Field(min_length=1)
 
 
 class HostnameBody(BaseModel):
@@ -418,6 +427,7 @@ async def post_config(patch: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         ("idle_mode", ("black", "image", "lastframe")),
         ("queue_leaky", ("none", "upstream", "downstream")),
         ("ndi_color_format", tuple(COLOR_FORMATS)),
+        ("cluster_sync_strength", tuple(syncplay.STRENGTHS)),
     ):
         if key in patch and patch[key] not in allowed:
             raise HTTPException(400, f"{key} must be one of: {', '.join(allowed)}")
@@ -565,54 +575,15 @@ async def play_local(body: PlayLocal) -> Dict[str, Any]:
     return status
 
 
-@app.post("/api/play/airplay")
-async def play_airplay() -> Dict[str, Any]:
-    """Start receiving AirPlay.
-
-    Nothing appears on the screen until somebody actually mirrors to the node —
-    the receiver only takes the display when a session starts. That is a
-    deliberate consequence of the one-owner rule, not an oversight, and the GUI
-    says so rather than leaving an operator staring at black wondering.
-    """
-    ok, reason = airplay.available()
-    if not ok:
-        raise HTTPException(409, reason)
-    take_local_control("AirPlay ready for use")
-    # Set a flag that AirPlay is ready, but keep current playback
-    config.update(mode=MODE_LOCAL, airplay_enabled=True)
+@app.post("/api/play/web")
+async def play_web(body: PlayWeb) -> Dict[str, Any]:
+    take_local_control("web playback started")
+    config.update(mode=MODE_WEB, web_url=body.url)
+    player.apply(MODE_WEB, body.url)
     status = player.status()
     if status["last_error"]:
         raise HTTPException(500, status["last_error"])
-    return {**status, "airplay": airplay.summary()}
-
-
-@app.get("/api/airplay")
-async def get_airplay() -> Dict[str, Any]:
-    cfg = config.load()
-    caps = airplay.capabilities()
-    return {
-        **caps,
-        "on": cfg.mode == MODE_AIRPLAY,
-        "ready": cfg.airplay_enabled,
-        "name": airplay.receiver_name(cfg),
-        "session": airplay.summary(),
-        "ports": airplay.ports(cfg),
-        "command": airplay.build_command(cfg, video_sink="kmssink"),
-    }
-
-
-@app.post("/api/stop")
-async def stop() -> Dict[str, Any]:
-    take_local_control("stopped from the GUI")
-    config.update(mode=MODE_IDLE, airplay_enabled=False)
-    player.apply(MODE_IDLE)
-    return player.status()
-
-
-@app.post("/api/restart")
-async def restart_player() -> Dict[str, Any]:
-    player.restart()
-    return player.status()
+    return status
 
 
 # ----------------------------------------------------------------------
@@ -620,9 +591,64 @@ async def restart_player() -> Dict[str, Any]:
 # ----------------------------------------------------------------------
 
 
+# Which codecs this box has a *hardware* decoder for, worked out once. The
+# registry does not change while the service runs, and the probe needs GStreamer
+# initialised, which is far too heavy to do per request on a polled endpoint.
+_hw_codecs_cache: Optional[set] = None
+# Factory-name fragment -> the ffprobe codec name it decodes. The Pi's V4L2
+# elements are named after their codec, so this is a substring match rather than
+# an exhaustive table of every element that might exist.
+_DECODER_CODECS = {
+    "h264": "h264", "h265": "hevc", "hevc": "hevc",
+    "vp8": "vp8", "vp9": "vp9", "av1": "av1", "mpeg2": "mpeg2video",
+}
+
+
+def hardware_codecs() -> Optional[set]:
+    """Codecs with a hardware decoder here, or None if we could not tell.
+
+    None is not the same as an empty set and the difference matters: "this node
+    has no hardware decode at all" would condemn every file in the library,
+    whereas "we could not ask" should fall back to what the board is known to
+    do. Guessing wrong in that direction turns a working library red.
+    """
+    global _hw_codecs_cache
+    if _hw_codecs_cache is not None:
+        return _hw_codecs_cache or None
+    try:
+        import gi  # type: ignore
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst  # type: ignore
+
+        if not Gst.is_initialized():
+            Gst.init(None)
+        from .runner import list_decoders
+
+        found = set()
+        for decoder in list_decoders():
+            if not decoder["hardware"]:
+                continue
+            name = decoder["name"].lower()
+            for fragment, codec in _DECODER_CODECS.items():
+                if fragment in name:
+                    found.add(codec)
+        _hw_codecs_cache = found
+        return found or None
+    except Exception as exc:  # noqa: BLE001 - no GStreamer is a normal dev box
+        log.debug("could not probe hardware decoders: %s", exc)
+        return None
+
+
 @app.get("/api/media")
 async def get_media(probe: bool = False, hashes: bool = False) -> Dict[str, Any]:
-    files = [m.to_dict() for m in media.list_media(probe=probe)]
+    # Probing shells out to ffprobe once per file. Even cached that is a pile of
+    # stat calls, and uncached it is seconds — all of it blocking, so it goes to
+    # a worker thread rather than stopping every other request on the node
+    # (the video on screen included, which polls this same service).
+    listing = await asyncio.get_running_loop().run_in_executor(
+        None, lambda: media.list_media(probe=probe, hw_codecs=hardware_codecs()))
+    files = [m.to_dict() for m in listing]
     if hashes:
         # Only on request: hashing a folder of 4 GB videos takes real time, and
         # the GUI polls this endpoint. The cluster push is the one caller that
@@ -698,6 +724,108 @@ async def delete_media(name: str) -> Dict[str, Any]:
     if not media.delete(name):
         raise HTTPException(404, f"no such media file: {name}")
     return {"deleted": name}
+
+
+# ----------------------------------------------------------------------
+# Transcoding
+#
+# One at a time, deliberately: encoding saturates the CPU on a Pi, and two at
+# once would take twice as long each while also starving whatever is on the
+# screen. The job outlives the request that started it, so progress is polled.
+# ----------------------------------------------------------------------
+
+transcode_job = None
+
+
+class TranscodeBody(BaseModel):
+    name: str = Field(min_length=1)
+    # Delete the original once the new file is in place. Off by default: the
+    # source may be the only copy, and a re-encode is not reversible.
+    replace: bool = False
+
+
+@app.get("/api/transcode")
+async def get_transcode() -> Dict[str, Any]:
+    ok, reason = transcode.available()
+    encoder = transcode.pick_encoder() if ok else None
+    state = (transcode_job.snapshot() if transcode_job is not None
+             else {"running": False, "done": False})
+    return {
+        "available": ok and encoder is not None,
+        "reason": reason or ("" if encoder else
+                             "ffmpeg here has no usable H.264 encoder"),
+        "encoder": encoder,
+        # Whether encoding will run on the Pi's own block or on the CPU, which
+        # is the difference between minutes and hours for a long file.
+        "hardware": encoder in transcode.HW_ENCODERS if encoder else False,
+        "job": state,
+    }
+
+
+@app.post("/api/transcode")
+async def post_transcode(body: TranscodeBody) -> Dict[str, Any]:
+    global transcode_job
+    ok, reason = transcode.available()
+    if not ok:
+        raise HTTPException(409, reason)
+    encoder = transcode.pick_encoder()
+    if encoder is None:
+        raise HTTPException(409, "ffmpeg here has no usable H.264 encoder")
+    src = media.resolve(body.name)
+    if src is None:
+        raise HTTPException(404, f"no such media file: {body.name}")
+    if transcode_job is not None and transcode_job.is_running():
+        raise HTTPException(409, "a conversion is already running")
+
+    out_name = transcode.target_name(body.name)
+    dest = config.MEDIA_DIR / out_name
+    if dest.exists():
+        raise HTTPException(409, f"{out_name} already exists — delete it first")
+    if dest == src:
+        raise HTTPException(400, "that file is already the converted one")
+
+    duration, info = media.probe_file(src)
+    transcode_job = transcode.TranscodeJob(body.name, {})
+    transcode_job.start(src, dest, encoder, duration,
+                        source_fps=info.fps if info else 0.0)
+    if body.replace:
+        _replace_after(body.name, out_name)
+    return transcode_job.snapshot()
+
+
+def _replace_after(original: str, produced: str) -> None:
+    """Delete the source once the conversion has succeeded, and only then.
+
+    Waiting in a thread rather than making the caller poll and then ask again:
+    an operator who ticked "replace" should not have to come back and finish the
+    job by hand, and a browser that was closed mid-encode must not be the reason
+    a library ends up with both files.
+    """
+    import threading
+
+    def wait() -> None:
+        job = transcode_job
+        if job is None:
+            return
+        while job.is_running():
+            time.sleep(1.0)
+        if job.snapshot().get("ok") and media.resolve(produced) is not None:
+            cfg = config.load()
+            # Never pull the file that is currently on the screen out from
+            # under the player.
+            if not (cfg.mode == MODE_LOCAL and cfg.local_file == original):
+                media.delete(original)
+                log.info("replaced %s with %s", original, produced)
+
+    threading.Thread(target=wait, name="transcode-replace", daemon=True).start()
+
+
+@app.post("/api/transcode/cancel")
+async def post_transcode_cancel() -> Dict[str, Any]:
+    if transcode_job is None:
+        raise HTTPException(404, "no conversion has been started")
+    transcode_job.cancel()
+    return {"cancelling": True}
 
 
 # ----------------------------------------------------------------------
@@ -1050,7 +1178,19 @@ async def get_overclock() -> Dict[str, Any]:
         try:
             data["last_result"] = json.loads(result_path.read_text())
         except (OSError, ValueError):
-        @app.post("/api/play/airplay")
+            pass
+    unit = Path("/etc/systemd/system/pistreamer-overclock.path")
+    data["writable"] = unit.exists()
+    if not data["writable"]:
+        data["error"] = (
+            "the overclock helper unit is not installed — re-run install.sh. "
+            "(It is path-activated rather than sudo-based: the service sets "
+            "NoNewPrivileges, which blocks sudo entirely.)"
+        )
+    return data
+
+
+@app.post("/api/play/airplay")
 async def play_airplay() -> Dict[str, Any]:
     """Start receiving AirPlay.
 
@@ -1064,9 +1204,7 @@ async def play_airplay() -> Dict[str, Any]:
     if not ok:
         raise HTTPException(409, reason)
     take_local_control("AirPlay ready for use")
-    # Set a flag in the config so the UI can show a ready message.
     config.update(mode=MODE_LOCAL, airplay_enabled=True)
-    # Do not spawn the AirPlay receiver yet; keep current playback.
     status = player.status()
     if status["last_error"]:
         raise HTTPException(500, status["last_error"])
@@ -1100,16 +1238,6 @@ async def stop() -> Dict[str, Any]:
 async def restart_player() -> Dict[str, Any]:
     player.restart()
     return player.status()
-
-    unit = Path("/etc/systemd/system/pistreamer-overclock.path")
-    data["writable"] = unit.exists()
-    if not data["writable"]:
-        data["error"] = (
-            "the overclock helper unit is not installed — re-run install.sh. "
-            "(It is path-activated rather than sudo-based: the service sets "
-            "NoNewPrivileges, which blocks sudo entirely.)"
-        )
-    return data
 
 
 @app.post("/api/overclock")
@@ -1292,6 +1420,8 @@ async def get_cluster() -> Dict[str, Any]:
         "beacon": cluster.beacon().stats(),
         "peers": [p.to_dict() for p in cluster.registry.all()],
         "sync": conductor.state(),
+        "sync_strength": cfg.cluster_sync_strength,
+        "sync_strengths": [s.to_dict() for s in syncplay.STRENGTHS.values()],
     }
 
 
@@ -1522,6 +1652,9 @@ class SyncPlayBody(BaseModel):
     playlist: str
     nodes: List[str] = Field(default_factory=list)
     loop: bool = True
+    # Blank uses this node's own configured strength. Only the pulse rate is
+    # set from here; each follower still decides its own corrections.
+    strength: str = ""
 
 
 @app.post("/api/cluster/sync/play")
@@ -1536,8 +1669,9 @@ async def post_sync_play(body: SyncPlayBody) -> Dict[str, Any]:
         raise HTTPException(400, "synchronised playback needs a playlist of files")
     targets = ([_own_peer()] + cluster.registry.all() if not body.nodes
                else _peers_by_id(body.nodes))
+    strength = body.strength or config.load().cluster_sync_strength
     try:
-        return conductor.start(items, targets, loop=body.loop)
+        return conductor.start(items, targets, loop=body.loop, strength=strength)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
