@@ -117,6 +117,38 @@ def main() -> int:
           "-b:v" in transcode.build_command(Path("/a"), Path("/b"), "h264_v4l2m2m"))
     check("the converted file is marked so it cannot be confused with the source",
           transcode.target_name("clip.mkv") == "clip-pi.mp4")
+    check("1080p60 gets a level that permits it",
+          "4.2" in transcode.build_command(Path("/a"), Path("/b"), "libx264"),
+          " ".join(transcode.build_command(Path("/a"), Path("/b"), "libx264")))
+
+    print("\na listed encoder is not a working one")
+    # Debian builds ffmpeg with h264_v4l2m2m whether or not the board can open
+    # it. Trusting the list picked it, and it then encoded zero frames and
+    # failed the job after the operator had waited for it.
+    real_listed = transcode._listed
+    transcode._listed = lambda: ["h264_v4l2m2m", "libx264"]
+    transcode._works_cache.clear()
+    check("an encoder that cannot encode is not offered",
+          not transcode.works("h264_v4l2m2m"))
+    check("...so a working one is picked instead",
+          transcode.pick_encoder() == "libx264", str(transcode.pick_encoder()))
+    check("the verdict is cached, not re-probed",
+          "h264_v4l2m2m" in transcode._works_cache)
+    transcode._listed = real_listed
+    transcode._works_cache.clear()
+
+    print("\nthe failure message names the cause, not the summary")
+    job = transcode.TranscodeJob("clip.mp4", {})
+    for line in ("[h264_v4l2m2m @ 0x1] Could not find a valid device",
+                 "Error initializing output stream 0:0 -- Error while opening encoder",
+                 "frame=    0 fps=0.0 q=0.0 Lsize=  6KiB time=N/A bitrate=N/A",
+                 "[aac @ 0x2] Qavg: 63704.125",
+                 "Conversion failed!"):
+        job._note(line)
+    why = job._why()
+    check("it reports the encoder failure", "opening encoder" in why, why)
+    check("...not the audio statistics", "Qavg" not in why, why)
+    check("...nor the byte count", "Lsize" not in why, why)
 
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         print("\n(skipping the round trip — ffmpeg is not installed here)")

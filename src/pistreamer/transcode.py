@@ -51,8 +51,11 @@ def available() -> tuple[bool, str]:
     return True, ""
 
 
-def encoders() -> List[str]:
-    """Which H.264 encoders this ffmpeg actually has, best first."""
+_works_cache: Dict[str, bool] = {}
+
+
+def _listed() -> List[str]:
+    """Encoders this ffmpeg was built with. Not the same as ones that work."""
     if not shutil.which("ffmpeg"):
         return []
     try:
@@ -65,6 +68,48 @@ def encoders() -> List[str]:
     if re.search(r"\blibx264\b", text):
         out.append("libx264")
     return out
+
+
+def works(encoder: str) -> bool:
+    """Encode a few frames and see. Cached: the answer cannot change at runtime.
+
+    Debian builds ffmpeg with h264_v4l2m2m whether or not the board can use it,
+    and the Pi 4's V4L2 H.264 encoder frequently cannot be opened on current
+    Raspberry Pi OS. Asked only whether it was *listed*, this picked it, and it
+    then initialised far enough not to error, encoded zero frames, and failed
+    the whole job with "frame= 0 ... Conversion failed!" — after the operator
+    had waited for it.
+
+    Being listed is not evidence. Encoding is.
+    """
+    if encoder == "libx264":
+        return encoder in _listed()
+    cached = _works_cache.get(encoder)
+    if cached is not None:
+        return cached
+    if encoder not in _listed():
+        _works_cache[encoder] = False
+        return False
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error",
+             "-f", "lavfi", "-i", "testsrc2=size=640x480:rate=25:duration=0.4",
+             "-c:v", encoder, "-b:v", "1M", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=60)
+        ok = proc.returncode == 0
+        if not ok:
+            log.info("%s is present but cannot encode here: %s",
+                     encoder, (proc.stderr or "").strip()[:200])
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.info("%s could not be tested: %s", encoder, exc)
+        ok = False
+    _works_cache[encoder] = ok
+    return ok
+
+
+def encoders() -> List[str]:
+    """H.264 encoders that actually encode on this node, best first."""
+    return [e for e in _listed() if works(e)]
 
 
 def pick_encoder() -> Optional[str]:
@@ -101,8 +146,10 @@ def build_command(src: Path, dest: Path, encoder: str, *,
     if encoder == "libx264":
         # veryfast, not slower: on a Pi the difference between presets is hours,
         # and the file only has to decode well, not be small.
+        # 4.2, not 4.1: level 4.1 tops out around 1080p30, and the files most
+        # worth converting are 1080p50 and 1080p60.
         cmd += ["-preset", "veryfast", "-crf", "21", "-profile:v", "high",
-                "-level", "4.1"]
+                "-level", "4.2"]
     else:
         # The V4L2 encoder has no CRF mode — it is bitrate-driven only.
         cmd += ["-b:v", "8M", "-maxrate", "10M", "-bufsize", "16M"]
@@ -147,6 +194,7 @@ class TranscodeJob:
             "cancelled": False,
             "encoder": "",
             "hardware": False,
+            "fell_back_from": "",
             "started": None,
             "finished": None,
             "duration": None,
@@ -212,23 +260,36 @@ class TranscodeJob:
         # than one that left nothing: it would go on a screen.
         tmp = dest.with_name(f".{dest.name}.part")
         try:
-            cmd = build_command(src, tmp, encoder, source_fps=source_fps)
-            log.info("transcoding %s -> %s with %s", src.name, dest.name, encoder)
-            self._proc = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                text=True, bufsize=1)
-            for line in self._proc.stderr or ():
-                self._note(line.rstrip())
-            code = self._proc.wait()
+            code = self._encode(src, tmp, encoder, source_fps)
             if self._cancel.is_set():
                 with self._lock:
                     self.state["cancelled"] = True
                 return
+            # A verified encoder can still fail on one particular file — a
+            # resolution or a frame rate the block will not take. Falling back
+            # costs the operator time; not falling back costs them the file, so
+            # try software once before giving up.
+            if code != 0 and encoder in HW_ENCODERS and works("libx264"):
+                log.warning("%s failed on %s; retrying with libx264",
+                            encoder, src.name)
+                with self._lock:
+                    self.state["fell_back_from"] = encoder
+                    self.state["encoder"] = "libx264"
+                    self.state["hardware"] = False
+                    self.state["position"] = 0.0
+                    self.state["started"] = time.time()
+                    self.state["tail"] = []
+                tmp.unlink(missing_ok=True)
+                code = self._encode(src, tmp, "libx264", source_fps)
+                if self._cancel.is_set():
+                    with self._lock:
+                        self.state["cancelled"] = True
+                    return
             if code != 0:
                 with self._lock:
-                    tail = " / ".join(self.state["tail"][-3:])
                     self.state["error"] = (
-                        f"ffmpeg failed (exit {code})" + (f": {tail}" if tail else ""))
+                        f"ffmpeg failed (exit {code})"
+                        + (f": {self._why()}" if self._why() else ""))
                 return
             if not tmp.is_file() or tmp.stat().st_size == 0:
                 with self._lock:
@@ -244,6 +305,36 @@ class TranscodeJob:
                 self.state["running"] = False
                 self.state["done"] = True
                 self.state["finished"] = time.time()
+
+    def _encode(self, src: Path, tmp: Path, encoder: str,
+                source_fps: float) -> int:
+        cmd = build_command(src, tmp, encoder, source_fps=source_fps)
+        log.info("transcoding %s -> %s with %s", src.name, tmp.name, encoder)
+        self._proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            text=True, bufsize=1)
+        for line in self._proc.stderr or ():
+            self._note(line.rstrip())
+        return self._proc.wait()
+
+    def _why(self) -> str:
+        """The line that explains the failure, not merely the last one.
+
+        ffmpeg's final lines are a size summary and the audio encoder's
+        statistics, so reporting the tail produced "frame= 0 ... Qavg:
+        63704" — true, and no use at all to somebody deciding what to do
+        about it. The cause is further up.
+        """
+        with self._lock:
+            tail = list(self.state["tail"])
+        noise = ("Qavg:", "Lsize=", "video:", "muxing overhead")
+        useful = [ln for ln in tail
+                  if any(w in ln.lower() for w in
+                         ("error", "failed", "invalid", "unable", "cannot",
+                          "no such", "not supported", "denied", "unsupported"))
+                  and not any(n in ln for n in noise)]
+        picked = useful[-2:] or [ln for ln in tail if not any(n in ln for n in noise)][-2:]
+        return " / ".join(picked)[:400]
 
     def _note(self, line: str) -> None:
         if not line:
